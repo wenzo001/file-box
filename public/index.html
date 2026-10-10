@@ -464,42 +464,52 @@ const UPLOAD_PARALLEL = 3;             // 同时在传的块数
 /** 一个加密块占多少字节：[4B 明文长度][12B IV][密文 + 16B 校验] */
 const blockBytes = (plain) => plain + 32;
 
-/** 与 FBCrypto.encryptFile 完全一致的加密块划分 */
-function predictedBlocks(size) {
-  const out = [];
+/** 规划一个文件的上传块：不切开任何一个密文块，组到目标大小就封口；
+ *  同时记下每块对应的明文区间 —— 续传时只加密缺的那段，不必重读整个文件。 */
+function planFile(size) {
+  const blocks = [];
   let left = size || 0;
-  if (!left) return [blockBytes(0)];
+  if (!left) blocks.push(blockBytes(0));
   while (left > 0) {
     const plain = Math.min(FBCrypto.CHUNK, left);
-    out.push(blockBytes(plain));
+    blocks.push(blockBytes(plain));
     left -= plain;
   }
-  return out;
-}
-
-/** 把连续的加密块并成上传块：不切开任何一个密文块，组到目标大小就封口 */
-function groupIntoChunks(blockSizes) {
-  const out = [];
-  let cur = 0;
-  for (const b of blockSizes) {
+  const plan = [];
+  let cur = 0, p0 = 0, plainEnd = 0;
+  for (const b of blocks) {
     cur += b;
-    if (cur >= UPLOAD_TARGET) { out.push(cur); cur = 0; }
+    plainEnd += b - 32;
+    if (cur >= UPLOAD_TARGET) {
+      plan.push({ bytes: cur, p0, p1: plainEnd });
+      cur = 0;
+      p0 = plainEnd;
+    }
   }
-  if (cur) out.push(cur);
-  return out;
+  if (cur) plan.push({ bytes: cur, p0, p1: plainEnd });
+  return plan;
 }
-const planChunks = (size) => groupIntoChunks(predictedBlocks(size));
-/** 每块在密文 Blob 里的起始偏移（前缀和，第一块从 0 开始） */
-const chunkOffsets = (chunks) => {
-  const out = [];
-  let acc = 0;
-  for (const c of chunks) { out.push(acc); acc += c; }
-  return out;
-};
+const planChunks = (size) => planFile(size).map((c) => c.bytes);
 
-/** 批次指纹：同一批文件（相对路径+大小+修改时间）任何时候都算出同一个 key，用来续传 */
-const batchKey = (files) => FBCrypto.hashHex(
-  `filebox-upload-v1\n${files.length}\n${files.map((f) => `${relPath(f)}\t${f.size}\t${f.lastModified || 0}`).join('\n')}`);
+/** 批次指纹：同一批文件（相对路径+大小+修改时间）任何时候都算出同一个 key，用来续传。
+ *  指纹掺入浏览器本地的随机盐：这样外发的 key 与磁盘上的密文名都无法被离线字典攻击
+ *  对回真实文件名（盐只存在本地，不上传）。清了站点数据就换一把新盐 —— 续传失效但无碍。 */
+function batchIdentity(files) {
+  const raw = `filebox-upload-v1\n${files.length}\n${files.map((f) => `${relPath(f)}\t${f.size}\t${f.lastModified || 0}`).join('\n')}`;
+  let salt = localSalt(raw);
+  return { salt, key: FBCrypto.hashHex(`${salt}\n${raw}`) };
+}
+let saltMemory = new Map(); // localStorage 不可用时（隐私模式等）退化成本会话内有效
+function localSalt(raw) {
+  const slot = 'fb-upload-salt:' + FBCrypto.hashHex(raw).slice(0, 16);
+  try {
+    const hit = localStorage.getItem(slot);
+    if (hit) return hit;
+  } catch { /* 读不到就用内存兜底 */ }
+  const fresh = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem(slot, fresh); } catch { saltMemory.set(slot, fresh); }
+  return saltMemory.get(slot) || fresh;
+}
 
 /** 磁盘上的密文名由批次指纹推出：同一批文件每次续传算出完全相同的布局 */
 const encNameOf = (key, i) => `f_${key.slice(0, 12)}${i.toString(16).padStart(2, '0')}.enc`;
@@ -508,8 +518,9 @@ const encNameOf = (key, i) => `f_${key.slice(0, 12)}${i.toString(16).padStart(2,
 function planBatch(key, files) {
   const items = files.map((f, i) => ({ name: relPath(f), size: f.size, enc: encNameOf(key, i) }));
   const manifestBytes = te.encode(JSON.stringify({ v: 1, files: items }));
-  const layout = files.map((f, i) => ({ enc: items[i].enc, chunks: planChunks(f.size) }));
-  layout.push({ enc: 'manifest.enc', chunks: planChunks(manifestBytes.length), manifestBytes });
+  const layout = files.map((f, i) => ({ enc: items[i].enc, plan: planFile(f.size) }));
+  layout.push({ enc: 'manifest.enc', plan: planFile(manifestBytes.length), manifestBytes });
+  for (const f of layout) f.chunks = f.plan.map((c) => c.bytes);
   return { layout, manifestBytes };
 }
 
@@ -528,7 +539,7 @@ const apiPost = async (path, body) => {
 async function refreshBatch() {
   if (!selected.length) { batch = null; return null; }
   const version = selectionVersion;
-  const key = await batchKey(selected);
+  const key = batchIdentity(selected).key;
   const plan = planBatch(key, selected);
   const r = await apiPost('/api/upload/init', {
     key,
@@ -648,7 +659,6 @@ async function upload() {
     }
     if (!batch || batch.version !== selectionVersion) throw new Error('准备上传失败，请重试');
     const { layout, uploadId, have, total } = batch;
-    const offsets = layout.map((f) => chunkOffsets(f.chunks));
 
     // 断点续传：只补缺失的块
     const todo = [];
@@ -665,45 +675,44 @@ async function upload() {
       setStatus(`已传 ${done0 + doneNow}/${total} 块 · ${pct}%`);
     };
     if (done0) toast(`接着上次进度传：已传 ${done0}/${total} 块`);
-    if (!todo.length) paint();
+    paint();
 
-    // 只加密还有缺块的文件（整批传过就不用再加密）
-    const blobs = new Map();   // fi → 该文件密文 Blob
-    const needLeft = new Map(); // fi → 还剩几块没传
-    for (const j of todo) needLeft.set(j.fi, (needLeft.get(j.fi) || 0) + 1);
-    const need = [...needLeft.keys()].sort((a, b) => a - b);
-    for (let k = 0; k < need.length; k++) {
-      const fi = need[k];
-      const spec = layout[fi];
-      let blob;
-      if (spec.manifestBytes) {
-        blob = new Blob([await FBCrypto.encryptBytes(spec.manifestBytes)]);
-      } else {
-        const seen = [];
-        blob = await FBCrypto.encryptFile(selected[fi], (p) => {
-          setStatus(`加密中 ${k + 1}/${need.length} · ${p}%`);
-        }, (bytes) => seen.push(bytes));
-        // 密文块布局必须与预测一致，否则续传会拼错
-        const actual = groupIntoChunks(seen);
-        if (JSON.stringify(actual) !== JSON.stringify(spec.chunks)) {
-          throw new Error('分块校验失败，请重试');
-        }
+    // 纯 JS 引擎（手机走 HTTP 的场景）下把加密也丢给线程池：
+    // 主线程单干实测只有 ~2.6MB/s，60MB 要 25s；线程池能吃满多核，主线程也不再被占住
+    const crypt = FBCrypto.native ? null : getDecryptPool();
+    const encryptChunk = async (spec, file, ci) => {
+      const seg = spec.plan[ci];
+      if (spec.manifestBytes) return FBCrypto.encryptBytes(spec.manifestBytes);
+      if (seg.p1 === seg.p0) return FBCrypto.encryptBytes(new Uint8Array(0)); // 0 字节文件
+      const parts = [];
+      let len = 0;
+      // 逐块现加密现发，内存里只留正在传的几块：早先是把整个文件密文攒成
+      // 一个 Blob 再切片，300MB 就会撞 ERR_BLOB_OUT_OF_MEMORY（峰值堆 359MB）
+      for (let off = seg.p0; off < seg.p1; off += FBCrypto.CHUNK) {
+        const end = Math.min(off + FBCrypto.CHUNK, seg.p1);
+        const buf = new Uint8Array(await file.slice(off, end).arrayBuffer());
+        const one = crypt ? await crypt.encrypt(buf) : await FBCrypto.encryptBytes(buf);
+        parts.push(one);
+        len += one.length;
       }
-      if (blob.size !== spec.chunks.reduce((a, b) => a + b, 0)) throw new Error('分块大小不符，请重试');
-      blobs.set(fi, blob);
-    }
+      const out = new Uint8Array(len);
+      let o = 0;
+      for (const p of parts) { out.set(p, o); o += p.length; }
+      return out;
+    };
 
     // 并发传块；任一失败就停下并保留进度，下次点「继续上传」接着来
     let cursor = 0;
     const inflight = new Set();
     const sendChunk = async (j) => {
       const { fi, ci } = todo[j];
-      const chunk = layout[fi].chunks[ci];
-      const from = offsets[fi][ci];
+      const spec = layout[fi];
+      const body = await encryptChunk(spec, selected[fi], ci);
+      if (body.length !== spec.chunks[ci]) throw new Error('分块大小不符，请重试'); // 布局校验：对不上就宁可不传
       const req = fetch(`/api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: blobs.get(fi).slice(from, from + chunk),
+        body,
       });
       inflight.add(req);
       let r;
@@ -715,9 +724,6 @@ async function upload() {
       have.add(`${fi}-${ci}`);
       doneNow++;
       paint();
-      const left = (needLeft.get(fi) || 0) - 1;
-      needLeft.set(fi, left);
-      if (left === 0) blobs.delete(fi); // 该文件的块都传完了，立刻释放内存
     };
     const send = async () => {
       for (;;) {
@@ -744,7 +750,8 @@ async function upload() {
   } catch (e) {
     // 失败不清清单：进度都还在，点一下就能接着传
     const raw = (e && e.message) || '上传失败';
-    const msg = /Failed to fetch|NetworkError|Load failed|network error/i.test(raw) ? '网络中断' : raw;
+    const isFetchFail = /Failed to fetch|NetworkError|Load failed|network error/i.test(raw);
+    const msg = !isFetchFail ? raw : (navigator.onLine === false ? '网络已断开' : '上传中断');
     if (batch) renderUpload();
     toast(batch && batch.have.size
       ? `${msg}，已传 ${batch.have.size}/${batch.total} 块，点「继续上传」接着传`
@@ -1108,7 +1115,11 @@ function getDecryptPool() {
     while (queue.length && idle.length) {
       const w = idle.pop(), job = queue.shift();
       busy.set(w, job.resolve);
-      w.postMessage({ op: 'decrypt', id: job.id, block: job.block, engine: job.engine }, [job.block.buffer]);
+      if (job.op === 'encrypt') {
+        w.postMessage({ op: 'encrypt', id: job.id, bytes: job.bytes, engine: job.engine }, [job.bytes.buffer]);
+      } else {
+        w.postMessage({ op: 'decrypt', id: job.id, block: job.block, engine: job.engine }, [job.block.buffer]);
+      }
     }
   };
   const admit = (w) => {
@@ -1123,6 +1134,9 @@ function getDecryptPool() {
     w.onmessage = (e) => {
       const msg = e.data;
       if (msg.op === 'key') {
+        // 主线程也用这把钥匙：纯 JS 引擎下首次加密/解密本来要在主线程同步跑
+        // 12 万次 PBKDF2（实测约 2s，页面直接冻住），这里借线程的成果省掉
+        FBCrypto.importJsKey(msg.key);
         // 同一线程的消息按 FIFO 处理，密钥一定排在解密任务前面
         for (let k = 1; k < size; k++) workers[k].postMessage({ op: 'initKey', key: msg.key, engine });
         workers.forEach(admit);
@@ -1159,9 +1173,17 @@ function getDecryptPool() {
     decrypt(block) {
       const id = ++seq;
       return new Promise((resolve) => {
-        queue.push({ id, block, engine: FBCrypto.native ? 'native' : 'js', resolve });
+        queue.push({ op: 'decrypt', id, block, engine: FBCrypto.native ? 'native' : 'js', resolve });
         dispatch();
       }).then((r) => { if (r.error) throw new Error(r.error); return r.pt; });
+    },
+    /** 加密也交给线程池：纯 JS 引擎下主线程单干只有 ~2.6MB/s，手机上传会拖成分钟级 */
+    encrypt(bytes) {
+      const id = ++seq;
+      return new Promise((resolve) => {
+        queue.push({ op: 'encrypt', id, bytes, engine: FBCrypto.native ? 'native' : 'js', resolve });
+        dispatch();
+      }).then((r) => { if (r.error) throw new Error(r.error); return r.ct; });
     },
   };
   return packPool;

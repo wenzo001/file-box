@@ -381,28 +381,6 @@
       return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('');
     },
 
-    /** 分块加密整个文件 → 密文 Blob（内存友好，大文件自动分块）
-     *  onBlock(密文块字节数) 用于让调用方拿到分块布局（上传按块续传要用） */
-    async encryptFile(file, onProg, onBlock) {
-      const parts = [];
-      if (!file.size) {
-        const one = await api.encryptBytes(new Uint8Array(0));
-        onBlock && onBlock(one.length);
-        parts.push(one);
-        onProg && onProg(100);
-      } else {
-        for (let off = 0; off < file.size; off += api.CHUNK) {
-          const buf = new Uint8Array(await file.slice(off, off + api.CHUNK).arrayBuffer());
-          const one = await api.encryptBytes(buf);
-          onBlock && onBlock(one.length);
-          parts.push(one);
-          onProg && onProg(Math.min(100, Math.ceil((off + api.CHUNK) / file.size * 100)));
-          await tick(); // 让出主线程，进度条不卡
-        }
-      }
-      return new Blob(parts);
-    },
-
     /** 流式解密（边下载边解密）→ 明文 Blob；onByte(已处理字节数) */
     async decryptStream(body, onByte) {
       const reader = body.getReader();

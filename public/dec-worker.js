@@ -20,6 +20,11 @@ self.onmessage = async (e) => {
       self.postMessage({ op: 'key', key, engine: used() });
       return;
     }
+    if (m.op === 'encrypt') { // 上传加密也走线程池：纯 JS 引擎下主线程单干只有 ~2.6MB/s
+      const ct = await FBCrypto.encryptBytes(m.bytes);
+      self.postMessage({ id: m.id, ct, engine: used() }, [ct.buffer]);
+      return;
+    }
     const pt = await FBCrypto.decryptBytes(m.block);
     self.postMessage({ id: m.id, pt, engine: used() }, [pt.buffer]);
   } catch (err) {
