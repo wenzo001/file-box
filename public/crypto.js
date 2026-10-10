@@ -375,10 +375,15 @@
     async exportJsKey() { return await jsKey(); },
     importJsKey(u8) { jsKeyPromise = Promise.resolve(u8); },
 
+    /** 字节数组的 SHA-256 十六进制摘要（上传分块完整性校验用） */
+    sha256Hex(u8) {
+      const h = sha256(u8 instanceof Uint8Array ? u8 : new Uint8Array(u8));
+      return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('');
+    },
+
     /** 字符串的 SHA-256 十六进制摘要（用于上传批次指纹，不涉密） */
     hashHex(str) {
-      const h = sha256(te.encode(String(str)));
-      return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('');
+      return api.sha256Hex(te.encode(String(str)));
     },
 
     /** 流式解密（边下载边解密）→ 明文 Blob；onByte(已处理字节数) */

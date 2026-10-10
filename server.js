@@ -111,6 +111,22 @@ const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000; // 未完成批次留一天，够断�
 const MAX_CHUNK = 32 * 1024 * 1024;        // 单块上限（客户端约 4MB 一块）
 const MAX_FILES = 200;                     // 单批文件数上限
 
+/** 标准 CRC32（内置查表实现：zlib.crc32 要 Node 20.15+，而本服务声明支持 Node ≥ 18） */
+const CRC_T = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_T[(c ^ buf[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 function ensureStagingDir() {
   fs.mkdirSync(STAGING_DIR, { recursive: true });
 }
@@ -240,7 +256,8 @@ app.post('/api/upload/init', (req, res) => {
   res.json({ ok: true, uploadId: key, have, total, resumed: have.length > 0 });
 });
 
-// 2) 传一块：大小必须与声明一致，先写 .tmp 再改名，断连不会留下"看起来完整"的半块
+// 2) 传一块：长度与摘要都要对得上（传输中损坏就地发现、让客户端重传），
+//    先写 .tmp 再改名，断连不会留下"看起来完整"的半块
 app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK }), (req, res) => {
   const { u, f, c } = req.query;
   const meta = isUploadId(u) ? readMeta(u) : null;
@@ -254,6 +271,18 @@ app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limi
   const buf = req.body;
   if (!Buffer.isBuffer(buf) || buf.length !== file.chunks[ci]) {
     return res.status(400).json({ error: '分块大小与声明不一致' });
+  }
+  // 完整性：客户端在 X-Chunk-Crc 里声明这块密文的 CRC32，对不上就是路上坏了，
+  // 直接让客户端重传这一块 —— 别等用户下载时才发现内容坏了，那时原文已经不在。
+  // 这里只用于发现"传输损坏"，防伪由端到端加密的 GCM 校验负责，所以用便宜的 CRC32
+  // （手机纯 JS 引擎上算 sha256 每 4MiB 要 200-400ms，会把上传拖慢一倍）
+  const declared = String(req.get('X-Chunk-Crc') || '').toLowerCase();
+  if (!/^[a-f0-9]{8}$/.test(declared)) {
+    return res.status(400).json({ error: '缺少或非法的分块校验值' });
+  }
+  const got = (crc32(buf) >>> 0).toString(16).padStart(8, '0');
+  if (got !== declared) {
+    return res.status(400).json({ error: '分块校验不通过（传输中损坏），请重传该块', resend: true });
   }
   // 预检：这次要写进来的字节会不会把上限撑破（缓存按块累加，数字是准的）
   if (usedBytes() + buf.length > STORAGE_LIMIT) return tooLarge(res);

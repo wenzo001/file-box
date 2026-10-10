@@ -471,14 +471,18 @@ const isCoarse = matchMedia('(pointer: coarse)').matches;
 if (isCoarse) $('#hint-drag').remove();
 
 const UPLOAD_TARGET = 4 * 1024 * 1024; // 每个上传块的目标大小（按加密块边界成组，不切开密文块）
+const PAD_UNIT = 64 * 1024;            // 密文长度向上取整到这个粒度，藏住精确的文件大小
 const UPLOAD_PARALLEL = 3;             // 同时在传的块数
+const CHUNK_ATTEMPTS = 3;              // 每块最多试 3 次（含首次）：抖动/掐断/被改坏都能自救
 
 /** 一个加密块占多少字节：[4B 明文长度][12B IV][密文 + 16B 校验] */
 const blockBytes = (plain) => plain + 32;
 
 /** 规划一个文件的上传块：不切开任何一个密文块，组到目标大小就封口；
- *  同时记下每块对应的明文区间 —— 续传时只加密缺的那段，不必重读整个文件。 */
-function planFile(size) {
+ *  同时记下每块对应的明文区间 —— 续传时只加密缺的那段，不必重读整个文件。
+ *  末尾补一块 0 填充，把密文凑成 PAD_UNIT 的整数倍：中间设备和服务端只看得到密文长度，
+ *  于是最多知道"大概多大"，看不出精确字节数（真实大小只记在加密的清单里，下载时裁掉）。 */
+function planFile(size, pad = true) {
   const blocks = [];
   let left = size || 0;
   if (!left) blocks.push(blockBytes(0));
@@ -487,18 +491,26 @@ function planFile(size) {
     blocks.push(blockBytes(plain));
     left -= plain;
   }
+  const raw = blocks.reduce((a, b) => a + b, 0);
+  // +32 给填充块自己留出块头；清单不填充（它只反映文件个数，而个数本来就看得见）
+  const padPlain = pad ? Math.ceil((raw + 32) / PAD_UNIT) * PAD_UNIT - raw - 32 : 0;
   const plan = [];
   let cur = 0, p0 = 0, plainEnd = 0;
   for (const b of blocks) {
     cur += b;
     plainEnd += b - 32;
     if (cur >= UPLOAD_TARGET) {
-      plan.push({ bytes: cur, p0, p1: plainEnd });
+      plan.push({ bytes: cur, p0, p1: plainEnd, padPlain: 0 });
       cur = 0;
       p0 = plainEnd;
     }
   }
-  if (cur) plan.push({ bytes: cur, p0, p1: plainEnd });
+  if (cur || !plan.length) plan.push({ bytes: cur, p0, p1: plainEnd, padPlain: 0 });
+  if (padPlain > 0) {
+    const last = plan[plan.length - 1]; // 填充块并进最后一块（块数不因此变化）
+    last.bytes += 32 + padPlain;
+    last.padPlain = padPlain;
+  }
   return plan;
 }
 const planChunks = (size) => planFile(size).map((c) => c.bytes);
@@ -531,7 +543,7 @@ function planBatch(key, files) {
   const items = files.map((f, i) => ({ name: relPath(f), size: f.size, enc: encNameOf(key, i) }));
   const manifestBytes = te.encode(JSON.stringify({ v: 1, files: items }));
   const layout = files.map((f, i) => ({ enc: items[i].enc, plan: planFile(f.size) }));
-  layout.push({ enc: 'manifest.enc', plan: planFile(manifestBytes.length), manifestBytes });
+  layout.push({ enc: 'manifest.enc', plan: planFile(manifestBytes.length, false), manifestBytes });
   for (const f of layout) f.chunks = f.plan.map((c) => c.bytes);
   return { layout, manifestBytes };
 }
@@ -762,18 +774,20 @@ async function upload() {
     const encryptChunk = async (spec, file, ci) => {
       const seg = spec.plan[ci];
       if (spec.manifestBytes) return FBCrypto.encryptBytes(spec.manifestBytes);
-      if (seg.p1 === seg.p0) return FBCrypto.encryptBytes(new Uint8Array(0)); // 0 字节文件
+      const enc = async (buf) => (crypt ? crypt.encrypt(buf) : FBCrypto.encryptBytes(buf));
       const jobs = [];
       // 逐块现加密现发，内存里只留正在传的几块：早先是把整个文件密文攒成
       // 一个 Blob 再切片，300MB 就会撞 ERR_BLOB_OUT_OF_MEMORY（峰值堆 359MB）。
       // 子块一次性派发、按序回收，才能把线程池吃满（串行等的话只用到一个线程）
-      for (let off = seg.p0; off < seg.p1; off += FBCrypto.CHUNK) {
-        const end = Math.min(off + FBCrypto.CHUNK, seg.p1);
-        jobs.push(file.slice(off, end).arrayBuffer().then((ab) => {
-          const buf = new Uint8Array(ab);
-          return crypt ? crypt.encrypt(buf) : FBCrypto.encryptBytes(buf);
-        }));
+      if (seg.p1 === seg.p0) {
+        jobs.push(enc(new Uint8Array(0))); // 0 字节文件
+      } else {
+        for (let off = seg.p0; off < seg.p1; off += FBCrypto.CHUNK) {
+          const end = Math.min(off + FBCrypto.CHUNK, seg.p1);
+          jobs.push(file.slice(off, end).arrayBuffer().then((ab) => enc(new Uint8Array(ab))));
+        }
       }
+      if (seg.padPlain) jobs.push(enc(new Uint8Array(seg.padPlain))); // 长度对齐那一块（全 0）
       const parts = await Promise.all(jobs);
       let len = 0;
       for (const p of parts) len += p.length;
@@ -781,6 +795,43 @@ async function upload() {
       let o = 0;
       for (const p of parts) { out.set(p, o); o += p.length; }
       return out;
+    };
+
+    // 每块的 CRC32：只为发现"传输中被改坏"，用便宜的算法（主线程约 8ms/4MiB）。
+    // 试过 sha256：手机纯 JS 上每块要 200-400ms，会把上传拖慢一倍，不值得
+    const crcOf = (bytes) => crcDone(crcFeed(bytes, 0xffffffff)).toString(16).padStart(8, '0');
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 传一块：网络抖动、被中途掐断、路上被改坏，都自动重试（最多 3 次），
+    // 三次都没过才放弃（进度与清单保留，可手动续传）；明确被拒的（大小不符/超额/过期）不重试
+    const putChunk = async (fi, ci, body, crc) => {
+      const url = `/api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`;
+      let lastErr = new Error('上传失败');
+      for (let attempt = 1; attempt <= CHUNK_ATTEMPTS; attempt++) {
+        let r = null, d = {};
+        try {
+          r = await fetch(url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-Crc': crc },
+            body,
+          });
+          if (r.ok) return;
+          d = await r.json().catch(() => ({}));
+        } catch { /* fetch 抛了：网络层失败，按可重试处理 */ }
+        const status = r ? r.status : 0;
+        // 网络层失败说"上传中断"（别报一个用户看不懂的细节），服务端明确拒绝则照原话显示
+        lastErr = status === 0
+          ? new Error(navigator.onLine === false ? '网络已断开' : '上传中断')
+          : new Error(d.error || `第 ${fi + 1} 个文件第 ${ci + 1} 块上传失败`);
+        const worthRetry = status === 0 || status >= 500 || status === 408 || status === 429 ||
+          /校验不通过/.test(d.error || '');
+        if (!worthRetry) throw lastErr;
+        if (attempt < CHUNK_ATTEMPTS) {
+          setStatus(`第 ${fi + 1} 个文件第 ${ci + 1} 块重试中（${attempt}/${CHUNK_ATTEMPTS - 1}）…`);
+          await sleep(300 * attempt);
+        }
+      }
+      throw lastErr;
     };
 
     // 并发传块；任一失败就停下并保留进度，下次点「继续上传」接着来
@@ -791,18 +842,10 @@ async function upload() {
       const spec = layout[fi];
       const body = await encryptChunk(spec, selected[fi], ci);
       if (body.length !== spec.chunks[ci]) throw new Error('分块大小不符，请重试'); // 布局校验：对不上就宁可不传
-      const req = fetch(`/api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body,
-      });
-      inflight.add(req);
-      let r;
-      try { r = await req; } finally { inflight.delete(req); }
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        throw new Error(d.error || `第 ${fi + 1} 个文件第 ${ci + 1} 块上传失败`);
-      }
+      const crc = crcOf(body);
+      const task = putChunk(fi, ci, body, crc); // 记整段（含重试），完成后才推进度
+      inflight.add(task);
+      try { await task; } finally { inflight.delete(task); }
       have.add(`${fi}-${ci}`);
       doneNow++;
       markBlockDone(batch, fi, ci);
@@ -1022,7 +1065,7 @@ async function fillBody(el) {
         <div class="file-row">
           <span class="name" title="${esc(f.name)}">${esc(f.name)}</span>
           <span class="size">${fmtSize(f.size)}</span>
-          <a href="javascript:void(0)" class="dl" data-folder="${enc(folder)}" data-enc="${enc(f.enc)}" data-name="${esc(f.name)}">下载</a>
+          <a href="javascript:void(0)" class="dl" data-folder="${enc(folder)}" data-enc="${enc(f.enc)}" data-name="${esc(f.name)}" data-size="${f.size}">下载</a>
         </div>`);
     } else {
       // 旧数据（未加密）：直接展示与下载
@@ -1059,6 +1102,15 @@ async function fetchAndDecrypt(folder, encName) {
   }
   return FBCrypto.decryptStream(r.body);
 }
+/** 明文按清单里的真实大小裁剪：上传时为了藏住精确大小补过 0，这里把填充去掉，
+ *  顺便校验长度对不对（短了就是坏了，宁可报错也别给用户半个文件）。
+ *  size 传 null 表示"不知道真实大小"（旧数据/没有清单），此时原样返回 ——
+ *  注意 0 是合法大小，不能和"不知道"混为一谈。 */
+function trimToDeclared(blob, size) {
+  if (size === null) return blob;
+  if (blob.size < size) throw new Error('文件长度与清单不符（数据不完整）');
+  return blob.size > size ? blob.slice(0, size) : blob;
+}
 // 单文件下载（事件委托，文件行里的「下载」）
 document.addEventListener('click', async (e) => {
   const a = e.target.closest('a.dl');
@@ -1067,7 +1119,11 @@ document.addEventListener('click', async (e) => {
   const name = a.dataset.name;
   a.textContent = '下载中…';
   try {
-    const blob = await fetchAndDecrypt(decodeURIComponent(a.dataset.folder), decodeURIComponent(a.dataset.enc));
+    const declared = a.dataset.size === undefined ? null : Number(a.dataset.size);
+    const blob = trimToDeclared(
+      await fetchAndDecrypt(decodeURIComponent(a.dataset.folder), decodeURIComponent(a.dataset.enc)),
+      declared,
+    );
     saveBlob(blob, name);
   } catch (err) {
     toast(err.message || '下载失败');
@@ -1301,7 +1357,7 @@ async function downZip(nameEnc, btn) {
     const rd = createArchiveReader(r.body);
     const zip = createZipWriter();
     const win = (pool ? pool.size : 0) + 1; // 在途块数：让网络与多核解密重叠
-    let nameMap = null, count = 0, done = 0, consumed = 0;
+    let nameMap = null, sizeMap = null, count = 0, done = 0, consumed = 0;
     setLabel('0%');
 
     for (;;) {
@@ -1324,16 +1380,25 @@ async function downZip(nameEnc, btn) {
         // 清单也交给线程池：纯 JS 引擎下首次派生密钥要 0.7s，别冻住主线程
         const plain = await (pool ? pool.decrypt(mf) : FBCrypto.decryptBytes(mf));
         const m = JSON.parse(td.decode(plain));
-        if (m && m.files) nameMap = new Map(m.files.map((x) => [x.enc, x.name]));
+        if (m && m.files) {
+          nameMap = new Map(m.files.map((x) => [x.enc, x.name]));
+          sizeMap = new Map(m.files.map((x) => [x.enc, x.size])); // 明文真实大小：用来裁掉长度填充
+        }
         continue;
       }
 
       const dataParts = [];
       let crc = 0xffffffff, psize = 0, left = size;
+      const declared = sizeMap ? sizeMap.get(name) : undefined;
       const emit = (pt) => {
-        crc = crcFeed(pt, crc);
-        psize += pt.length;
-        dataParts.push(new Blob([pt]));
+        let chunk = pt;
+        // 上传时为藏住精确大小补过 0：按清单里的真实大小裁掉（旧文件没补过，等于不裁）
+        if (declared !== undefined && psize + chunk.length > declared) {
+          chunk = chunk.subarray(0, Math.max(0, declared - psize));
+        }
+        crc = crcFeed(chunk, crc);
+        psize += chunk.length;
+        dataParts.push(new Blob([chunk]));
       };
       if (nameMap) {
         // 加密目录：边下边分块解密，最多 win 块在途
@@ -1359,6 +1424,10 @@ async function downZip(nameEnc, btn) {
           emit(chunk);
           paint(done, total);
         }
+      }
+      // 裁掉填充后长度必须与清单声明的一致，短了就是坏了 —— 宁可报错也别给半个文件
+      if (declared !== undefined && psize !== declared) {
+        throw new Error('文件长度与清单不符（数据不完整）');
       }
       zip.add((nameMap && nameMap.get(name)) || name, crcDone(crc), psize, dataParts);
       count++;
