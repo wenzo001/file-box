@@ -14,6 +14,9 @@ uploads/
 
 # 发布产物（npm run pack 生成）
 dist/
+
+# 未完成的分块上传暂存（跑起来才生成）
+.uploading/
 .DS_Store
 Thumbs.db
 

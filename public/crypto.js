@@ -375,16 +375,27 @@
     async exportJsKey() { return await jsKey(); },
     importJsKey(u8) { jsKeyPromise = Promise.resolve(u8); },
 
-    /** 分块加密整个文件 → 密文 Blob（内存友好，大文件自动分块） */
-    async encryptFile(file, onProg) {
+    /** 字符串的 SHA-256 十六进制摘要（用于上传批次指纹，不涉密） */
+    hashHex(str) {
+      const h = sha256(te.encode(String(str)));
+      return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('');
+    },
+
+    /** 分块加密整个文件 → 密文 Blob（内存友好，大文件自动分块）
+     *  onBlock(密文块字节数) 用于让调用方拿到分块布局（上传按块续传要用） */
+    async encryptFile(file, onProg, onBlock) {
       const parts = [];
       if (!file.size) {
-        parts.push(await api.encryptBytes(new Uint8Array(0)));
+        const one = await api.encryptBytes(new Uint8Array(0));
+        onBlock && onBlock(one.length);
+        parts.push(one);
         onProg && onProg(100);
       } else {
         for (let off = 0; off < file.size; off += api.CHUNK) {
           const buf = new Uint8Array(await file.slice(off, off + api.CHUNK).arrayBuffer());
-          parts.push(await api.encryptBytes(buf));
+          const one = await api.encryptBytes(buf);
+          onBlock && onBlock(one.length);
+          parts.push(one);
           onProg && onProg(Math.min(100, Math.ceil((off + api.CHUNK) / file.size * 100)));
           await tick(); // 让出主线程，进度条不卡
         }

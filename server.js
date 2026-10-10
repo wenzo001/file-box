@@ -2,11 +2,12 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const { pipeline } = require('stream/promises');
 const express = require('express');
-const multer = require('multer');
 const selfsigned = require('selfsigned');
 
 const app = express();
+app.use(express.json({ limit: '2mb' })); // init/finish 这类小 JSON 请求体
 
 // ---- 配置（均可通过环境变量覆盖） ----
 const PORT = Number(process.env.PORT) || 3000;              // HTTP 端口（完整服务）
@@ -56,39 +57,10 @@ function folderName(now) {
   );
 }
 
-/** 创建不重名的上传目录（同一分钟内多次上传自动追加 _2、_3...；并发安全） */
-function createUploadFolder() {
-  const base = folderName(new Date());
-  let name = base;
-  let i = 1;
-  for (;;) {
-    try {
-      fs.mkdirSync(path.join(UPLOAD_DIR, name));
-      return name;
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        name = `${base}_${++i}`; // 目录已存在，试试下一个序号
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
 /** 文件名安全化：去掉路径分隔符，避免目录穿越 */
 function safeName(name) {
   const base = path.basename(String(name || '')).replace(/[/\\]/g, '_').trim();
   return base === '.' || base === '..' || base === '' ? '' : base;
-}
-
-/** 修正 multer(busboy) 将文件名按 latin1 解析导致的中文乱码；纯 ASCII 名不受影响 */
-function fixName(name) {
-  try {
-    const decoded = Buffer.from(name, 'latin1').toString('utf8');
-    return decoded.includes('\uFFFD') ? name : decoded;
-  } catch {
-    return name;
-  }
 }
 
 // ---- 存储空间统计与过期清理 ----
@@ -130,47 +102,186 @@ function cleanupExpired() {
 cleanupExpired();
 setInterval(cleanupExpired, 6 * 60 * 60 * 1000).unref();
 
-// ---- 上传（multer 2.x，按批次存进当次新建的目录；文件内容已由前端端到端加密） ----
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    try {
-      if (!req.uploadFolder) req.uploadFolder = createUploadFolder();
-      cb(null, path.join(UPLOAD_DIR, req.uploadFolder));
-    } catch (err) {
-      cb(err);
-    }
-  },
-  filename(req, file, cb) {
-    const name = safeName(fixName(file.originalname)) || `file_${Date.now()}`;
-    cb(null, name);
-  },
-});
+// ---- 上传：分块 + 断点续传 ----
+// 分块先落到 uploads 之外的 .uploading/<批次>/，全部块传完再按「完成那一刻」的时间
+// 命名并搬进 uploads。所以：列表里永远看不到上传到一半的目录，展示的时间就是传完的时刻。
+// 中断后重新发起同一批文件（客户端用批次指纹识别），只补缺失的块即可接着传。
+const STAGING_DIR = path.join(__dirname, '.uploading');
+const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000; // 未完成批次留一天，够断点续传，过期回收
+const MAX_CHUNK = 32 * 1024 * 1024;        // 单块上限（客户端约 4MB 一块）
+const MAX_FILES = 200;                     // 单批文件数上限
 
-const upload = multer({
-  storage,
-  // 单文件不设大小限制（由下面存储总量 10GB 兜底）；单次最多 200 个文件
-  limits: { fileSize: Infinity, files: 200 },
-});
+function ensureStagingDir() {
+  fs.mkdirSync(STAGING_DIR, { recursive: true });
+}
+ensureStagingDir();
 
-app.post(
-  '/api/upload',
-  (req, res, next) => {
-    cleanupExpired(); // 上传前先做一次过期清理，腾出空间
-    if (dirSize(UPLOAD_DIR) >= STORAGE_LIMIT) {
-      return res.status(413).json({
-        error: `存储空间已达上限（${STORAGE_LIMIT_GB}GB），请先删除无用文件`,
-      });
+const isUploadId = (id) => /^[a-f0-9]{16,64}$/.test(String(id || ''));
+const uploadDirOf = (id) => path.join(STAGING_DIR, String(id));
+
+/** 回收过期未完成批次（进程被杀、客户端再也不回来） */
+function sweepStaging(maxAgeMs = UPLOAD_TTL_MS) {
+  ensureStagingDir();
+  const now = Date.now();
+  for (const name of fs.readdirSync(STAGING_DIR)) {
+    const p = path.join(STAGING_DIR, name);
+    let st;
+    try { st = fs.statSync(p); } catch { continue; }
+    if (now - st.mtimeMs > maxAgeMs) {
+      fs.rmSync(p, { recursive: true, force: true });
+      console.log(`[上传] 回收过期未完成的批次 ${name}`);
     }
-    next();
-  },
-  upload.array('files'),
-  (req, res) => {
-    if (!req.uploadFolder) {
-      return res.status(400).json({ error: '没有收到文件' });
-    }
-    res.json({ ok: true, folder: req.uploadFolder, count: req.files.length });
   }
-);
+}
+sweepStaging(0); // 启动时：上个进程的批次都已随进程中断，直接清干净
+setInterval(() => sweepStaging(), 6 * 60 * 60 * 1000).unref();
+
+const readMeta = (id) => {
+  try { return JSON.parse(fs.readFileSync(path.join(uploadDirOf(id), 'meta.json'), 'utf8')); } catch { return null; }
+};
+
+/** 磁盘上已收到的块（不信内存状态，重启后依然准确） */
+function haveParts(id) {
+  let names;
+  try { names = fs.readdirSync(uploadDirOf(id)); } catch { return []; }
+  const out = [];
+  for (const n of names) {
+    const m = n.match(/^part-(\d+)-(\d+)\.bin$/);
+    if (m) out.push({ f: Number(m[1]), c: Number(m[2]) });
+  }
+  return out;
+}
+
+/** 校验分块声明：文件名安全、不重复、块大小在范围内 */
+function metaProblem(files) {
+  if (!Array.isArray(files) || !files.length) return '没有文件';
+  if (files.length > MAX_FILES) return `单次最多 ${MAX_FILES} 个文件`;
+  const seen = new Set();
+  for (const f of files) {
+    if (!f || typeof f.enc !== 'string' || !f.enc || safeName(f.enc) !== f.enc) return '文件名不合法';
+    if (seen.has(f.enc)) return `文件名重复: ${f.enc}`;
+    seen.add(f.enc);
+    if (!Array.isArray(f.chunks) || !f.chunks.length) return '分块信息不合法';
+    for (const c of f.chunks) {
+      if (!Number.isInteger(c) || c <= 0 || c > MAX_CHUNK) return '分块大小不合法';
+    }
+  }
+  return null;
+}
+
+/** 把暂存目录搬进 uploads，名字用完成时刻；撞上同分钟的批次就追加序号 */
+function commitStaging(stagingDir) {
+  const base = folderName(new Date());
+  for (let i = 1; i <= 50; i++) {
+    const name = i === 1 ? base : `${base}_${i}`;
+    const target = path.join(UPLOAD_DIR, name);
+    try {
+      if (fs.existsSync(target)) continue;
+      fs.renameSync(stagingDir, target); // 同盘 rename，一步到位
+      return name;
+    } catch (err) {
+      if (err.code === 'EEXIST' || err.code === 'EPERM') continue; // 并发抢了同名目录，换下一个
+      throw err;
+    }
+  }
+  throw new Error('同一分钟内上传批次过多，请稍后重试');
+}
+
+const storageFull = () => dirSize(UPLOAD_DIR) + dirSize(STAGING_DIR) >= STORAGE_LIMIT;
+const tooLarge = (res) =>
+  res.status(413).json({ error: `存储空间已达上限（${STORAGE_LIMIT_GB}GB），请先删除无用文件` });
+
+// 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
+app.post('/api/upload/init', (req, res) => {
+  cleanupExpired();
+  const { key, files } = req.body || {};
+  if (typeof key !== 'string' || !/^[a-f0-9]{16,64}$/.test(key)) {
+    return res.status(400).json({ error: '批次标识不合法' });
+  }
+  const bad = metaProblem(files);
+  if (bad) return res.status(400).json({ error: bad });
+  if (storageFull()) return tooLarge(res);
+
+  const dir = uploadDirOf(key);
+  const old = readMeta(key);
+  // 同一指纹但分块布局变了（换了引擎/文件变了）：旧块不可用，整批重来
+  const sameLayout = old && JSON.stringify(old.files) === JSON.stringify(files);
+  if (old && !sameLayout) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log(`[上传] 批次 ${key.slice(0, 8)} 分块布局变化，重新开始`);
+  }
+  if (!sameLayout) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ v: 1, key, files }));
+  }
+  const have = sameLayout ? haveParts(key) : [];
+  const total = files.reduce((s, f) => s + f.chunks.length, 0);
+  res.json({ ok: true, uploadId: key, have, total, resumed: have.length > 0 });
+});
+
+// 2) 传一块：大小必须与声明一致，先写 .tmp 再改名，断连不会留下"看起来完整"的半块
+app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK }), (req, res) => {
+  const { u, f, c } = req.query;
+  const meta = isUploadId(u) ? readMeta(u) : null;
+  if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
+  const fi = Number(f);
+  const ci = Number(c);
+  const file = meta.files[fi];
+  if (!file || !Number.isInteger(ci) || ci < 0 || ci >= file.chunks.length) {
+    return res.status(400).json({ error: '分块序号不合法' });
+  }
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || buf.length !== file.chunks[ci]) {
+    return res.status(400).json({ error: '分块大小与声明不一致' });
+  }
+  const dir = uploadDirOf(u);
+  const tmp = path.join(dir, `part-${fi}-${ci}.tmp`);
+  const dst = path.join(dir, `part-${fi}-${ci}.bin`);
+  try {
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, dst);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    return res.status(500).json({ error: '写入分块失败' });
+  }
+  res.json({ ok: true, size: buf.length });
+});
+
+// 3) 收尾：校验块齐了 → 按序拼成文件 → 迁入 uploads（此时才出现在列表里）
+app.post('/api/upload/finish', (req, res) => {
+  const { uploadId } = req.body || {};
+  const meta = isUploadId(uploadId) ? readMeta(uploadId) : null;
+  if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
+  const dir = uploadDirOf(uploadId);
+  const have = new Set(haveParts(uploadId).map((p) => `${p.f}-${p.c}`));
+  const total = meta.files.reduce((s, f) => s + f.chunks.length, 0);
+  if (have.size !== total) {
+    return res.status(409).json({ error: `还有 ${total - have.size} 块没传完`, have: [...have] });
+  }
+  (async () => {
+    try {
+      for (let fi = 0; fi < meta.files.length; fi++) {
+        const f = meta.files[fi];
+        const out = path.join(dir, f.enc);
+        for (let ci = 0; ci < f.chunks.length; ci++) {
+          const part = path.join(dir, `part-${fi}-${ci}.bin`);
+          await pipeline(fs.createReadStream(part), fs.createWriteStream(out, { flags: 'a' }));
+          fs.rmSync(part, { force: true }); // 拼一块删一块，峰值不翻倍
+        }
+      }
+      // 拼完就把批次账本与残余分块清掉，别让它们跟着 rename 进 uploads
+      fs.rmSync(path.join(dir, 'meta.json'), { force: true });
+      for (const leftover of fs.readdirSync(dir)) {
+        if (/^part-\d+-\d+\.(bin|tmp)$/.test(leftover)) fs.rmSync(path.join(dir, leftover), { force: true });
+      }
+      const folder = commitStaging(dir); // 名字 = 完成时刻
+      res.json({ ok: true, folder, count: meta.files.filter((f) => f.enc !== MANIFEST).length });
+    } catch (err) {
+      console.error('[上传] 合并分块失败', err);
+      if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
+    }
+  })();
+});
 
 // ---- 文件列表（按时间倒序：新的在前） ----
 // 文件名/大小来自磁盘（密文名）；真实文件名在前端解密 manifest.enc 后还原
@@ -288,14 +399,14 @@ app.get('/api/archive/:folder', async (req, res) => {
 // ---- 前端静态页 ----
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---- 统一错误处理（multer 等） ----
+// ---- 统一错误处理 ----
 app.use((err, req, res, next) => {
   if (!err) return next();
   console.error(err);
   const msg =
-    err.code === 'LIMIT_FILE_COUNT' ? '单次最多上传 200 个文件' :
+    err.type === 'entity.too.large' ? '请求体过大（单个分块超过上限）' :
     err.message || '请求处理失败';
-  res.status(400).json({ error: msg });
+  res.status(err.status || 400).json({ error: msg });
 });
 
 // ---- 双端口启动：HTTP 可直接用；HTTPS 更优（传输层加密 + 原生加密引擎） ----

@@ -27,7 +27,7 @@ const INCLUDE = [
   'public',
 ];
 // 产物顶层一旦出现这些，直接失败
-const FORBIDDEN = [/^uploads\//, /^\.certs\//, /^\.git\//, /^dist\//, /\.log$/, /^\.env/, /^scripts\//];
+const FORBIDDEN = [/^uploads\//, /^\.uploading\//, /^\.certs\//, /^\.git\//, /^dist\//, /\.log$/, /^\.env/, /^scripts\//];
 
 const sizeOf = (p) => (fs.statSync(p).isDirectory()
   ? fs.readdirSync(p).reduce((s, f) => s + sizeOf(path.join(p, f)), 0)
