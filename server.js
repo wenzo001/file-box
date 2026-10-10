@@ -152,13 +152,18 @@ function haveParts(id) {
   return out;
 }
 
-/** 校验分块声明：文件名安全、不重复、块大小在范围内 */
+/** 这些名字在批次目录里有特殊用途，声明成文件会把账本/分块覆盖掉（例如叫 part-0-1.bin
+ *  会让合并时把文件往自己身上追加），一律拒绝 */
+const RESERVED_NAME = /^(meta\.json|part-\d+-\d+\.(bin|tmp))$/;
+
+/** 校验分块声明：文件名安全、不重复、不是保留名、块大小在范围内 */
 function metaProblem(files) {
   if (!Array.isArray(files) || !files.length) return '没有文件';
   if (files.length > MAX_FILES) return `单次最多 ${MAX_FILES} 个文件`;
   const seen = new Set();
   for (const f of files) {
     if (!f || typeof f.enc !== 'string' || !f.enc || safeName(f.enc) !== f.enc) return '文件名不合法';
+    if (RESERVED_NAME.test(f.enc)) return `文件名被占用: ${f.enc}`;
     if (seen.has(f.enc)) return `文件名重复: ${f.enc}`;
     seen.add(f.enc);
     if (!Array.isArray(f.chunks) || !f.chunks.length) return '分块信息不合法';
@@ -168,6 +173,9 @@ function metaProblem(files) {
   }
   return null;
 }
+
+/** 这批声明要占多少字节 */
+const declaredBytes = (files) => files.reduce((s, f) => s + f.chunks.reduce((a, b) => a + b, 0), 0);
 
 /** 把暂存目录搬进 uploads，名字用完成时刻；撞上同分钟的批次就追加序号 */
 function commitStaging(stagingDir) {
@@ -191,6 +199,16 @@ const storageFull = () => dirSize(UPLOAD_DIR) + dirSize(STAGING_DIR) >= STORAGE_
 const tooLarge = (res) =>
   res.status(413).json({ error: `存储空间已达上限（${STORAGE_LIMIT_GB}GB），请先删除无用文件` });
 
+// 已用空间带 30 秒缓存：分块写入路径上要频繁判断，不能每块都全盘遍历一遍
+let usageCache = { at: 0, bytes: 0 };
+function usedBytes() {
+  if (Date.now() - usageCache.at > 30 * 1000) {
+    usageCache = { at: Date.now(), bytes: dirSize(UPLOAD_DIR) + dirSize(STAGING_DIR) };
+  }
+  return usageCache.bytes;
+}
+const forgetUsage = () => { usageCache.at = 0; }; // 提交/删除后立刻失效，别让缓存骗人
+
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
 app.post('/api/upload/init', (req, res) => {
   cleanupExpired();
@@ -200,7 +218,10 @@ app.post('/api/upload/init', (req, res) => {
   }
   const bad = metaProblem(files);
   if (bad) return res.status(400).json({ error: bad });
-  if (storageFull()) return tooLarge(res);
+  // 上限要连着「这批声明的字节」一起算：只看到当前占用的话，分块是逐个写进来的，没人拦
+  const stagedHere = fs.existsSync(uploadDirOf(key)) ? dirSize(uploadDirOf(key)) : 0;
+  const declared = declaredBytes(files);
+  if (usedBytes() - stagedHere + declared > STORAGE_LIMIT) return tooLarge(res);
 
   const dir = uploadDirOf(key);
   const old = readMeta(key);
@@ -234,9 +255,12 @@ app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limi
   if (!Buffer.isBuffer(buf) || buf.length !== file.chunks[ci]) {
     return res.status(400).json({ error: '分块大小与声明不一致' });
   }
+  // 预检：这次要写进来的字节会不会把上限撑破（缓存按块累加，数字是准的）
+  if (usedBytes() + buf.length > STORAGE_LIMIT) return tooLarge(res);
   const dir = uploadDirOf(u);
   const tmp = path.join(dir, `part-${fi}-${ci}.tmp`);
   const dst = path.join(dir, `part-${fi}-${ci}.bin`);
+  const existed = fs.existsSync(dst);
   try {
     fs.writeFileSync(tmp, buf);
     fs.renameSync(tmp, dst);
@@ -244,6 +268,7 @@ app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limi
     fs.rmSync(tmp, { force: true });
     return res.status(500).json({ error: '写入分块失败' });
   }
+  if (!existed) usageCache.bytes += buf.length; // 只加新增的，重传同一块不重复计
   res.json({ ok: true, size: buf.length });
 });
 
@@ -260,6 +285,7 @@ app.post('/api/upload/finish', (req, res) => {
   }
   (async () => {
     try {
+      if (usedBytes() >= STORAGE_LIMIT) return tooLarge(res); // 落盘前再确认一次，别把上限撑破
       for (let fi = 0; fi < meta.files.length; fi++) {
         const f = meta.files[fi];
         const out = path.join(dir, f.enc);
@@ -275,12 +301,15 @@ app.post('/api/upload/finish', (req, res) => {
         if (/^part-\d+-\d+\.(bin|tmp)$/.test(leftover)) fs.rmSync(path.join(dir, leftover), { force: true });
       }
       const folder = commitStaging(dir); // 名字 = 完成时刻
+      forgetUsage(); // 刚搬进 uploads，缓存里的占用已经不准了
       res.json({ ok: true, folder, count: meta.files.filter((f) => f.enc !== MANIFEST).length });
     } catch (err) {
       console.error('[上传] 合并分块失败', err);
-      if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
+      try {
+        if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
+      } catch { /* 连接已经断了，没什么可做的 */ }
     }
-  })();
+  })().catch((err) => console.error('[上传] 收尾流程异常', err));
 });
 
 // ---- 文件列表（按时间倒序：新的在前） ----
@@ -324,6 +353,7 @@ app.delete('/api/folder/:folder', (req, res) => {
     return res.status(404).json({ error: '目录不存在' });
   }
   fs.rmSync(dir, { recursive: true, force: true });
+  forgetUsage(); // 腾出的空间要立刻反映到上限判断上
   res.json({ ok: true });
 });
 

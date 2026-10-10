@@ -628,12 +628,14 @@ drop.addEventListener('drop', (e) => {
   addFiles(e.dataTransfer.files);
 });
 input.addEventListener('change', () => { addFiles(input.files); input.value = ''; });
-// 追加合并（按 名称+大小 去重），支持分几次把文件凑齐
+// 追加合并（按 名称+大小+修改时间 去重），支持分几次把文件凑齐。
+// 带上修改时间：不同目录里同名同大小但内容不同的两个文件不会被误判成重复而丢掉
+const fileKey = (f) => `${relPath(f)}@${f.size}@${f.lastModified || 0}`;
 function addFiles(list) {
   if (uploading || !list || !list.length) return;
-  const seen = new Set(selected.map((f) => relPath(f) + '@' + f.size));
+  const seen = new Set(selected.map(fileKey));
   for (const f of Array.from(list)) {
-    const k = relPath(f) + '@' + f.size;
+    const k = fileKey(f);
     if (seen.has(k)) continue;
     seen.add(k);
     selected.push(f);
@@ -684,17 +686,20 @@ async function upload() {
       const seg = spec.plan[ci];
       if (spec.manifestBytes) return FBCrypto.encryptBytes(spec.manifestBytes);
       if (seg.p1 === seg.p0) return FBCrypto.encryptBytes(new Uint8Array(0)); // 0 字节文件
-      const parts = [];
-      let len = 0;
+      const jobs = [];
       // 逐块现加密现发，内存里只留正在传的几块：早先是把整个文件密文攒成
-      // 一个 Blob 再切片，300MB 就会撞 ERR_BLOB_OUT_OF_MEMORY（峰值堆 359MB）
+      // 一个 Blob 再切片，300MB 就会撞 ERR_BLOB_OUT_OF_MEMORY（峰值堆 359MB）。
+      // 子块一次性派发、按序回收，才能把线程池吃满（串行等的话只用到一个线程）
       for (let off = seg.p0; off < seg.p1; off += FBCrypto.CHUNK) {
         const end = Math.min(off + FBCrypto.CHUNK, seg.p1);
-        const buf = new Uint8Array(await file.slice(off, end).arrayBuffer());
-        const one = crypt ? await crypt.encrypt(buf) : await FBCrypto.encryptBytes(buf);
-        parts.push(one);
-        len += one.length;
+        jobs.push(file.slice(off, end).arrayBuffer().then((ab) => {
+          const buf = new Uint8Array(ab);
+          return crypt ? crypt.encrypt(buf) : FBCrypto.encryptBytes(buf);
+        }));
       }
+      const parts = await Promise.all(jobs);
+      let len = 0;
+      for (const p of parts) len += p.length;
       const out = new Uint8Array(len);
       let o = 0;
       for (const p of parts) { out.set(p, o); o += p.length; }
