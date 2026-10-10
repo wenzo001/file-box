@@ -135,10 +135,22 @@
   #file-list .rm svg { width: 15px; height: 15px; }
   #file-list .rm:active { opacity: .4; }
 
-  .bar { height: 5px; border-radius: 3px; background: var(--fill);
-    margin-top: 14px; overflow: hidden; display: none; }
-  .bar > div { height: 100%; width: 0%; background: var(--accent);
-    border-radius: 3px; transition: width .15s linear; }
+  /* 上传进度：一块一块拼成的长条。每块 = 一个上传块（固定约 4MiB，最后一块是余数），
+     块数随文件大小变；块多了自动换行，超过 4 行才出现滚动，免得把按钮挤下去 */
+  #blocks {
+    display: flex; flex-wrap: wrap; gap: 2px;
+    margin-top: 14px; padding: 3px; border-radius: 7px;
+    background: var(--fill); max-height: 78px; overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  #blocks .blk {
+    width: 9px; height: 12px; border-radius: 2px; background: var(--card);
+    transition: background .12s, opacity .12s;
+  }
+  #blocks .blk.done { background: var(--accent-fill); }
+  #blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
+  #blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); } /* 清单那一块 */
+  @keyframes blkPulse { 50% { opacity: .3; } }
   #up-status {
     font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
     font-variant-numeric: tabular-nums;
@@ -348,7 +360,7 @@
             </span>
           </div>
           <div id="file-list"></div>
-          <div class="bar" id="bar"><div></div></div>
+          <div id="blocks" hidden></div>
           <div id="up-status" style="display:none"></div>
           <button type="submit" class="btn btn-primary" id="submit">上传</button>
         </div>
@@ -535,9 +547,69 @@ const apiPost = async (path, body) => {
   return d;
 };
 
+/** 进度长条：每块 = 一个上传块（固定约 4MiB，最后一块是余数），块数随文件大小变。
+ *  先按批次布局把格子铺好（少了就自动换行），再按已传的块点亮。 */
+function renderStrip(b) {
+  const box = $('#blocks');
+  box.innerHTML = '';
+  if (!b || !b.layout) { box.hidden = true; b && (b.blkEls = null); return; }
+  b.blkEls = [];
+  b.blkBase = [];
+  b.layout.forEach((spec) => {
+    b.blkBase.push(b.blkEls.length);
+    spec.chunks.forEach((bytes, ci) => {
+      const el = document.createElement('span');
+      el.className = 'blk' + (spec.manifestBytes ? ' meta' : '');
+      el.title = spec.manifestBytes ? `文件名清单（加密）· ${fmtSize(bytes)}` : `第 ${ci + 1} 块 · ${fmtSize(bytes)}`;
+      box.appendChild(el);
+      b.blkEls.push(el);
+    });
+  });
+  box.hidden = false;
+  paintStrip(b);
+}
+
+/** 按「已传的块」整体重刷（刚进页面看到续传进度、重新选文件时用） */
+function paintStrip(b) {
+  if (!b || !b.blkEls) return;
+  let pointed = false;
+  b.layout.forEach((spec, fi) => spec.chunks.forEach((_, ci) => {
+    const el = b.blkEls[b.blkBase[fi] + ci];
+    if (!el) return;
+    const done = b.have.has(`${fi}-${ci}`);
+    el.classList.toggle('done', done);
+    const active = !done && !pointed;
+    el.classList.toggle('active', active);
+    if (active) pointed = true;
+  }));
+  scrollActiveIntoView();
+}
+
+/** 传完一块：只点亮那一格，把「进行中」挪到下一格（大文件时别整条重刷） */
+function markBlockDone(b, fi, ci) {
+  if (!b || !b.blkEls) return;
+  const el = b.blkEls[b.blkBase[fi] + ci];
+  if (!el) return;
+  el.classList.remove('active');
+  el.classList.add('done');
+  const next = el.nextElementSibling;
+  if (next && !next.classList.contains('done')) next.classList.add('active');
+  scrollActiveIntoView();
+}
+
+/** 块多到超出可视高度时，让「进行中」那格留在视野里 */
+function scrollActiveIntoView() {
+  const box = $('#blocks');
+  const act = box.querySelector('.blk.active');
+  if (!act || box.scrollHeight <= box.clientHeight) return;
+  if (act.offsetTop < box.scrollTop || act.offsetTop + act.offsetHeight > box.scrollTop + box.clientHeight) {
+    box.scrollTop = Math.max(0, act.offsetTop - box.clientHeight / 2);
+  }
+}
+
 /** 问服务端这批文件有多少块已经传过了；清单一变就重新问（用于「继续上传」） */
 async function refreshBatch() {
-  if (!selected.length) { batch = null; return null; }
+  if (!selected.length) { batch = null; renderStrip(null); return null; }
   const version = selectionVersion;
   const key = batchIdentity(selected).key;
   const plan = planBatch(key, selected);
@@ -553,8 +625,13 @@ async function refreshBatch() {
     have: new Set(r.have.map((p) => `${p.f}-${p.c}`)),
   };
   renderUpload();
+  renderStrip(batch); // 选完文件就能看到「上次传到哪」，点上传前心里有数
   return batch;
 }
+
+/** 后台同步批次：失败就把长条清掉，别让上一批的格子留在新清单下面误导人
+ *  （上传时走 refreshBatch 本体，那样错误信息能如实冒到 toast 上） */
+const syncBatch = () => refreshBatch().catch(() => { batch = null; renderStrip(null); });
 
 // 状态机：未选文件 → 主按钮是「选择文件」；已选 → 清单 + 主按钮「上传」
 // 任一时刻只有一个主操作，第一次进来照着点即可
@@ -610,6 +687,7 @@ $('#clear').addEventListener('click', () => {
   selectionVersion++;
   batch = null;
   renderUpload();
+  renderStrip(null);
 });
 $('#file-list').addEventListener('click', (e) => {
   const b = e.target.closest('.rm');
@@ -617,7 +695,7 @@ $('#file-list').addEventListener('click', (e) => {
   selected.splice(Number(b.dataset.i), 1);
   selectionVersion++;
   renderUpload();
-  refreshBatch().catch(() => {});
+  syncBatch();
 });
 
 drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('dragging'); });
@@ -642,17 +720,15 @@ function addFiles(list) {
   }
   selectionVersion++;
   renderUpload();
-  refreshBatch().catch(() => {}); // 顺便看看这批有没有可续传的进度
+  syncBatch(); // 顺便看看这批有没有可续传的进度
 }
 
 async function upload() {
   if (!selected.length) { toast('请先选择文件'); return; }
-  const btn = $('#submit'), bar = $('#bar'), fill = bar.querySelector('div'), stat = $('#up-status');
+  const btn = $('#submit'), stat = $('#up-status');
   const setStatus = (t) => { stat.textContent = t || ''; stat.style.display = t ? 'block' : 'none'; };
   uploading = true;
   btn.disabled = true;
-  bar.style.display = 'block';
-  fill.style.width = '0%';
 
   try {
     if (!batch || batch.version !== selectionVersion) {
@@ -661,6 +737,7 @@ async function upload() {
     }
     if (!batch || batch.version !== selectionVersion) throw new Error('准备上传失败，请重试');
     const { layout, uploadId, have, total } = batch;
+    renderStrip(batch); // 铺格子：每块一个，已传的点亮，续传时点上传前就能看到进度
 
     // 断点续传：只补缺失的块
     const todo = [];
@@ -671,13 +748,13 @@ async function upload() {
     }
     const done0 = total - todo.length;
     let doneNow = 0;
-    const paint = () => {
-      const pct = total ? Math.round((done0 + doneNow) / total * 100) : 100;
-      fill.style.width = pct + '%';
-      setStatus(`已传 ${done0 + doneNow}/${total} 块 · ${pct}%`);
+    const paintText = () => {
+      const done = done0 + doneNow;
+      const pct = total ? Math.round(done / total * 100) : 100;
+      setStatus(`已传 ${done}/${total} 块 · ${pct}%`);
     };
     if (done0) toast(`接着上次进度传：已传 ${done0}/${total} 块`);
-    paint();
+    paintText();
 
     // 纯 JS 引擎（手机走 HTTP 的场景）下把加密也丢给线程池：
     // 主线程单干实测只有 ~2.6MB/s，60MB 要 25s；线程池能吃满多核，主线程也不再被占住
@@ -728,7 +805,8 @@ async function upload() {
       }
       have.add(`${fi}-${ci}`);
       doneNow++;
-      paint();
+      markBlockDone(batch, fi, ci);
+      paintText();
     };
     const send = async () => {
       for (;;) {
@@ -751,6 +829,7 @@ async function upload() {
     batch = null;
     selectionVersion++;
     renderUpload();
+    renderStrip(null); // 传完了把进度长条收起来
     refreshList(); // 局部刷新：新目录插进列表，其它行（含展开状态）不动
   } catch (e) {
     // 失败不清清单：进度都还在，点一下就能接着传
@@ -766,10 +845,10 @@ async function upload() {
     uploading = false;
     if (batch && batch.version === selectionVersion) renderUpload();
     else { btn.textContent = '上传'; btn.disabled = overLimit; }
-    // 还有没传完的块：进度条收起来，但把"还能接着传"留在界面上
+    // 还有没传完的块：长条留着（看得见传到哪了），把"还能接着传"写在下面
     const remain = batch && batch.version === selectionVersion && batch.have.size < batch.total;
     setTimeout(() => {
-      bar.style.display = 'none';
+      if (!remain) $('#blocks').hidden = true;
       setStatus(remain ? `已传 ${batch.have.size}/${batch.total} 块，点「继续上传」接着传` : '');
     }, remain ? 0 : 600);
   }
