@@ -17,10 +17,12 @@
     --card: #FFFFFF;                    /* secondarySystemGroupedBackground */
     --hdr: rgba(242,242,247,.82);
     --text: #1C1C1E;                    /* label */
-    --text2: rgba(60,60,67,.6);         /* secondaryLabel */
+    --text2: #565B62;                   /* secondaryLabel：在白卡上 6.84:1。原来是 rgba(60,60,67,.6)→#8a8a8a，只有 3.45:1，13px 的次要文字不达 AA */
     --text3: rgba(60,60,67,.32);        /* tertiaryLabel */
-    --accent: #007AFF;                  /* systemBlue */
+    --accent: #0059B3;                  /* systemBlue 的 AA 版本：蓝字在白卡 6.82:1、在半透明头部 6.1:1（#007AFF 只有 4.02:1，#0071E3 在头部 4.21:1） */
     --accent-fill: #0071E3;             /* 实底按钮用：白字对比度 4.70:1（#007AFF 仅 4.02:1，不足 AA 4.5:1） */
+    --accent-ink: var(--accent);        /* 行内文字按钮的蓝：与 --accent 同一支，免得两套蓝各走各路 */
+    --label-ink: #4A4F55;               /* 标签类次要文字：在 --fill 底上 7.5:1（原 --text2 只有 2.5:1） */
     --red: #FF3B30;                     /* systemRed */
     --sep: rgba(60,60,67,.29);          /* separator */
     --fill: rgba(120,120,128,.12);      /* systemFill */
@@ -36,6 +38,8 @@
       --text3: rgba(235,235,245,.32);
       --accent: #0A84FF;
       --accent-fill: #0A69E8;           /* 暗色实底：白字 5.00:1 */
+      --accent-ink: #0A84FF;            /* 暗色下的蓝色文字：在 --card 上 4.66:1（--accent-fill 只有 3.62:1） */
+      --label-ink: #C7C9CF;             /* 暗色下的次要文字标签 */
       --red: #FF453A;
       --sep: rgba(84,84,88,.6);
       --fill: rgba(120,120,128,.24);
@@ -200,14 +204,14 @@
     text-overflow: ellipsis; white-space: nowrap; }
   .folder-meta { font-size: 13px; color: var(--text2); margin-top: 1px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tag { display: inline-block; font-size: 12px; font-weight: 500; color: var(--text2);
+  .tag { display: inline-block; font-size: 12px; font-weight: 500; color: var(--label-ink);
     background: var(--fill); border-radius: 5px; padding: 1px 7px; margin-left: 4px;
     vertical-align: 1px; -webkit-user-select: none; user-select: none; }
   /* 热乎：蓝色实底（白字 4.70:1，达 WCAG AA） */
   .tag.hot { background: var(--accent-fill); color: #fff; font-weight: 600; }
   .acts { display: flex; gap: 2px; flex-shrink: 0; }
   .linkbtn {
-    flex-shrink: 0; border: none; background: transparent; color: var(--accent);
+    flex-shrink: 0; border: none; background: transparent; color: var(--accent-ink);
     font: inherit; font-size: 15px; font-weight: 500; cursor: pointer;
     padding: 8px 6px; border-radius: 8px; -webkit-user-select: none; user-select: none;
     touch-action: manipulation;
@@ -221,6 +225,15 @@
   }
   .del svg { width: 20px; height: 20px; }
   .del:active { opacity: .4; }
+
+  /* ---------- 触摸设备：所有可点控件至少 44×44（Apple HIG 最小触摸目标） ----------
+     只放大命中区域，不改字号与外观；桌面（精确指针）不受影响。 */
+  @media (pointer: coarse) {
+    .linkbtn, .file-row a, .copy-btn, header button.refresh {
+      min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center;
+    }
+    .del { width: 44px; height: 44px; }
+  }
 
   .folder-body { display: none; }
 
@@ -771,9 +784,15 @@ async function upload() {
     // 纯 JS 引擎（手机走 HTTP 的场景）下把加密也丢给线程池：
     // 主线程单干实测只有 ~2.6MB/s，60MB 要 25s；线程池能吃满多核，主线程也不再被占住
     const crypt = FBCrypto.native ? null : getDecryptPool();
+    /** 把若干密文片段在主线程拼成 Body（只用于原生引擎和很小的清单，成本可忽略） */
+    const bodyOf = (parts) => {
+      let c = 0xffffffff;
+      for (const p of parts) c = FBCrypto.crcFeed(p, c);
+      return { blob: new Blob(parts), crc: FBCrypto.crcDone(c).toString(16).padStart(8, '0') };
+    };
     const encryptChunk = async (spec, file, ci) => {
       const seg = spec.plan[ci];
-      if (spec.manifestBytes) return FBCrypto.encryptBytes(spec.manifestBytes);
+      if (spec.manifestBytes) return bodyOf([await FBCrypto.encryptBytes(spec.manifestBytes)]);
       const enc = async (buf) => (crypt ? crypt.encrypt(buf) : FBCrypto.encryptBytes(buf));
       const jobs = [];
       // 逐块现加密现发，内存里只留正在传的几块：早先是把整个文件密文攒成
@@ -789,21 +808,18 @@ async function upload() {
       }
       if (seg.padPlain) jobs.push(enc(new Uint8Array(seg.padPlain))); // 长度对齐那一块（全 0）
       const parts = await Promise.all(jobs);
-      let len = 0;
-      for (const p of parts) len += p.length;
-      const out = new Uint8Array(len);
-      let o = 0;
-      for (const p of parts) { out.set(p, o); o += p.length; }
-      return out;
+      // 拼块和 CRC 交给线程：这两步在主线程要 120ms+，之后发 Uint8Array 还要再占 160ms，
+      // 手机上就是这几下把页面冻住、进度条看着像卡住了。改成线程返回 Blob，主线程只发一次请求。
+      // CRC 用 32 位就够（只为发现路上被改坏）；试过 sha256：纯 JS 每块 200-400ms，会把上传拖慢一倍
+      if (crypt) { const r = await crypt.join(parts); return { blob: r.blob, crc: r.crc.toString(16).padStart(8, '0') }; }
+      return bodyOf(parts);
     };
 
-    // 每块的 CRC32：只为发现"传输中被改坏"，用便宜的算法（主线程约 8ms/4MiB）。
-    // 试过 sha256：手机纯 JS 上每块要 200-400ms，会把上传拖慢一倍，不值得
-    const crcOf = (bytes) => crcDone(crcFeed(bytes, 0xffffffff)).toString(16).padStart(8, '0');
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     // 传一块：网络抖动、被中途掐断、路上被改坏，都自动重试（最多 3 次），
-    // 三次都没过才放弃（进度与清单保留，可手动续传）；明确被拒的（大小不符/超额/过期）不重试
+    // 三次都没过才放弃（进度与清单保留，可手动续传）；明确被拒的（大小不符/超额/过期）不重试。
+    // body 是 Blob：不可变、可反复读，所以重试直接复用同一个，不用重新加密
     const putChunk = async (fi, ci, body, crc) => {
       const url = `/api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`;
       let lastErr = new Error('上传失败');
@@ -836,14 +852,15 @@ async function upload() {
 
     // 并发传块；任一失败就停下并保留进度，下次点「继续上传」接着来
     let cursor = 0;
+    let aborted = false; // 报错之后不再开新块：不然界面都写"上传中断"了，后台还在偷偷传
     const inflight = new Set();
     const sendChunk = async (j) => {
       const { fi, ci } = todo[j];
       const spec = layout[fi];
-      const body = await encryptChunk(spec, selected[fi], ci);
-      if (body.length !== spec.chunks[ci]) throw new Error('分块大小不符，请重试'); // 布局校验：对不上就宁可不传
-      const crc = crcOf(body);
-      const task = putChunk(fi, ci, body, crc); // 记整段（含重试），完成后才推进度
+      const { blob, crc } = await encryptChunk(spec, selected[fi], ci);
+      if (aborted) return; // 加密期间已经出过错了，这块不发（下次续传会补）
+      if (blob.size !== spec.chunks[ci]) throw new Error('分块大小不符，请重试'); // 布局校验：对不上就宁可不传
+      const task = putChunk(fi, ci, blob, crc); // 记整段（含重试），完成后才推进度
       inflight.add(task);
       try { await task; } finally { inflight.delete(task); }
       have.add(`${fi}-${ci}`);
@@ -853,9 +870,10 @@ async function upload() {
     };
     const send = async () => {
       for (;;) {
+        if (aborted) return;
         const j = cursor++;
         if (j >= todo.length) return;
-        await sendChunk(j);
+        try { await sendChunk(j); } catch (err) { aborted = true; throw err; }
       }
     };
     try {
@@ -1133,21 +1151,7 @@ document.addEventListener('click', async (e) => {
 });
 
 // ---------- 打包下载：一条聚合流 + 多核解密 + 边解边拼 zip（STORE 模式，不压缩） ----------
-const CRC_T = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-const crcFeed = (u8, seed) => { // 增量 CRC：分块喂入，省掉整文件二次复制
-  let c = seed;
-  for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 255] ^ (c >>> 8);
-  return c;
-};
-const crcDone = (c) => (c ^ 0xffffffff) >>> 0;
+// CRC32 在 crypto.js 里（FBCrypto.crcFeed / crcDone），主线程与工作线程共用同一份实现
 
 // zip 写入器：数据分片以 Blob 引用按序拼接，内存占用不再翻倍
 function createZipWriter() {
@@ -1257,6 +1261,8 @@ function getDecryptPool() {
       busy.set(w, job.resolve);
       if (job.op === 'encrypt') {
         w.postMessage({ op: 'encrypt', id: job.id, bytes: job.bytes, engine: job.engine }, [job.bytes.buffer]);
+      } else if (job.op === 'join') {
+        w.postMessage({ op: 'join', id: job.id, parts: job.parts }, job.parts.map((p) => p.buffer));
       } else {
         w.postMessage({ op: 'decrypt', id: job.id, block: job.block, engine: job.engine }, [job.block.buffer]);
       }
@@ -1324,6 +1330,14 @@ function getDecryptPool() {
         queue.push({ op: 'encrypt', id, bytes, engine: FBCrypto.native ? 'native' : 'js', resolve });
         dispatch();
       }).then((r) => { if (r.error) throw new Error(r.error); return r.ct; });
+    },
+    /** 拼块 + 算 CRC 也交给线程（主线程实测要 270ms，手机降频下更久），回一个可直接 PUT 的 Blob */
+    join(parts) {
+      const id = ++seq;
+      return new Promise((resolve) => {
+        queue.push({ op: 'join', id, parts, resolve });
+        dispatch();
+      }).then((r) => { if (r.error) throw new Error(r.error); return r; });
     },
   };
   return packPool;
@@ -1396,7 +1410,7 @@ async function downZip(nameEnc, btn) {
         if (declared !== undefined && psize + chunk.length > declared) {
           chunk = chunk.subarray(0, Math.max(0, declared - psize));
         }
-        crc = crcFeed(chunk, crc);
+        crc = FBCrypto.crcFeed(chunk, crc);
         psize += chunk.length;
         dataParts.push(new Blob([chunk]));
       };
@@ -1429,7 +1443,7 @@ async function downZip(nameEnc, btn) {
       if (declared !== undefined && psize !== declared) {
         throw new Error('文件长度与清单不符（数据不完整）');
       }
-      zip.add((nameMap && nameMap.get(name)) || name, crcDone(crc), psize, dataParts);
+      zip.add((nameMap && nameMap.get(name)) || name, FBCrypto.crcDone(crc), psize, dataParts);
       count++;
     }
 

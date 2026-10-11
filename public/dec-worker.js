@@ -25,6 +25,15 @@ self.onmessage = async (e) => {
       self.postMessage({ id: m.id, ct, engine: used() }, [ct.buffer]);
       return;
     }
+    if (m.op === 'join') {
+      // 把一个上传块的多个密文片段拼成 Blob 并算 CRC，全在这里做：
+      // 主线程算 4MiB 的 CRC 要 111ms、拼副本再发 Uint8Array 还要 160ms+，
+      // 手机端 CPU 上就是这几下把页面冻住，进度条看着像"卡在 60%"
+      let c = 0xffffffff;
+      for (const p of m.parts) c = FBCrypto.crcFeed(p, c);
+      self.postMessage({ id: m.id, crc: FBCrypto.crcDone(c), blob: new Blob(m.parts) });
+      return;
+    }
     const pt = await FBCrypto.decryptBytes(m.block);
     self.postMessage({ id: m.id, pt, engine: used() }, [pt.buffer]);
   } catch (err) {

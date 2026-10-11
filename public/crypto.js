@@ -40,6 +40,18 @@
     return s;
   })();
 
+  // ================= CRC32（上传分块与打包下载的完整性） =================
+  // 与 server.js 的实现同口径；放在这里是为了让主线程和工作线程共用一份，别写两遍。
+  const CRC_T = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+
   // ================= SHA-256 / HMAC / PBKDF2（纯 JS） =================
   const K256 = new Int32Array([
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -385,6 +397,14 @@
     hashHex(str) {
       return api.sha256Hex(te.encode(String(str)));
     },
+
+    /** CRC32 增量喂入 / 收尾 / 一步算完的十六进制（与 server.js 同口径） */
+    crcFeed(u8, seed) {
+      let c = seed;
+      for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 255] ^ (c >>> 8);
+      return c;
+    },
+    crcDone(c) { return (c ^ 0xffffffff) >>> 0; },
 
     /** 流式解密（边下载边解密）→ 明文 Blob；onByte(已处理字节数) */
     async decryptStream(body, onByte) {
