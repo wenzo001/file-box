@@ -142,13 +142,14 @@
   /* 上传进度：一块一块拼成的长条。每块 = 一个上传块（固定约 4MiB，最后一块是余数），
      块数随文件大小变；块多了自动换行，超过 4 行才出现滚动，免得把按钮挤下去 */
   #blocks {
-    display: flex; flex-wrap: wrap; gap: 2px;
+    display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
     margin-top: 14px; padding: 3px; border-radius: 7px;
-    background: var(--fill); max-height: 78px; overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
+    background: var(--fill);
+    /* 格子大小由 layoutStrip 按块数算：块多就缩小格子，绝不在长条里加滚动条（手机上要能一眼看全） */
+    --blk-w: 9px; --blk-h: 12px;
   }
   #blocks .blk {
-    width: 9px; height: 12px; border-radius: 2px; background: var(--card);
+    width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
     transition: background .12s, opacity .12s;
   }
   #blocks .blk.done { background: var(--accent-fill); }
@@ -158,6 +159,7 @@
   #up-status {
     font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
     font-variant-numeric: tabular-nums;
+    white-space: pre-line; /* 换行点由代码里的 \n 决定：中文可以任意断行，交给浏览器会变成"一 / 格 ≈ 4 MB" */
   }
 
   .btn {
@@ -573,7 +575,27 @@ const apiPost = async (path, body) => {
 };
 
 /** 进度长条：每块 = 一个上传块（固定约 4MiB，最后一块是余数），块数随文件大小变。
- *  先按批次布局把格子铺好（少了就自动换行），再按已传的块点亮。 */
+ *  格子按块数自适应大小：块少时是原来的 9×12，块多就缩小，最多占 STRIP.rows 行 ——
+ *  整条始终一眼看全，不在里面做滚动（手机上要滚着看进度等于没有进度）。 */
+const STRIP = { wMax: 9, wMin: 3, hMax: 12, hMin: 4, rows: 6, budget: 96 }; // budget：整条最多占这么多 px（不含 padding）
+function layoutStrip(b) {
+  if (!b || !b.blkEls) return;
+  const box = $('#blocks');
+  const inner = box.clientWidth - 6; // 左右各 3px padding
+  if (inner <= 0) return;            // 还没显示（hidden 时量不到），显示后再排
+  const perMax = Math.max(1, Math.floor((inner + 2) / (STRIP.wMax + 2)));
+  let w = STRIP.wMax;
+  if (b.blkEls.length > perMax * STRIP.rows) {
+    const need = Math.ceil(b.blkEls.length / STRIP.rows); // 要在 rows 行内摆下，一行至少这么多格
+    w = Math.max(STRIP.wMin, Math.floor((inner + 2) / need) - 2);
+  }
+  // 宽度已经缩到下限还摆不下时（几千块），改成压高度：宁可矮，也不要滚动或裁掉格子
+  const rows = Math.max(1, Math.ceil(b.blkEls.length / Math.max(1, Math.floor((inner + 2) / (w + 2)))));
+  const h = Math.max(STRIP.hMin, Math.min(STRIP.hMax, Math.floor(STRIP.budget / rows) - 2));
+  box.style.setProperty('--blk-w', w + 'px');
+  box.style.setProperty('--blk-h', h + 'px');
+}
+
 function renderStrip(b) {
   const box = $('#blocks');
   box.innerHTML = '';
@@ -591,8 +613,12 @@ function renderStrip(b) {
     });
   });
   box.hidden = false;
+  layoutStrip(b); // 要先显示出来才量得到宽度
   paintStrip(b);
 }
+
+// 转屏/分屏后宽度变了，格子要重新按新行宽排一遍，否则行数会超出预期
+addEventListener('resize', () => { if (batch && !$('#blocks').hidden) layoutStrip(batch); });
 
 /** 按「已传的块」整体重刷（刚进页面看到续传进度、重新选文件时用） */
 function paintStrip(b) {
@@ -607,7 +633,6 @@ function paintStrip(b) {
     el.classList.toggle('active', active);
     if (active) pointed = true;
   }));
-  scrollActiveIntoView();
 }
 
 /** 传完一块：只点亮那一格，把「进行中」挪到下一格（大文件时别整条重刷） */
@@ -619,17 +644,6 @@ function markBlockDone(b, fi, ci) {
   el.classList.add('done');
   const next = el.nextElementSibling;
   if (next && !next.classList.contains('done')) next.classList.add('active');
-  scrollActiveIntoView();
-}
-
-/** 块多到超出可视高度时，让「进行中」那格留在视野里 */
-function scrollActiveIntoView() {
-  const box = $('#blocks');
-  const act = box.querySelector('.blk.active');
-  if (!act || box.scrollHeight <= box.clientHeight) return;
-  if (act.offsetTop < box.scrollTop || act.offsetTop + act.offsetHeight > box.scrollTop + box.clientHeight) {
-    box.scrollTop = Math.max(0, act.offsetTop - box.clientHeight / 2);
-  }
 }
 
 /** 问服务端这批文件有多少块已经传过了；清单一变就重新问（用于「继续上传」） */
@@ -773,10 +787,22 @@ async function upload() {
     }
     const done0 = total - todo.length;
     let doneNow = 0;
+    // 说明这格一格到底代表多大、已经发出去多少字节（格子缩小时光看格子数量感觉不到进度）
+    const per = layout[0].chunks[0];
+    const allBytes = layout.reduce((a, s) => a + s.chunks.reduce((x, y) => x + y, 0), 0);
+    const sentBytes = () => {
+      let n = 0;
+      for (let fi = 0; fi < layout.length; fi++) {
+        layout[fi].chunks.forEach((bytes, ci) => { if (have.has(`${fi}-${ci}`)) n += bytes; });
+      }
+      return n;
+    };
     const paintText = () => {
       const done = done0 + doneNow;
       const pct = total ? Math.round(done / total * 100) : 100;
-      setStatus(`已传 ${done}/${total} 块 · ${pct}%`);
+      // 数字与单位之间不许断行（手机上这行会换行，"4.0" 和 "MB" 被拆到两行很难读）
+      const nb = (s) => String(s).replace(/ /g, '\u00A0');
+      setStatus(`已传 ${done}/${total} 块 · ${pct}%\n一格 ≈ ${nb(fmtSize(per))} ｜ 约 ${nb(fmtSize(sentBytes()))} / ${nb(fmtSize(allBytes))}`);
     };
     if (done0) toast(`接着上次进度传：已传 ${done0}/${total} 块`);
     paintText();
