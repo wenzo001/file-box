@@ -64,13 +64,20 @@ function safeName(name) {
 }
 
 // ---- 存储空间统计与过期清理 ----
-/** 递归统计目录占用字节数 */
+/** 递归统计目录占用字节数。用 lstat：软链接既不该计入用量，更不该跟着递归
+ *  （一个指回上层的软链接就能让同步递归绕不完）。单个条目读不到也跳过：Windows 上
+ *  杀软/索引器会临时锁文件，不该因此让一次列表或上传请求整个报错 */
 function dirSize(dir) {
   let total = 0;
-  for (const name of fs.readdirSync(dir)) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  for (const name of names) {
     const p = path.join(dir, name);
-    const st = fs.statSync(p);
-    total += st.isDirectory() ? dirSize(p) : st.size;
+    try {
+      const st = fs.lstatSync(p);
+      if (st.isDirectory()) total += dirSize(p);
+      else if (st.isFile()) total += st.size;
+    } catch { continue; }
   }
   return total;
 }
@@ -107,9 +114,11 @@ setInterval(cleanupExpired, 6 * 60 * 60 * 1000).unref();
 // 命名并搬进 uploads。所以：列表里永远看不到上传到一半的目录，展示的时间就是传完的时刻。
 // 中断后重新发起同一批文件（客户端用批次指纹识别），只补缺失的块即可接着传。
 const STAGING_DIR = path.join(__dirname, '.uploading');
-const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000; // 未完成批次留一天，够断点续传，过期回收
+const UPLOAD_TTL_MS = Number(process.env.UPLOAD_TTL_HOURS || 48) * 60 * 60 * 1000; // 未完成批次留 2 天：过期回收，下次上传从头再来
 const MAX_CHUNK = 32 * 1024 * 1024;        // 单块上限（客户端约 4MB 一块）
 const MAX_FILES = 200;                     // 单批文件数上限
+const MAX_STAGING_BATCHES = 20;            // 最多同时留多少个未完成批次：只按字节卡上限的话，刷 init 堆空目录没人管
+const MAX_INFLIGHT_PARTS = 8;              // 同时缓冲中的分块数：Node 是把整块读进内存再落盘的，没有上界就能被撑爆内存
 
 /** 标准 CRC32（内置查表实现：zlib.crc32 要 Node 20.15+，而本服务声明支持 Node ≥ 18） */
 const CRC_T = (() => {
@@ -135,21 +144,55 @@ ensureStagingDir();
 const isUploadId = (id) => /^[a-f0-9]{16,64}$/.test(String(id || ''));
 const uploadDirOf = (id) => path.join(STAGING_DIR, String(id));
 
-/** 回收过期未完成批次（进程被杀、客户端再也不回来） */
+/** 回收过期未完成批次（进程被杀、客户端再也不回来），并给批次数量一个上界 */
 function sweepStaging(maxAgeMs = UPLOAD_TTL_MS) {
   ensureStagingDir();
   const now = Date.now();
+  let removed = 0;
+  const dirs = [];
   for (const name of fs.readdirSync(STAGING_DIR)) {
     const p = path.join(STAGING_DIR, name);
     let st;
     try { st = fs.statSync(p); } catch { continue; }
-    if (now - st.mtimeMs > maxAgeMs) {
-      fs.rmSync(p, { recursive: true, force: true });
-      console.log(`[上传] 回收过期未完成的批次 ${name}`);
-    }
+    if (!st.isDirectory()) { try { fs.rmSync(p, { force: true }); removed++; } catch { /* 正被人占用就算了 */ } continue; }
+    dirs.push({ name, mtime: st.mtimeMs });
   }
+  // 目录 mtime = 最后一次动它的时刻：客户端中途放弃、再也不回来，也从这里回收
+  for (const d of dirs.filter((x) => now - x.mtime > maxAgeMs)) {
+    fs.rmSync(path.join(STAGING_DIR, d.name), { recursive: true, force: true });
+    console.log(`[上传] 回收 ${Math.round((now - d.mtime) / 3600000)} 小时没动过的批次 ${d.name.slice(0, 8)}`);
+    removed++;
+  }
+  // 数量上界：只按字节卡上限的话，一直换指纹新建批次就能堆出成千上万个小目录，
+  // 而每次判断占用都要遍历一遍 —— 越用越慢，等于另一种"泄漏"
+  const live = dirs.filter((x) => now - x.mtime <= maxAgeMs).sort((a, b) => a.mtime - b.mtime);
+  while (live.length >= MAX_STAGING_BATCHES) {
+    const victim = live.shift();
+    fs.rmSync(path.join(STAGING_DIR, victim.name), { recursive: true, force: true });
+    console.log(`[上传] 未完成批次超过 ${MAX_STAGING_BATCHES} 个，挤掉最早的 ${victim.name.slice(0, 8)}`);
+    removed++;
+  }
+  if (removed) forgetUsage(); // 腾出的空间立刻反映到上限判断，别让 30 秒缓存报高
+  return removed;
 }
-sweepStaging(0); // 启动时：上个进程的批次都已随进程中断，直接清干净
+
+/** 启动时：上个进程留下的 .tmp 是写一半的（.bin 都是写完才改名的），只清这些，
+ *  已完成的块留着 —— 否则服务一重启（发版、改配置）2 天续传就白设计了 */
+function reclaimStagingOnBoot() {
+  ensureStagingDir();
+  let n = 0;
+  for (const name of fs.readdirSync(STAGING_DIR)) {
+    const p = path.join(STAGING_DIR, name);
+    try {
+      if (!fs.statSync(p).isDirectory()) continue;
+      for (const f of fs.readdirSync(p)) {
+        if (/^part-\d+-\d+\.tmp$/.test(f)) { fs.rmSync(path.join(p, f), { force: true }); n++; }
+      }
+    } catch { /* 目录已经没了就算了 */ }
+  }
+  if (n) console.log(`[上传] 清掉 ${n} 个写了一半的分块`);
+  sweepStaging();
+}
 setInterval(() => sweepStaging(), 6 * 60 * 60 * 1000).unref();
 
 const readMeta = (id) => {
@@ -169,8 +212,8 @@ function haveParts(id) {
 }
 
 /** 这些名字在批次目录里有特殊用途，声明成文件会把账本/分块覆盖掉（例如叫 part-0-1.bin
- *  会让合并时把文件往自己身上追加），一律拒绝 */
-const RESERVED_NAME = /^(meta\.json|part-\d+-\d+\.(bin|tmp))$/;
+ *  会让合并时把文件往自己身上追加；叫 x.enc.assembling 会占用另一个文件拼接时的临时名），一律拒绝 */
+const RESERVED_NAME = /^(meta\.json|part-\d+-\d+\.(bin|tmp)|.*\.assembling)$/;
 
 /** 校验分块声明：文件名安全、不重复、不是保留名、块大小在范围内 */
 function metaProblem(files) {
@@ -225,6 +268,9 @@ function usedBytes() {
 }
 const forgetUsage = () => { usageCache.at = 0; }; // 提交/删除后立刻失效，别让缓存骗人
 
+// 启动回收放在占用统计可用之后（sweepStaging 要调 forgetUsage，提前调会踩到未初始化的缓存）
+reclaimStagingOnBoot();
+
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
 app.post('/api/upload/init', (req, res) => {
   cleanupExpired();
@@ -256,9 +302,25 @@ app.post('/api/upload/init', (req, res) => {
   res.json({ ok: true, uploadId: key, have, total, resumed: have.length > 0 });
 });
 
+// 内存上界：express.raw 是把整块读进内存才交给处理函数的，并发一多就是 N×32MB。
+// 超过上界先挡回去 —— 429 在客户端属于"可重试"，它会退避重传同一块，进度不丢。
+let partsInFlight = 0;
+function gateParts(req, res, next) {
+  if (partsInFlight >= MAX_INFLIGHT_PARTS) {
+    return res.status(429).json({ error: '服务器写入正忙，这块稍后重试' });
+  }
+  partsInFlight++;
+  let released = false;
+  const release = () => { if (!released) { released = true; partsInFlight--; } };
+  // 客户端中途断开时 'finish' 不一定触发，两个都挂上：漏放一次就少一个名额，攒久了上传就全堵死
+  res.on('finish', release);
+  res.on('close', release);
+  next();
+}
+
 // 2) 传一块：长度与摘要都要对得上（传输中损坏就地发现、让客户端重传），
 //    先写 .tmp 再改名，断连不会留下"看起来完整"的半块
-app.put('/api/upload/part', express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK }), (req, res) => {
+app.put('/api/upload/part', gateParts, express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK }), (req, res) => {
   const { u, f, c } = req.query;
   const meta = isUploadId(u) ? readMeta(u) : null;
   if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
@@ -317,12 +379,15 @@ app.post('/api/upload/finish', (req, res) => {
       if (usedBytes() >= STORAGE_LIMIT) return tooLarge(res); // 落盘前再确认一次，别把上限撑破
       for (let fi = 0; fi < meta.files.length; fi++) {
         const f = meta.files[fi];
-        const out = path.join(dir, f.enc);
+        const out = path.join(dir, `${f.enc}.assembling`);
+        fs.rmSync(out, { force: true }); // 上次拼一半的残骸不能拿来追加
         for (let ci = 0; ci < f.chunks.length; ci++) {
           const part = path.join(dir, `part-${fi}-${ci}.bin`);
           await pipeline(fs.createReadStream(part), fs.createWriteStream(out, { flags: 'a' }));
           fs.rmSync(part, { force: true }); // 拼一块删一块，峰值不翻倍
         }
+        // 拼完一个文件才改成正名：中途出错绝不会留下"看起来是完整文件"的半成品
+        fs.renameSync(out, path.join(dir, f.enc));
       }
       // 拼完就把批次账本与残余分块清掉，别让它们跟着 rename 进 uploads
       fs.rmSync(path.join(dir, 'meta.json'), { force: true });
@@ -334,6 +399,10 @@ app.post('/api/upload/finish', (req, res) => {
       res.json({ ok: true, folder, count: meta.files.filter((f) => f.enc !== MANIFEST).length });
     } catch (err) {
       console.error('[上传] 合并分块失败', err);
+      // 块已经边拼边删了，这个批次不可能再"续"：整批丢掉，让下次从头来。
+      // 留着只会留下拼一半的文件，下次追加拼接就成了坏文件
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 删不掉也得先回复客户端 */ }
+      forgetUsage();
       try {
         if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
       } catch { /* 连接已经断了，没什么可做的 */ }

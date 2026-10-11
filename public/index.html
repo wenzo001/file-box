@@ -946,6 +946,13 @@ $('#form').addEventListener('submit', (e) => { e.preventDefault(); upload(); });
 let overLimit = false;
 let lastList = null; // 服务端原始列表（密文名）
 const manifestCache = {}; // 目录 → 加密清单 Promise
+const MANIFEST_KEEP = 30; // 只留最近看过的 30 个目录：每份都是解密出来的文件名清单，一直翻就一直攒着，那是内存泄漏
+function keepManifest(folder, p) {
+  manifestCache[folder] = p;
+  const keys = Object.keys(manifestCache); // 字符串键按插入顺序枚举，最前面的就是最久没用的
+  for (let i = 0; i < keys.length - MANIFEST_KEEP; i++) delete manifestCache[keys[i]];
+  return p;
+}
 const HOT_MS = 10 * 60 * 1000; // 「热乎」判定窗口
 let hotFolders = new Set();    // 本次会话里判定为热乎的目录：判定后不再撤销（不刷新页面就一直留着）
 let knownFolders = new Set();  // 当前列表里已有的目录名
@@ -1129,10 +1136,10 @@ async function fillBody(el) {
 // 拉取并解密目录清单（真实文件名）
 function getManifest(folder) {
   if (!manifestCache[folder]) {
-    manifestCache[folder] = fetch(`/api/download/${enc(folder)}/manifest.enc`)
+    keepManifest(folder, fetch(`/api/download/${enc(folder)}/manifest.enc`)
       .then((r) => (r.ok ? r.arrayBuffer() : null))
       .then(async (buf) => buf ? JSON.parse(td.decode(await FBCrypto.decryptBytes(new Uint8Array(buf)))) : null)
-      .catch(() => null);
+      .catch(() => null));
   }
   return manifestCache[folder];
 }
