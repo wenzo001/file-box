@@ -129,9 +129,11 @@
   #file-list .row span { flex: 1; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   #file-list .row b { font-weight: 400; color: var(--text2); flex-shrink: 0; font-size: 13px; }
-  /* 视觉小、可点区域 44×44（Apple HIG 最小触摸目标） */
+  /* 视觉小、可点区域 44×44（Apple HIG 最小触摸目标）。
+     右边距必须是 0：#file-list 有 overflow-y:auto，CSS 会把 overflow-x 一并算成 auto，
+     任何伸出容器右边缘的东西（比如之前那个 -10px）都会冒出一条横向滚动条 */
   #file-list .rm {
-    flex-shrink: 0; width: 44px; height: 44px; margin: -11px -10px -11px -6px;
+    flex-shrink: 0; width: 44px; height: 44px; margin: -11px 0 -11px -6px;
     border: none; background: transparent; color: var(--text3);
     display: flex; align-items: center; justify-content: center; cursor: pointer;
     -webkit-user-select: none; user-select: none; touch-action: manipulation;
@@ -486,6 +488,10 @@ const isCoarse = matchMedia('(pointer: coarse)').matches;
 if (isCoarse) $('#hint-drag').remove();
 
 const UPLOAD_TARGET = 4 * 1024 * 1024; // 每个上传块的目标大小（按加密块边界成组，不切开密文块）
+// 一个密文块里的明文长度。故意不跟 FBCrypto.CHUNK 走：那个值在页面加载时就按"有没有
+// WebCrypto"定死了（localhost/HTTPS 是 4MiB，手机用 http://内网IP 是 512KiB），
+// 用它规划分块会让同一批文件在两种页面下切出不同的边界，换端口/换设备就续不上。
+const PLAIN_BLOCK = 512 * 1024;
 const PAD_UNIT = 64 * 1024;            // 密文长度向上取整到这个粒度，藏住精确的文件大小
 const UPLOAD_PARALLEL = 3;             // 同时在传的块数
 const CHUNK_ATTEMPTS = 3;              // 每块最多试 3 次（含首次）：抖动/掐断/被改坏都能自救
@@ -502,7 +508,7 @@ function planFile(size, pad = true) {
   let left = size || 0;
   if (!left) blocks.push(blockBytes(0));
   while (left > 0) {
-    const plain = Math.min(FBCrypto.CHUNK, left);
+    const plain = Math.min(PLAIN_BLOCK, left);
     blocks.push(blockBytes(plain));
     left -= plain;
   }
@@ -748,6 +754,15 @@ input.addEventListener('change', () => { addFiles(input.files); input.value = ''
 // 追加合并（按 名称+大小+修改时间 去重），支持分几次把文件凑齐。
 // 带上修改时间：不同目录里同名同大小但内容不同的两个文件不会被误判成重复而丢掉
 const fileKey = (f) => `${relPath(f)}@${f.size}@${f.lastModified || 0}`;
+/** 顺序不许影响批次指纹与分块布局（下次可能换个顺序重选文件）。
+ *  用码位比较而不是 localeCompare：不同浏览器/语言环境排序不一样，会把同一批文件算成两批 */
+function sortSelected() {
+  selected.sort((a, b) => {
+    const x = relPath(a), y = relPath(b);
+    if (x !== y) return x < y ? -1 : 1;
+    return a.size - b.size || (a.lastModified || 0) - (b.lastModified || 0);
+  });
+}
 function addFiles(list) {
   if (uploading || !list || !list.length) return;
   const seen = new Set(selected.map(fileKey));
@@ -757,6 +772,7 @@ function addFiles(list) {
     seen.add(k);
     selected.push(f);
   }
+  sortSelected();
   selectionVersion++;
   renderUpload();
   syncBatch(); // 顺便看看这批有没有可续传的进度
@@ -827,8 +843,9 @@ async function upload() {
       if (seg.p1 === seg.p0) {
         jobs.push(enc(new Uint8Array(0))); // 0 字节文件
       } else {
-        for (let off = seg.p0; off < seg.p1; off += FBCrypto.CHUNK) {
-          const end = Math.min(off + FBCrypto.CHUNK, seg.p1);
+        // 必须按 planFile 用的同一个 PLAIN_BLOCK 切：切法不一致密文长度就对不上声明
+        for (let off = seg.p0; off < seg.p1; off += PLAIN_BLOCK) {
+          const end = Math.min(off + PLAIN_BLOCK, seg.p1);
           jobs.push(file.slice(off, end).arrayBuffer().then((ab) => enc(new Uint8Array(ab))));
         }
       }
