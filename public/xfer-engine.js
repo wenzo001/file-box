@@ -312,7 +312,7 @@
     const st = {
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
       sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
-      safety: '', kex: '', engine: '', error: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
+      safety: '', kex: '', engine: '', error: '', note: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
       peerConfirmed: false,
     };
     let pool = null;
@@ -403,7 +403,8 @@
     function switchChannel(to, why) {
       if (st.channel === to) return;
       if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
-      patch({ channel: to, error: why || st.error });
+      // 通道说明走 note：写进 error 会让整块状态（含"校验通过"）一直显示成报错色
+      patch({ channel: to, note: why || st.note });
     }
 
     // ---------- 发送端主循环（并行窗口 + 只补没确认的块） ----------
@@ -759,7 +760,7 @@
         onState: async (state, open) => {
           if (open) {
             const mode = await rtc.mode();
-            switchChannel(mode, mode === 'turn_relay' ? '走了 TURN 中继（不是直连）' : '已建立点对点直连');
+            switchChannel(mode); // 直连/TURN 各自的说明由界面 CHAN 文案给，不重复塞一句
             afterHandshake();
           } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
             if (st.channel !== 'server_relay') {

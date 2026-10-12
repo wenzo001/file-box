@@ -558,7 +558,7 @@
     const [ctext, ccls] = chanOf(st.channel);
     const chanEl = t('chan');
     chanEl.className = 'chan' + (ccls ? ' ' + ccls : '');
-    const why = st.error && st.phase === 'retrying' ? ` · ${st.error}` : '';
+    const why = st.error && st.phase === 'retrying' ? ` · ${st.error}` : (st.note ? ` · ${st.note}` : '');
     t('chan-t').textContent = (st.channel === 'none' ? ctext : `${ctext}${why}`);
 
     const frames = st.frames || 0;
