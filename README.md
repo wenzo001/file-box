@@ -21,6 +21,7 @@
 - 地址分享：复制项目地址，或复制某个目录的直达链接，对方打开自动展开定位
 - 自动适配 PC / 移动端，iOS 原生质感 UI
 - 端口可自定义，HTTP / HTTPS 双端口，基于 pm2 部署
+- 无痕传输：顶栏独立入口，选文件出一个一次性传输码（32 字符），对方在另一台设备输入即可收文件。优先 WebRTC 点对点直连，不通再走 TURN 或本服务器密文中转；全程端到端 AES-256-GCM，服务器只见密文帧不见文件名，做完/过期就清理，不写进文件库、不产生永久链接。详见 [`docs/transfer.md`](docs/transfer.md)
 
 ## 目录结构
 
@@ -29,14 +30,23 @@
 ├── server.js            # 服务端（Express）
 ├── ecosystem.config.js  # pm2 配置
 ├── package.json
+├── lib/
+│   └── transfer.js      # 无痕传输服务端：会话账本、信令转发、密文中转
+├── docs/
+│   └── transfer.md      # 无痕传输：架构图、状态机、密钥生命周期、API、配置、安全边界
 ├── public/
-│   ├── index.html       # 前端单页
+│   ├── index.html       # 前端单页（文件存储）
 │   ├── crypto.js        # 浏览器端加密模块（原生 WebCrypto + 纯 JS 回退）
-│   └── dec-worker.js    # 打包下载的解密线程
+│   ├── dec-worker.js    # 打包下载的解密线程
+│   ├── transfer.html    # 无痕传输页面（独立入口，不动存储页）
+│   ├── xfer-proto.js    # 无痕传输协议与密码学（浏览器与 Node 共用同一份）
+│   ├── xfer-engine.js   # 无痕传输会话引擎：状态机、三级进度、续传、通道降级
+│   └── xfer-worker.js   # 无痕传输的加解密线程（封帧/开帧/SHA-256）
 ├── scripts/
 │   └── pack.js          # npm run pack：收应用文件 + 生产依赖闭包，出自包含包并自检
 ├── dist/                # 发布产物（npm run pack 生成，不入库）
 ├── uploads/             # 上传文件（密文）存放处，启动时自动创建
+├── transfer/            # 无痕传输的中转区（只有密文帧 + 最小账本，会话结束即清）
 ├── .uploading/          # 未完成的分块批次暂存（上传完成即搬进 uploads；超过 24 小时自动回收）
 ├── .certs/              # HTTPS 自签证书，首次启动自动生成
 └── README.md
