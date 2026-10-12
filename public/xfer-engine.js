@@ -107,6 +107,19 @@
         rq.onerror = () => resolve(null);
       });
     },
+    // 续传前要先把"本地已经存过哪些块"读回来，否则会照着服务器的 uploaded 重新下一遍
+    async seqs(sid) {
+      const db = await this.open();
+      const p = `${sid}#`;
+      return new Promise((resolve) => {
+        const rq = db.transaction('frames').objectStore('frames').getAllKeys();
+        rq.onsuccess = () => resolve((rq.result || [])
+          .filter((k) => String(k).startsWith(p))
+          .map((k) => Number(String(k).slice(p.length)))
+          .filter((n) => Number.isInteger(n)));
+        rq.onerror = () => resolve([]);
+      });
+    },
     async drop(sid) {
       const db = await this.open();
       const keys = await new Promise((resolve) => {
@@ -300,6 +313,7 @@
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
       sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
       safety: '', kex: '', engine: '', error: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
+      peerConfirmed: false,
     };
     let pool = null;
     let secret = '';
@@ -315,6 +329,8 @@
     let iceServers = [];
     let myKeys = null;
     let handshakeDone = false;
+    let peerConfirmed = false;      // 对方的 confirm 已经对上：这一条链路确认没有第三方
+    let pendingConfirm = null;      // 早于密钥到达的对方 confirm，握手完成后补验
     let resumeMode = false;
     const acked = new Set();        // 接收端已落盘并上报过的块（发送端从服务器读到）
     const stored = new Set();       // 接收端本地已落盘
@@ -527,7 +543,11 @@
       if (!list.length) return;
       try { await net.ack(st.sid, list); } catch { /* 本地已经存好了，服务器记账晚一点不要紧 */ }
     }
+    let pulling = false;
     async function pullMissing() {
+      // 轮询和握手可能同时叫它；两边一起拉会把同几块下一遍（块本身幂等，但白占带宽和内存）
+      if (pulling) return true;
+      pulling = true;
       try {
         const s = await net.state(st.sid);
         const up = new Set(expand(s.uploaded));
@@ -541,6 +561,8 @@
       } catch (err) {
         if (err.status === 404) { patch({ phase: 'waiting', error: '服务器上的这个会话已经过期了' }); return false; }
         patch({ error: err.message || '网络不稳，正在重试', phase: 'retrying' });
+      } finally {
+        pulling = false;
       }
       emit();
       return true;
@@ -630,10 +652,7 @@
       if (handshakeDone) return;
       const peer = JSON.parse(body);
       if (resumeMode && sess) { // 恢复：密钥已经缓存，不再重新派生
-        handshakeDone = true;
-        patch({ safety: sess.safety, kex: sess.kex });
-        await net.signal(st.sid, 'confirm', JSON.stringify(await P.confirmMac(sess, role, st.sid)));
-        afterHandshake();
+        await resumeHandshake();
         return;
       }
       const shared = await P.ecdhShared(myKeys && myKeys.priv, P.unhex(peer.pub));
@@ -649,22 +668,59 @@
       afterHandshake();
     }
     function afterHandshake() {
+      // 对方的 confirm 可能比这一端的密钥还早到（重连时服务器会立刻补发历史），
+      // 那时还验不了；先存着，握手一落地马上补验，不然"链路上没有别人"这个结论永远立不起来
+      if (pendingConfirm) {
+        const b = pendingConfirm;
+        pendingConfirm = null;
+        onPeerConfirm(b).catch((e) => fail(e.message || e));
+      }
       if (role === 'sender') pump();
       else { pullMissing(); schedulePoll(); }
     }
+    // 恢复：会话密钥已经在本地（localStorage 里那份），绝不能再等对方的 key 信令 ——
+    // 对面可能是刷新后新开的会话，也可能服务器补发的是旧 key，两种都不能把这条链路卡住。
+    // 所以这里直接进"已握手"，把 confirm 补发出去，然后按本地已有的块决定还缺哪些。
+    async function resumeHandshake() {
+      if (!resumeMode || !sess || handshakeDone) return;
+      handshakeDone = true;
+      patch({ safety: sess.safety, kex: sess.kex, engine: P.engine, resumable: true });
+      await net.signal(st.sid, 'confirm', JSON.stringify(await P.confirmMac(sess, role, st.sid))).catch(() => {});
+      if (role === 'receiver') await hydrateStored();
+      afterHandshake();
+    }
+    // 本地已经落盘的块要先"认领"回来：否则 pullMissing 会照着服务器的 uploaded 把几十 GB 重下一遍，
+    // 进度也会从"已经存好"被算回 0
+    async function hydrateStored() {
+      try {
+        for (const s of await Store.seqs(st.sid)) stored.add(s);
+        st.stored = stored.size;
+        const mframe = new Uint8Array((await Store.get(st.sid, 0)) || []);
+        if (mframe.length && !layout) {
+          const r = await pool.open({ key: Array.from(sess.kMeta), sid8: Array.from(sess.sid8), frame: mframe });
+          applyManifest(P.readManifest(new Uint8Array(r.plaintext)));
+        }
+        emit();
+        if (layout && stored.size >= st.frames) await finishReceive();
+      } catch (err) {
+        patch({ error: `本地暂存读不回来了：${err.message || err}` });
+      }
+    }
     async function onPeerConfirm(body) {
-      // 握手已经完成后又收到 confirm，只会是重连时服务器补发的历史 —— 忽略它，
-      // 不然一句重复确认会把 verified 打回 false，把"可以保存"的界面变没
-      if (handshakeDone) return;
-      if (!sess) { patch({ phase: 'retrying', error: '还没拿到对方公钥，正在等' }); return; }
+      // 已经验过一次，再来的只会是重连时服务器补发的历史 —— 忽略它，
+      // 不然一句重复确认会把"链路没有第三方"这个结论冲掉
+      if (peerConfirmed) return;
+      if (!handshakeDone) { pendingConfirm = body; patch({ phase: 'retrying', error: '还没拿到对方公钥，正在等' }); return; }
       const mine = await P.confirmMac(sess, role === 'sender' ? 'receiver' : 'sender', st.sid);
       if (JSON.parse(body) !== mine) throw new Error('配对校验不通过：链路上可能有第三方，已终止');
-      patch({ verified: false });
+      peerConfirmed = true;
+      patch({ peerConfirmed: true, error: '' });
       if (role === 'receiver' && !layout) pullMissing();
     }
     function cacheKeys() {
       const rec = {
         code: P.formatCode(st.sid, secret), expiresAt: st.expiresAt, frames: st.frames, totalBytes: st.totalBytes,
+        safety: sess.safety, kex: sess.kex,
         keys: { kRec: P.hex(sess.kRec), kMeta: P.hex(sess.kMeta), kConfirm: P.hex(sess.kConfirm), sid8: P.hex(sess.sid8) },
       };
       if (role === 'sender') {
@@ -679,7 +735,7 @@
       sess = {
         kRec: P.unhex(rec.keys.kRec), kMeta: P.unhex(rec.keys.kMeta),
         kConfirm: P.unhex(rec.keys.kConfirm), sid8: P.unhex(rec.keys.sid8),
-        safety: '', kex: 'resumed',
+        safety: rec.safety || '', kex: rec.kex || 'resumed',
       };
       token = rec.token || token;
       st.expiresAt = rec.expiresAt;
@@ -794,6 +850,7 @@
         openStream();
         await exchangeKeys();
         cacheKeys();
+        await resumeHandshake();
         return { code: st.code, resumed: true };
       }
       if (resume && resume.record && !resume.record.keys) {
@@ -846,6 +903,7 @@
       await setupChannel(); // rtc 先就位，再开流收补发的 offer/ice/key
       openStream();
       await exchangeKeys();
+      if (resumeMode) await resumeHandshake(); // 恢复不等对方的 key：本地有密钥就能直接接着拉
       return { frames: j.frames, totalBytes: j.totalBytes };
     }
 

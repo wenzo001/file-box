@@ -569,6 +569,8 @@
     el.className = err ? 'err' : '';
     const lines = [];
     lines.push(PHASE[st.phase] || st.phase || '待命');
+    // 安全码光显示出来不够，还得说清"对面那一端有没有核过同一组数"
+    if (st.safety) lines.push(st.peerConfirmed ? '✓ 对方也确认了这组安全码，链路上没有别人' : '还在等对方确认安全码（先核对两边数字是否一致）');
     if (st.frames) {
       const pct = Math.min(100, Math.round((doneN / st.frames) * 100));
       const moved = Math.min(st.totalBytes, Math.round(doneN * (st.totalBytes / st.frames)));
