@@ -16,6 +16,9 @@
     --text: #1C1C1E;
     --text2: #565B62;
     --text3: rgba(60,60,67,.32);
+    /* 脚注专用：--text3 在白底上只有 1.8:1，达不到 4.5:1。
+       装饰用途（通道小圆点、✕ 图标）继续用 --text3，文字用这个更深的 */
+    --text3-ink: #6B6B70;
     --accent: #0059B3;
     --accent-fill: #0071E3;
     --accent-ink: var(--accent);
@@ -38,6 +41,7 @@
       --text: #FFFFFF;
       --text2: rgba(235,235,245,.6);
       --text3: rgba(235,235,245,.32);
+      --text3-ink: #A9A9B0;
       --accent: #0A84FF;
       --accent-fill: #0A69E8;
       --accent-ink: #0A84FF;
@@ -88,7 +92,7 @@
     text-transform: uppercase; letter-spacing: .4px;
     margin: 24px 4px 7px;
   }
-  .sec .sec-note { font-size: 12px; font-weight: 400; color: var(--text3); text-transform: none; letter-spacing: 0; }
+  .sec .sec-note { font-size: 12px; font-weight: 400; color: var(--text3-ink); text-transform: none; letter-spacing: 0; }
 
   .panel { background: var(--card); border-radius: 12px; overflow: hidden; }
 
@@ -268,7 +272,7 @@
   .modes .mode-i.warn { background: rgba(255,149,0,.14); color: #8A5A00; }
   @media (prefers-color-scheme: dark) { .modes .mode-i.warn { color: #FFB340; } }
 
-  .subtle { font-size: 12px; color: var(--text3); margin-top: 8px; line-height: 1.5; }
+  .subtle { font-size: 12px; color: var(--text3-ink); margin-top: 8px; line-height: 1.5; }
 
   .warn {
     margin-top: 10px; border-radius: 10px; padding: 10px 12px;
