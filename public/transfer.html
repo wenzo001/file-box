@@ -23,6 +23,7 @@
     --red: #FF3B30;
     --sep: rgba(60,60,67,.29);
     --fill: rgba(120,120,128,.12);
+    --seg-thumb: #FFFFFF;
     --ok: #34C759;
   }
   @media (prefers-color-scheme: dark) {
@@ -40,6 +41,7 @@
       --red: #FF453A;
       --sep: rgba(84,84,88,.6);
       --fill: rgba(120,120,128,.24);
+      --seg-thumb: #48484A;
     }
   }
 
@@ -96,8 +98,8 @@
     -webkit-user-select: none; user-select: none; touch-action: manipulation;
     transition: background .18s, box-shadow .18s;
   }
-  .segbar button.on { background: var(--card); font-weight: 600;
-    box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  .segbar button.on { background: var(--seg-thumb); color: var(--text); font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,.18); }
 
   .pad { padding: 16px; }
   .hint { font-size: 13px; color: var(--text2); line-height: 1.6; }
@@ -178,6 +180,10 @@
     -webkit-user-select: none; user-select: none; touch-action: manipulation;
   }
   .copy-code:active { opacity: .6; }
+  .share-row + .share-row { margin-top: 12px; }
+  .share-label { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  .share-label .say-inline { font-weight: 400; color: var(--text2); margin-left: 6px; }
+  .code-box .code.url { font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
 
   /* 安全码：两端必须一致才算没人夹在中间 */
   .safety {
@@ -282,8 +288,8 @@
 
 <div class="wrap">
   <div class="segbar" role="tablist">
-    <button type="button" id="tab-send" role="tab" aria-selected="true">我要发送</button>
-    <button type="button" id="tab-recv" role="tab" aria-selected="false">我要接收</button>
+    <button type="button" id="tab-send" role="tab" aria-selected="true">发送</button>
+    <button type="button" id="tab-recv" role="tab" aria-selected="false">接收</button>
   </div>
 
   <div class="note" id="caps"></div>
@@ -302,12 +308,22 @@
     </div>
 
     <div id="send-live" hidden>
-      <div class="sec">2 · 把传输码给对方<span class="sec-note">对方在「我要接收」里输入</span></div>
+      <div class="sec">2 · 把传输码给对方<span class="sec-note">发链接，或在「接收」里输码</span></div>
       <div class="panel">
         <div class="pad">
-          <div class="code-box">
-            <div class="code" id="send-code"></div>
-            <button type="button" class="copy-code" id="send-copy">复制</button>
+          <div class="share-row">
+            <div class="share-label">传输码</div>
+            <div class="code-box">
+              <div class="code" id="send-code"></div>
+              <button type="button" class="copy-code" id="send-copy">复制</button>
+            </div>
+          </div>
+          <div class="share-row">
+            <div class="share-label">接收链接<span class="say-inline">对方点开就自动到接收页</span></div>
+            <div class="code-box">
+              <div class="code url" id="send-link"></div>
+              <button type="button" class="copy-code" id="send-copy-link">复制</button>
+            </div>
           </div>
           <div class="safety">
             <div class="num" id="send-safety">— — — — —</div>
@@ -321,7 +337,7 @@
             <button type="button" class="linkbtn" id="send-recon">重新连接</button>
             <button type="button" class="linkbtn" id="send-cancel" style="color:var(--red)">取消并销毁</button>
           </div>
-          <div class="subtle">会话是临时的：过期、取消或传完后服务器上的密文会被清掉；不生成永久链接，也不会进文件库。</div>
+          <div class="subtle">会话是临时的：过期、取消或传完后服务器上的密文会被清掉；链接不是永久地址，会话一结束就失效，也不会进文件库。码跟在 # 后面，服务器和反向代理的访问日志都收不到它。</div>
         </div>
       </div>
     </div>
@@ -523,9 +539,21 @@
     return s;
   }
 
+  function receiveLink(code) {
+    // 码放在 # 之后：浏览器不会把片段发给服务器，反向代理的访问日志也就记不到它
+    return `${location.origin}${location.pathname}#recv?code=${encodeURIComponent(code)}`;
+  }
+
   function paint(prefix, st, box) {
     const t = (id) => $(`${prefix}-${id}`);
-    if (st.code) t('code') && (t('code').textContent = st.code);
+    if (st.code) {
+      if (t('code')) t('code').textContent = st.code;
+      const linkEl = t('link');
+      if (linkEl && linkEl.dataset.code !== st.code) {
+        linkEl.dataset.code = st.code;
+        linkEl.textContent = receiveLink(st.code);
+      }
+    }
     if (st.safety) t('safety').textContent = st.safety.replace(/(.{1})(?=.)/g, '$1 ');
     const [ctext, ccls] = chanOf(st.channel);
     const chanEl = t('chan');
@@ -649,6 +677,10 @@
     const txt = $('#send-code').textContent;
     toast((await copyText(txt)) ? '传输码已复制' : '复制没成功，请手动选中复制');
   });
+  $('#send-copy-link').addEventListener('click', async () => {
+    const txt = $('#send-link').textContent;
+    toast((await copyText(txt)) ? '接收链接已复制' : '复制没成功，请手动选中复制');
+  });
 
   $('#start').addEventListener('click', async () => {
     if (!picked.length) return;
@@ -752,7 +784,33 @@
   }
   $('#tab-send').addEventListener('click', () => showTab('send'));
   $('#tab-recv').addEventListener('click', () => showTab('recv'));
-  addEventListener('hashchange', () => showTab(location.hash === '#recv' ? 'recv' : 'send'));
+
+  // 链接里的码：优先 #recv?code=…（不进服务器日志），也兼容手拼的 ?code=…
+  function codeFromUrl() {
+    const frag = location.hash.replace(/^#/, '');
+    let raw = (frag.match(/[?&]code=([^&]+)/) || [])[1] || '';
+    if (!raw) {
+      const q = new URLSearchParams(location.search);
+      raw = q.get('code') || '';
+    }
+    if (!raw) return '';
+    try { return decodeURIComponent(raw.replace(/\+/g, ' ')); } catch { return raw; }
+  }
+
+  function autoAccept(code) {
+    $('#recv-in').value = code;
+    const sid = code.replace(/[^0-9a-z]/gi, '').slice(0, 8).toLowerCase();
+    if (sender && sender.state.sid && sender.state.sid === sid) { toast('这是你自己刚生成的传输码，已填好但不自动配对'); return; }
+    toast('已从链接识别传输码，正在配对…');
+    onReceive();
+  }
+
+  function routeFromUrl() {
+    const code = codeFromUrl();
+    showTab(code ? 'recv' : (location.hash === '#recv' ? 'recv' : 'send'));
+    if (code) autoAccept(code); // showTab 已把码从地址栏擦回 #recv，重开这条链接才会重新配对
+  }
+  addEventListener('hashchange', routeFromUrl);
 
   function renderResume() {
     const sending = !$('#view-send').hidden;
@@ -798,7 +856,7 @@
     });
   }
 
-  showTab(location.hash === '#recv' ? 'recv' : 'send');
+  routeFromUrl();
   addEventListener('resize', () => {
     ['#blocks', '#r-blocks'].forEach((s) => { const b = $(s); if (b && !b.hidden) layoutStrip(b); });
   });
