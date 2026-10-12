@@ -10,7 +10,7 @@ module.exports = {
         RETENTION_DAYS: 90,
         UPLOAD_TTL_HOURS: 48, // 未完成的断点续传批次留 2 天，超时回收
         // ---- 无痕传输（详见 docs/transfer.md）----
-        TRANSFER_DIR: './transfer', // 密文中转区，必须与 uploads 分开
+        TRANSFER_DIR: './.transfer', // 密文中转区，必须与 uploads 分开（与 server.js 默认值一致）
         XFER_TTL_MINUTES: 30,       // 会话有效期，到点清密文与账本
         XFER_LIMIT_GB: 2,           // 中转区总配额
         XFER_MAX_SESSIONS: 20,

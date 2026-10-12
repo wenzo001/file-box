@@ -17,6 +17,10 @@ dist/
 
 # 未完成的分块上传暂存（跑起来才生成）
 .uploading/
+
+# 无痕传输的密文中转区（跑起来才生成，绝不能入库）
+.transfer/
+transfer/
 .DS_Store
 Thumbs.db
 
