@@ -263,9 +263,20 @@
     b[12] = (b[12] + 1) & 255;
   }
 
+  const EMPTY = new Uint8Array(0);
+  /** GCM 长度块：把「字节数」写成 64 位大端位数。分块最大只有几 MB，但位数会跨过 2^32，
+   *  所以高低 32 位分开写，不用 >>>（>>> 会把超过 32 位的部分直接截掉） */
+  function putBits(out, at, bytes) {
+    const bits = bytes * 8;
+    const hi = Math.floor(bits / 4294967296);
+    const lo = bits - hi * 4294967296;
+    out[at] = (hi >>> 24) & 255; out[at + 1] = (hi >>> 16) & 255; out[at + 2] = (hi >>> 8) & 255; out[at + 3] = hi & 255;
+    out[at + 4] = (lo >>> 24) & 255; out[at + 5] = (lo >>> 16) & 255; out[at + 6] = (lo >>> 8) & 255; out[at + 7] = lo & 255;
+  }
+
   const ZERO16 = new Uint8Array(16);
 
-  function jsGcmSeal(key, iv, pt) { // → { ct, tag }
+  function jsGcmSeal(key, iv, pt, aad) { // → { ct, tag }；aad 不给时与不带附加数据的 GCM 逐字节一致
     const rk = expandKey256(key);
     const H = encBlock(rk, ZERO16);
     const tab = makeGhTables(H);
@@ -277,13 +288,15 @@
       for (let i = 0; i < n; i++) ct[off + i] = pt[off + i] ^ ks[i];
       inc32(cb);
     }
-    // GHASH: ct（补齐 16 倍数）|| [len(C) 位数 64BE]
-    const padLen = (ct.length + 15) & ~15;
-    const ghData = new Uint8Array(padLen + 16);
-    ghData.set(ct);
-    const bits = ct.length * 8;
-    ghData[padLen + 12] = (bits >>> 24) & 255; ghData[padLen + 13] = (bits >>> 16) & 255;
-    ghData[padLen + 14] = (bits >>> 8) & 255; ghData[padLen + 15] = bits & 255;
+    // GHASH: A（补齐）|| C（补齐）|| [len(A) 位数 64BE][len(C) 位数 64BE]
+    const a = aad || EMPTY;
+    const aPad = (a.length + 15) & ~15;
+    const cPad = (ct.length + 15) & ~15;
+    const ghData = new Uint8Array(aPad + cPad + 16);
+    ghData.set(a);
+    ghData.set(ct, aPad);
+    putBits(ghData, aPad + cPad, a.length);
+    putBits(ghData, aPad + cPad + 8, ct.length);
     const S = ghash(tab, ghData);
     const j0 = new Uint8Array(16); j0.set(iv); j0[15] = 1;
     const ej0 = encBlock(rk, j0);
@@ -292,16 +305,18 @@
     return { ct, tag };
   }
 
-  function jsGcmOpen(key, iv, ct, tag) { // 校验并解密 → Uint8Array
+  function jsGcmOpen(key, iv, ct, tag, aad) { // 校验并解密 → Uint8Array；aad 不给时与旧行为逐字节一致
     const rk = expandKey256(key);
     const H = encBlock(rk, ZERO16);
     const tab = makeGhTables(H);
-    const padLen = (ct.length + 15) & ~15;
-    const ghData = new Uint8Array(padLen + 16);
-    ghData.set(ct);
-    const bits = ct.length * 8;
-    ghData[padLen + 12] = (bits >>> 24) & 255; ghData[padLen + 13] = (bits >>> 16) & 255;
-    ghData[padLen + 14] = (bits >>> 8) & 255; ghData[padLen + 15] = bits & 255;
+    const a = aad || EMPTY;
+    const aPad = (a.length + 15) & ~15;
+    const cPad = (ct.length + 15) & ~15;
+    const ghData = new Uint8Array(aPad + cPad + 16);
+    ghData.set(a);
+    ghData.set(ct, aPad);
+    putBits(ghData, aPad + cPad, a.length);
+    putBits(ghData, aPad + cPad + 8, ct.length);
     const S = ghash(tab, ghData);
     const j0 = new Uint8Array(16); j0.set(iv); j0[15] = 1;
     const ej0 = encBlock(rk, j0);
@@ -447,7 +462,7 @@
 
     /** 测试钩子（生产无副作用） */
     _test: {
-      sha256, pbkdf2Sha256, jsGcmSeal, jsGcmOpen, expandKey256, encBlock, ghash, makeGhTables,
+      sha256, pbkdf2Sha256, hmacSha256, jsGcmSeal, jsGcmOpen, expandKey256, encBlock, ghash, makeGhTables,
       setEngine(name) { useNative = name === 'native' && hasNative; },
       get useNative() { return useNative && hasNative; },
     },
