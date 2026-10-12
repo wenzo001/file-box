@@ -25,6 +25,8 @@ const INCLUDE = [
   'ecosystem.config.js',
   'README.md',
   'public',
+  'lib',        // server.js 里 require('./lib/transfer')，少了它解压即跑就是个崩溃
+  'docs',
 ];
 // 产物顶层一旦出现这些，直接失败
 const FORBIDDEN = [/^uploads\//, /^\.uploading\//, /^\.certs\//, /^\.git\//, /^dist\//, /\.log$/, /^\.env/, /^scripts\//];
