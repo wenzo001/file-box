@@ -349,6 +349,65 @@ test('信令确实会转到对端：发送方 offer 到接收方、接收方 ans
   rStream.cancel(); sStream.cancel();
 });
 
+// SSE 帧按结构解出来再断言：手写转义匹配（\\" 之类）很容易自己写错，红得莫名其妙
+const sseEvents = (txt) =>
+  txt.split('\n\n').filter((b) => b.startsWith('event: ')).map((b) => {
+    const name = b.slice(7, b.indexOf('\n'));
+    const dm = b.match(/^data: (.*)$/m);
+    return { name, data: dm ? JSON.parse(dm[1]) : null };
+  });
+const readUntil = async (reader, ms) => {
+  const dec = new TextDecoder();
+  const stop = Date.now() + ms;
+  let txt = '';
+  while (Date.now() < stop) {
+    const got = await Promise.race([reader.read(), new Promise((r) => setTimeout(() => r(null), stop - Date.now()))]);
+    if (!got || got.done) break;
+    txt += dec.decode(got.value, { stream: true });
+    if (/\n\n$/.test(txt) && sseEvents(txt).length) break;
+  }
+  return txt;
+};
+
+test('信令补发：事件流迟到的一方仍能拿到已经发过的握手消息', async () => {
+  const c = await createSession();
+  // 接收方还没开事件流，发送方就已经把 key 发出去了（真实时序就是这样撞上的）
+  const sent = await fetch(`${srv.base}/api/xfer/signal`, {
+    method: 'POST', headers: hdr({ 'X-Xfer-Sender': c.body.token }),
+    body: JSON.stringify({ sid: c.sid, kind: 'key', body: '{"kex":"p256","pub":"aabbcc"}' }),
+  });
+  assert.strictEqual(sent.status, 200);
+  await join(srv, c.sid, c.proof);
+  const res = await fetch(`${srv.base}/api/xfer/events?sid=${c.sid}&role=receiver`, { headers: { 'X-Xfer-Proof': c.proof } });
+  assert.strictEqual(res.status, 200);
+  const reader = res.body.getReader();
+  const ev = sseEvents(await readUntil(reader, 3000)).find((e) => e.name === 'key');
+  reader.cancel();
+  assert.ok(ev, '迟到的事件流必须补收到对方已经发过的 key，否则握手永远凑不齐');
+  assert.strictEqual(ev.data.from, 'sender');
+  assert.deepStrictEqual(JSON.parse(ev.data.body), { kex: 'p256', pub: 'aabbcc' });
+});
+
+test('信令补发只补发给该收的那一方：发送方不会收到自己发的 key', async () => {
+  const c = await createSession();
+  await join(srv, c.sid, c.proof);
+  await fetch(`${srv.base}/api/xfer/signal`, {
+    method: 'POST', headers: hdr({ 'X-Xfer-Sender': c.body.token }),
+    body: JSON.stringify({ sid: c.sid, kind: 'key', body: '{"pub":"mine"}' }),
+  });
+  // 先让接收方来一条，把服务器"该发的都发了"这个状态顶出来，再回头看发送方这边有没有
+  const r = await fetch(`${srv.base}/api/xfer/events?sid=${c.sid}&role=receiver`, { headers: { 'X-Xfer-Proof': c.proof } });
+  const rr = r.body.getReader();
+  assert.ok(sseEvents(await readUntil(rr, 3000)).some((e) => e.name === 'key'), '接收方应该补收到 key');
+  rr.cancel();
+  const s = await fetch(`${srv.base}/api/xfer/events?sid=${c.sid}&role=sender`, { headers: { 'X-Xfer-Sender': c.body.token } });
+  const sr = s.body.getReader();
+  // 发送方这边：除了自己开流时对方那声 hello，不该出现自己发出的 key
+  const txt = await readUntil(sr, 1500);
+  sr.cancel();
+  assert.ok(!sseEvents(txt).some((e) => e.name === 'key'), '发给接收方的 key 不该回给发送方自己');
+});
+
 test('与正式文件库物理隔离：.transfer 不会出现在列表 / 下载 / 归档里', async () => {
   const c = await createSession();
   await fetch(`${srv.base}/api/xfer/seg?sid=${c.sid}&i=0`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Xfer-Sender': c.body.token }, body: crypto.randomBytes(64) });
