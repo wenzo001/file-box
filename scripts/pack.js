@@ -187,17 +187,25 @@ try {
   console.error(`[打包] 已生成的可直接部署目录: ${STAGE}`);
   process.exit(1);
 }
-const inTar = cp.execFileSync('tar', ['-tzf', TARBALL_NAME], { cwd: DIST, encoding: 'utf8' })
-  .split(/\r?\n/).filter(Boolean)
-  .map((l) => l.replace(/^file-box\//, ''))
-  .filter((l) => l && !l.endsWith('/'))
-  .sort();
-const want = staged.slice().sort();
-if (JSON.stringify(inTar) !== JSON.stringify(want)) {
-  console.error(`[打包] tar 条目与暂存目录不一致（包内 ${inTar.length} / 暂存 ${want.length}）`);
-  console.error('  仅在包内:', inTar.filter((x) => !staged.includes(x)).slice(0, 3));
-  console.error('  仅在暂存:', want.filter((x) => !inTar.includes(x)).slice(0, 3));
-  process.exit(1);
+// 校验包内容：**解出来再比**，不要比 `tar -tzf` 的输出。
+// 原因：Windows 的 tar 按 ANSI 代码页输出文件名，Node 却按 UTF-8 解码 stdout，
+// 于是任何非 ASCII 文件名（比如中文文档）都会变成乱码，和暂存清单必然对不上 ——
+// 这是把"包坏了"和"名字读错了"混为一谈。解压后由文件系统给出正确名字，才是可靠比对。
+const EXTRACT = path.join(DIST, '.tar-check');
+fs.rmSync(EXTRACT, { recursive: true, force: true });
+fs.mkdirSync(EXTRACT, { recursive: true });
+try {
+  cp.execFileSync('tar', ['-xzf', TARBALL_NAME, '-C', '.tar-check'], { cwd: DIST, stdio: 'inherit' });
+  const unpacked = walkFiles(path.join(EXTRACT, 'file-box')).sort();
+  const want = staged.slice().sort();
+  if (JSON.stringify(unpacked) !== JSON.stringify(want)) {
+    console.error(`[打包] tar 解出来的内容与暂存目录不一致（包内 ${unpacked.length} / 暂存 ${want.length}）`);
+    console.error('  仅在包内:', unpacked.filter((x) => !staged.includes(x)).slice(0, 3));
+    console.error('  仅在暂存:', want.filter((x) => !unpacked.includes(x)).slice(0, 3));
+    process.exit(1);
+  }
+} finally {
+  fs.rmSync(EXTRACT, { recursive: true, force: true });
 }
 
 const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
