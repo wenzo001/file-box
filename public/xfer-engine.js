@@ -25,6 +25,9 @@
   };
 
   // ---------------- 加密线程池（主线程绝不碰 AES/SHA，否则手机端页面会冻） ----------------
+  // 会话被取消时用它给还在排队的线程活计一个出口（身份比对，不靠文案）
+  const ABORTED = new Error('会话已结束');
+
   function Pool(size) {
     const n = Math.max(1, Math.min(size || 4, (navigator.hardwareConcurrency || 4) >= 4 ? 4 : 2));
     const workers = [];
@@ -36,6 +39,8 @@
       const w = new Worker('xfer-worker.js');
       w.onmessage = (e) => {
         const job = pending.get(e.data.id);
+        // 进度回信：这条线程还在忙，不能当成"活干完了"把工人放回空闲池
+        if (job && e.data.progress != null) { if (job.onProgress) job.onProgress(e.data.progress, e.data.doneBytes); return; }
         pending.delete(e.data.id);
         idle.push(w);
         if (job) job.resolve(e.data);
@@ -60,10 +65,10 @@
         idle.shift().postMessage(job.msg, job.transfer || []);
       }
     }
-    const call = (op, msg, transfer) => new Promise((resolve, reject) => {
+    const call = (op, msg, transfer, onProgress) => new Promise((resolve, reject) => {
       const id = ++seq;
       // resolve/reject 要跟着 job 走：只存 id 的话 worker 回信时找不到出口，每一块都会永远悬着
-      queue.push({ id, resolve, reject, msg: Object.assign({ id, op }, msg), transfer });
+      queue.push({ id, resolve, reject, onProgress, msg: Object.assign({ id, op }, msg), transfer });
       drain();
     }).then((r) => { if (r.error) throw new Error(r.error); return r; });
     return {
@@ -71,7 +76,17 @@
       sha256: (bytes) => call('sha256', { bytes }),
       seal: (o) => call('seal', o, [o.plaintext.buffer]),
       open: (o) => call('open', o, [o.frame.buffer.slice(0)]),
-      close() { workers.forEach((w) => { try { w.terminate(); } catch { /* 已终止 */ } }); },
+      fingerprint: (file, onProgress) => call('fingerprint', { file }, null, onProgress),
+      close() {
+        // 线程被 terminate 掉之后不会再回信：排队中和在跑的活都要给个出口，
+        // 否则"准备阶段就取消"会让 send() 的 await 永远悬着，界面卡在进度上
+        const err = ABORTED;
+        queue.splice(0).forEach((j) => j.reject(err));
+        pending.forEach((j) => j.reject(err));
+        pending.clear();
+        idle.length = 0;
+        workers.forEach((w) => { try { w.terminate(); } catch { /* 已终止 */ } });
+      },
     };
   }
 
@@ -302,6 +317,13 @@
   }
 
   // ---------------- 会话引擎 ----------------
+  // 一个页面里同一角色只允许一个在跑的会话：两个会话会抢同一批块、各自往 IndexedDB 写、
+  // 都上报 ack，界面上就是进度来回跳动。界面自己也要拦，这里是兜住别的入口。
+  // 终态（idle/取消/失败/完成）不算在跑：那之后应该能开新的。
+  const LIVE_PHASES = ['fingerprinting', 'waiting', 'pairing', 'paired', 'transferring', 'paused', 'retrying', 'verifying', 'ready', 'saving'];
+  const liveSession = { sender: null, receiver: null };
+  const isLive = (s) => !!s && LIVE_PHASES.includes(s.state.phase);
+
   function Session(opts) {
     const cfg = Object.assign({}, DEFAULTS, opts.config || {});
     const role = opts.role;
@@ -313,6 +335,7 @@
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
       sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
       safety: '', kex: '', engine: '', error: '', note: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
+      fpDone: 0, fpTotal: 0,          // 准备阶段：已读/总字节，界面拿它画进度和预计耗时
       peerConfirmed: false,
     };
     let pool = null;
@@ -338,13 +361,42 @@
     let running = false;
     let paused = false;
     let closed = false;
-    let ackBuf = new Set();
+    let aborted = false;            // 用户主动取消（准备阶段也要能停）
+    let api = null;
+    const ackBuf = new Set();
     let ackTimer = null;
     const timers = [];
     let sample = { t: 0, bytes: 0 };
 
     function patch(o) { Object.assign(st, o); emit(); }
     function fail(msg, recoverable) { patch({ phase: recoverable ? 'retrying' : 'failed', error: String(msg || '出错') }); }
+
+    function claim() {
+      if (isLive(liveSession[role]) && liveSession[role] !== api) {
+        throw new Error('这个页面上已经有一个在跑的会话了：请先取消它再开始新的');
+      }
+      liveSession[role] = api;
+    }
+    // 逐件算指纹：进度按累计字节报（界面拿它画长条 + 预计耗时）。中途取消返回 null。
+    async function fingerprintAll(files) {
+      const total = files.reduce((a, f) => a + f.size, 0);
+      const sha = new Map();
+      let done = 0;
+      patch({ fpTotal: total, fpDone: 0 });
+      try {
+        for (const f of files) {
+          const base = done;
+          const r = await fingerprintFile(pool, f.file, (p, bytes) => patch({ fpDone: Math.min(total, base + bytes) }));
+          sha.set(f.relPath, r.fileSha256);
+          done = Math.min(total, base + f.size);
+          patch({ fpDone: done });
+        }
+      } catch (err) {
+        if (aborted) return null;
+        throw err;
+      }
+      return sha;
+    }
 
     const fileKeyCache = new Map();
     function fileKey(fileId) {
@@ -806,6 +858,7 @@
 
     function close() {
       closed = true;
+      if (liveSession[role] === api) liveSession[role] = null;
       timers.forEach(clearTimeout);
       timers.length = 0;
       if (link) link.close();
@@ -818,6 +871,7 @@
     // ---------- 对外：发送 ----------
     // resume = { sid, record }：用之前缓存的会话密钥接着传；重新选的文件必须逐个对指纹
     async function send(list, resume) {
+      claim();
       pool = pool || new Pool();
       selFiles = list;
       byRel = new Map(list.map((f) => [f.relPath, f]));
@@ -825,6 +879,11 @@
         const rec = resume.record;
         const parsed = P.parseCode(rec.code);
         if (!parsed) throw new Error('本地存的传输码读不回来了');
+        for (const f of list) { // 清单先核完再哈希：不然白等一趟才发现对不上
+          const want = (rec.files || []).find((x) => x.relPath === f.relPath);
+          if (!want) throw new Error(`这次的清单里没有「${f.name}」，不能续原会话`);
+          if (want.size !== f.size) throw new Error(`「${f.name}」大小变了（${want.size} → ${f.size}），不能续原会话`);
+        }
         st.sid = parsed.sid;
         secret = parsed.secret;
         proof = await P.proofOf(parsed.sid, parsed.secret);
@@ -832,20 +891,18 @@
         st.code = P.formatCode(parsed.sid, parsed.secret);
         restoreKeys(rec);
         resumeMode = true;
-        patch({ phase: 'fingerprinting', code: st.code, resumable: true });
-        const planned = [];
-        for (const f of list) {
-          const want = (rec.files || []).find((x) => x.relPath === f.relPath);
-          if (!want) throw new Error(`这次的清单里没有「${f.name}」，不能续原会话`);
-          if (want.size !== f.size) throw new Error(`「${f.name}」大小变了（${want.size} → ${f.size}），不能续原会话`);
-          const fp = await fingerprintFile(f.file, (p) => patch({ error: `正在核对「${f.name}」的指纹 ${Math.round(p * 100)}%` }));
-          if (want.sha256 && fp.fileSha256 !== want.sha256) throw new Error(`「${f.name}」内容已经变了，不能续原会话：请重新发一次`);
-          planned.push({ relPath: f.relPath, name: f.name, size: f.size, mime: f.mime, sha256: fp.fileSha256 });
-        }
-        patch({ error: '' });
-        layout = P.planLayout(planned);
+        layout = P.planLayout(list);
         st.frames = layout.totalFrames;
         st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
+        patch({ phase: 'fingerprinting', code: st.code, resumable: true });
+        const sha = await fingerprintAll(list);
+        if (!sha) return { code: st.code, cancelled: true };
+        if (aborted) return { code: st.code, cancelled: true };
+        for (const lf of layout.files) {
+          lf.sha256 = sha.get(lf.relPath);
+          const want = (rec.files || []).find((x) => x.relPath === lf.relPath);
+          if (want && want.sha256 && lf.sha256 !== want.sha256) throw new Error(`「${lf.name}」内容已经变了，不能续原会话：请重新发一次`);
+        }
         await ensureKeys();
         await setupChannel(); // 同 fresh 分支：rtc 先于事件流
         openStream();
@@ -857,23 +914,25 @@
       if (resume && resume.record && !resume.record.keys) {
         throw new Error('这个会话的密钥本地已经没了（换过浏览器或清过站点数据），无法续传：请重新发一次');
       }
+      // 帧号只依赖大小和路径，先排好：准备阶段的长条和之后传输用的是同一批格子
+      layout = P.planLayout(selFiles);
+      st.frames = layout.totalFrames;
+      st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
       patch({ phase: 'fingerprinting' });
-      const planned = [];
-      for (const f of selFiles) {
-        const fp = await fingerprintFile(f.file, (p) => patch({ error: `正在读文件内容算指纹 ${Math.round(p * 100)}%` }));
-        planned.push({ relPath: f.relPath, name: f.name, size: f.size, mime: f.mime, sha256: fp.fileSha256 });
-      }
-      patch({ error: '' });
-      layout = P.planLayout(planned);
+      const sha = await fingerprintAll(selFiles);
+      if (!sha) return { code: '', cancelled: true };
+      // 用户可能在指纹刚算完、还没来得及建会话的那一瞬间点了"取消生成"。
+      // 少了这一检查，取消之后照样会 net.create 出一个会话，界面上就是"取消了还在等对方"。
+      if (aborted) return { code: '', cancelled: true };
+      layout.files.forEach((lf) => { lf.sha256 = sha.get(lf.relPath); });
       secret = P.genSecret();
       st.sid = P.genSid();
       proof = await P.proofOf(st.sid, secret);
       st.code = P.formatCode(st.sid, secret);
-      const created = await net.create(st.sid, proof, layout.totalFrames, layout.files.reduce((s, f) => s + f.size, 0));
+      const created = await net.create(st.sid, proof, layout.totalFrames, st.totalBytes);
       token = created.token;
       st.expiresAt = created.expiresAt;
-      st.frames = layout.totalFrames;
-      st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
+      if (aborted) { await net.finish(st.sid, 'cancel').catch(() => {}); return { code: '', cancelled: true }; }
       patch({ phase: 'waiting', code: st.code });
       await ensureKeys();
       await setupChannel(); // 同上：rtc 必须先于事件流存在
@@ -885,6 +944,7 @@
     }
 
     async function accept(codeText) {
+      claim();
       pool = pool || new Pool();
       const parsed = P.parseCode(codeText);
       if (!parsed) throw new Error('传输码格式不对：应为 8 + 24 个字符（不含 i/l/o/0）');
@@ -895,6 +955,7 @@
       const rec = readLs('receiver')[parsed.sid];
       if (rec && rec.keys) { restoreKeys(rec); resumeMode = true; }
       const j = await net.join(parsed.sid, proof);
+      if (aborted) return { frames: j.frames, totalBytes: j.totalBytes, cancelled: true };
       st.frames = j.frames;
       st.totalBytes = j.totalBytes;
       st.expiresAt = j.expiresAt;
@@ -908,13 +969,18 @@
       return { frames: j.frames, totalBytes: j.totalBytes };
     }
 
-    return {
+    return api = {
       state: st,
       send,
       accept,
       pause() { paused = true; patch({ phase: 'paused' }); },
       resume() { paused = false; patch({ phase: 'transferring' }); if (role === 'sender') pump(); else pullMissing(); },
-      async cancel() { await net.finish(st.sid, 'cancel').catch(() => {}); patch({ phase: 'cancelled' }); close(); },
+      async cancel() {
+        aborted = true;
+        close(); // 先关：准备阶段还没有会话号可通知服务器，但读文件的线程必须立刻停下来
+        patch({ phase: 'cancelled' }); // 状态先落到界面，别让用户等着网络往返
+        if (st.sid) await net.finish(st.sid, 'cancel').catch(() => {});
+      },
       async refresh() { await refreshAck(); if (role === 'receiver') await pullMissing(); },
       close,
       saveAll,
@@ -929,23 +995,14 @@
     };
   }
 
-  // 文件指纹：逐块 SHA-256 → 链摘要 → 再哈希。全程流式，内存里最多两块。
-  async function fingerprintFile(file, onProgress) {
-    const B = P.PLAIN_BLOCK;
-    const chain = [];
-    for (let off = 0; off < file.size; off += B) {
-      const bytes = new Uint8Array(await file.slice(off, Math.min(file.size, off + B)).arrayBuffer());
-      chain.push(await P.sha256(bytes));
-      if (onProgress) onProgress(Math.min(1, (off + B) / file.size));
-      if ((off / B) % 64 === 0) await sleep(0);
-    }
-    if (!chain.length) chain.push(await P.sha256(new Uint8Array(0)));
-    return { fileSha256: P.hex(await P.sha256(P.cat(...chain))), size: file.size };
+  // 文件指纹：整件文件的逐块 SHA-256 → 链摘要 → 再哈希。算在工作线程里，主线程只收进度。
+  async function fingerprintFile(pool, file, onProgress) {
+    const r = await pool.fingerprint(file, onProgress);
+    return { fileSha256: r.hex, size: file.size };
   }
 
   global.XferEngine = {
     Session,
-    fingerprintFile,
     Pool,
     Store,
     toRanges,
@@ -958,6 +1015,8 @@
         .filter((x) => x.expiresAt > now);
     },
     forget(role, sid) { writeLs(role, sid, null); },
+    // 界面用它兜底"一个角色只允许一个会话"；界面自己也要在开局前拦一次
+    liveOf(role) { const s = liveSession[role]; return s && isLive(s) ? s.state.phase : ''; },
     capabilities() {
       return {
         secure: Boolean(global.isSecureContext),

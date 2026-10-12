@@ -17,6 +17,25 @@ self.onmessage = async (e) => {
       self.postMessage({ id: m.id, hex: XferProto.hex(d) });
       return;
     }
+    if (m.op === 'fingerprint') {
+      // 整件文件的逐块哈希放在这一条线程里跑完：主线程只收进度，2GB 也不该让它卡一下。
+      // File 可以直接结构化克隆进来，切片读也是异步的，不会把这边也堵死。
+      const B = XferProto.PLAIN_BLOCK;
+      const file = m.file;
+      const chain = [];
+      let sentAt = 0;
+      for (let off = 0; off < file.size; off += B) {
+        const bytes = new Uint8Array(await file.slice(off, Math.min(file.size, off + B)).arrayBuffer());
+        chain.push(await XferProto.sha256(bytes));
+        const p = Math.min(1, (off + B) / file.size);
+        const now = Date.now();
+        if (p >= 1 || now - sentAt > 80) { sentAt = now; self.postMessage({ id: m.id, progress: p, doneBytes: Math.min(file.size, off + B) }); }
+      }
+      if (!chain.length) chain.push(await XferProto.sha256(new Uint8Array(0)));
+      const total = await XferProto.sha256(XferProto.cat(...chain));
+      self.postMessage({ id: m.id, hex: XferProto.hex(total) });
+      return;
+    }
     if (m.op === 'seal') {
       const frame = await XferProto.seal({
         key: new Uint8Array(m.key), sid8: new Uint8Array(m.sid8), type: m.type,
