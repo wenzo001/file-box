@@ -545,6 +545,18 @@
       emit();
       return true;
     }
+    // 接收端要主动追问：服务器中转时发送方是一块一块上传的，配对那一刻拉到的只是当时有的。
+    // 不轮询就会永远停在"刚配对时的那几块"上，两边互相等，直到超时。
+    let pollT = null;
+    function schedulePoll() {
+      if (pollT || closed || role !== 'receiver') return;
+      pollT = setTimeout(async () => {
+        pollT = null;
+        if (closed || st.verified) return;
+        if (!paused && handshakeDone) { await refreshAck(); await pullMissing(); }
+        schedulePoll();
+      }, cfg.pollMs);
+    }
     async function finishReceive() {
       if (st.verified) return;
       patch({ phase: 'verifying' });
@@ -638,7 +650,7 @@
     }
     function afterHandshake() {
       if (role === 'sender') pump();
-      else { pullMissing(); }
+      else { pullMissing(); schedulePoll(); }
     }
     async function onPeerConfirm(body) {
       // 握手已经完成后又收到 confirm，只会是重连时服务器补发的历史 —— 忽略它，
@@ -741,6 +753,7 @@
       timers.length = 0;
       if (link) link.close();
       if (rtc) rtc.close();
+      if (pollT) { clearTimeout(pollT); pollT = null; }
       if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
       pool && pool.close();
     }
