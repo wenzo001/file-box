@@ -21,10 +21,14 @@
     --accent-ink: var(--accent);
     --label-ink: #4A4F55;
     --red: #FF3B30;
+    /* 红字专用：--red 在白底上只有 3.55:1，达不到 4.5:1；
+       背景/描边继续用 --red，文字用这个更深的 */
+    --red-ink: #C0271C;
     --sep: rgba(60,60,67,.29);
     --fill: rgba(120,120,128,.12);
     --seg-thumb: #FFFFFF;
     --ok: #34C759;
+    --warn: #FF9500;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -39,9 +43,11 @@
       --accent-ink: #0A84FF;
       --label-ink: #C7C9CF;
       --red: #FF453A;
+      --red-ink: #FF6961;
       --sep: rgba(84,84,88,.6);
       --fill: rgba(120,120,128,.24);
       --seg-thumb: #48484A;
+      --warn: #FF9F0A;
     }
   }
 
@@ -205,6 +211,8 @@
   .chan.live .dot { background: var(--ok); }
   .chan.relay .dot { background: var(--accent-fill); }
   .chan.warn .dot { background: var(--red); }
+  /* 降级（HTTP 入口：没有 WebCrypto 也没有直连）不是错误，用橙色而不是红色 —— 红色留给真出错 */
+  .chan.deg .dot { background: var(--warn); }
 
   /* 进度长条：与文件库页面 #blocks 同一组件、同一配色、同一动画 */
   #blocks {
@@ -226,6 +234,39 @@
     font-variant-numeric: tabular-nums; white-space: pre-line;
   }
   #send-status.err, #recv-status.err { color: var(--red); font-weight: 500; }
+
+  /* 准备期骨架：码还没算出来时那两行分享区长这样。只在线程里算指纹时出现，
+     所以不会像"整页 loading"那样把用户晾着 —— 下面的取消键一直可用。 */
+  .skel { display: none; margin-top: 8px; }
+  .skel.on { display: block; }
+  .skel i {
+    display: block; height: 12px; border-radius: 6px; margin-bottom: 6px;
+    background: var(--fill);
+    background-image: linear-gradient(90deg, transparent, rgba(120,120,128,.18), transparent);
+    background-size: 40% 100%; background-repeat: no-repeat;
+    animation: skelSlide 1.2s ease-in-out infinite;
+  }
+  .skel i:nth-child(2) { width: 72%; }
+  .skel i:nth-child(3) { width: 48%; }
+  @keyframes skelSlide { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skel i { animation: none; } }
+
+  /* ETA / 预计耗时：换行要留给它，手机上 390×844 也得排得下 */
+  .eta {
+    font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
+    font-variant-numeric: tabular-nums; line-height: 1.5;
+    overflow-wrap: anywhere; white-space: pre-line;
+  }
+
+  /* 模式 / 降级说明：和通道那一行分工 —— 通道说"现在怎么传"，这块说"为什么只能这样"，
+     并且必须给可执行的下一步。中性色，真正的错误才用 .warn */
+  .modes { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .modes .mode-i {
+    font-size: 12px; line-height: 1.55; color: var(--label-ink);
+    padding: 8px 10px; border-radius: 9px; background: var(--fill);
+  }
+  .modes .mode-i.warn { background: rgba(255,149,0,.14); color: #8A5A00; }
+  @media (prefers-color-scheme: dark) { .modes .mode-i.warn { color: #FFB340; } }
 
   .subtle { font-size: 12px; color: var(--text3); margin-top: 8px; line-height: 1.5; }
 
@@ -317,6 +358,7 @@
               <div class="code" id="send-code"></div>
               <button type="button" class="copy-code" id="send-copy">复制</button>
             </div>
+            <div class="skel" id="send-code-skel" aria-hidden="true"><i></i><i></i><i></i></div>
           </div>
           <div class="share-row">
             <div class="share-label">接收链接<span class="say-inline">对方点开就自动到接收页</span></div>
@@ -324,18 +366,21 @@
               <div class="code url" id="send-link"></div>
               <button type="button" class="copy-code" id="send-copy-link">复制</button>
             </div>
+            <div class="skel" id="send-link-skel" aria-hidden="true"><i></i><i></i></div>
           </div>
           <div class="safety">
             <div class="num" id="send-safety">— — — — —</div>
             <div class="say">配对成功后，两边屏幕上必须显示<b>同一组安全码</b>。不一样就立刻取消 —— 服务器看不到内容，但它能看到谁在配对，靠这组数字确认中间没别人。</div>
           </div>
           <div class="chan" id="send-chan"><span class="dot"></span><span id="send-chan-t">还没连接</span></div>
+          <div class="modes" id="send-mode" hidden></div>
           <div id="blocks" hidden></div>
           <div id="send-status">等待接收方…</div>
+          <div class="eta" id="send-eta" hidden></div>
           <div class="ops">
             <button type="button" class="linkbtn" id="send-pause">暂停</button>
             <button type="button" class="linkbtn" id="send-recon">重新连接</button>
-            <button type="button" class="linkbtn" id="send-cancel" style="color:var(--red)">取消并销毁</button>
+            <button type="button" class="linkbtn" id="send-cancel" style="color:var(--red-ink)">取消并销毁</button>
           </div>
           <div class="subtle">会话是临时的：过期、取消或传完后服务器上的密文会被清掉；链接不是永久地址，会话一结束就失效，也不会进文件库。码跟在 # 后面，服务器和反向代理的访问日志都收不到它。</div>
         </div>
@@ -369,12 +414,13 @@
             <div class="say">和发送方屏幕上那组一模一样才可以收。不一样 = 有人在中间换过密钥，请取消并让对方重发。</div>
           </div>
           <div class="chan" id="recv-chan"><span class="dot"></span><span id="recv-chan-t">还没连接</span></div>
+          <div class="modes" id="recv-mode" hidden></div>
           <div id="r-blocks" hidden></div>
           <div id="recv-status">等待对方开始…</div>
           <div class="ops">
             <button type="button" class="linkbtn" id="recv-pause">暂停</button>
             <button type="button" class="linkbtn" id="recv-recon">重新连接</button>
-            <button type="button" class="linkbtn" id="recv-cancel" style="color:var(--red)">取消</button>
+            <button type="button" class="linkbtn" id="recv-cancel" style="color:var(--red-ink)">取消</button>
           </div>
         </div>
       </div>
@@ -449,7 +495,7 @@
   }
 
   const PHASE = {
-    idle: '', fingerprinting: '正在算文件指纹（只读本地内容，不上传）',
+    idle: '', fingerprinting: '正在生成传输码（只读本地内容，不上传）',
     waiting: '等待接收方输入传输码', pairing: '正在配对、核对安全码',
     transferring: '加密传输中', paused: '已暂停（恢复状态还在）',
     retrying: '连接断了，正在自动重连或改走中转', verifying: '全部到齐，正在逐块校验并算总 SHA-256',
@@ -463,6 +509,32 @@
     server_relay: ['服务器密文中转', 'relay'],
   };
   const chanOf = (c) => CHAN[c] || CHAN.none;
+
+  // 常量先集中放，界面到处要用
+  const TERMINAL = ['cancelled', 'failed', 'done'];
+  // 准备期 = 码还没拿到手（正在线程里算指纹）。这时候复制键点到也只是空串。
+  // 注意不能用 phase 判断：'waiting' 时码已经在了，而它比安全码更早出现。
+  const codeReady = (st) => !!st.code;
+  // 降级判定用 caps（一进页面就知道），而不是 st.kex —— kex 要等对方公钥到了才有值，
+  // 在那之前"为什么慢/为什么不能直连"正是用户最想问的时候
+  const degraded = () => !caps.subtle
+    || (sender && sender.state.kex === 'code')
+    || (receiver && receiver.state.kex === 'code');
+
+  // ---------------- ETA 平滑估计 ----------------
+  // 为什么不能读一帧算一帧：进度包每 80ms 一个，主线程一忙就跳得很厉害，两秒跳完一秒剩
+  const etaState = { since: 0, base: 0 };
+  function etaFrom(doneBytes, totalBytes, now) {
+    if (!(totalBytes > 0) || !(doneBytes > 0)) return { eta: 0, ready: false };
+    if (!etaState.since) etaState.since = now, etaState.base = doneBytes;
+    const dt = now - etaState.since;
+    // 至少攒 1.2 秒才给估算，不然前两个包就能把速度算飞
+    if (dt < 1200) return { eta: 0, ready: false };
+    const rate = (doneBytes - etaState.base) / ((dt / 1000) || 1);
+    if (!(rate > 0)) return { eta: 0, ready: false };
+    return { eta: (totalBytes - doneBytes) / rate, ready: true };
+  }
+  function resetEta() { etaState.since = 0; etaState.base = 0; }
 
   // ---------------- 进度长条（复用 #blocks 组件；格数封顶，每格代表若干帧） ----------------
   const MAXCELL = 600;
@@ -557,7 +629,8 @@
     if (st.safety) t('safety').textContent = st.safety.replace(/(.{1})(?=.)/g, '$1 ');
     const [ctext, ccls] = chanOf(st.channel);
     const chanEl = t('chan');
-    chanEl.className = 'chan' + (ccls ? ' ' + ccls : '');
+    // 降级（HTTP 入口没有 WebCrypto）单独给橙点：绿色=直连、蓝色=中转、橙色=降级
+    chanEl.className = 'chan' + (ccls ? ' ' + ccls : '') + (degraded() ? ' deg' : '');
     const why = st.error && st.phase === 'retrying' ? ` · ${st.error}` : (st.note ? ` · ${st.note}` : '');
     t('chan-t').textContent = (st.channel === 'none' ? ctext : `${ctext}${why}`);
 
@@ -588,15 +661,84 @@
     } else {
       const p = t('pause');
       if (p) p.textContent = st.phase === 'paused' ? '继续发送' : '暂停';
+      // 码未就绪：两行分享区长骨架。有了码就不是骨架了 —— 用户看到"真的码"才该去复制
+      const skel = $('#send-code-skel'), skel2 = $('#send-link-skel');
+      const on = !codeReady(st);
+      if (skel) skel.classList.toggle('on', on);
+      if (skel2) skel2.classList.toggle('on', on);
+    }
+    // 模式 / 降级 / 环境限制：通道那一行只说"现在怎么传"，这里说清"为什么只能这样"
+    paintMode(prefix, st);
+    // 准备期上锁：复制键、暂停、重连这个阶段都还没有意义，点了只会复制到空码
+    lockForPhase(prefix, st);
+  }
+
+  // 一句话说清当前模式与限制，并给可执行的下一步（HTTP 入口那行不是死胡同）
+  function paintMode(prefix, st) {
+    const el = $(`${prefix}-mode`);
+    if (!el) return;
+    const deg = degraded();
+    const parts = [];
+    if (deg) {
+      parts.push({ txt: '降级模式：当前是 HTTP 入口，浏览器没给加密接口，所以用纯 JS 加密（约 7MB/s），也用不了点对点直连。内容依旧是端到端加密的，只是没有前向保密。', warn: true });
+    } else {
+      parts.push({ txt: '本会话用浏览器原生 WebCrypto（ECDH P-256 派生会话密钥）。', warn: false });
+    }
+    if (st.channel === 'server_relay') parts.push({ txt: '现在是服务器密文中转：服务器只搬密文，看不到文件名和内容。', warn: false });
+    else if (st.channel === 'p2p') parts.push({ txt: '现在是点对点直连：内容不经过服务器。', warn: false });
+    else if (st.channel === 'p2p_connecting') parts.push({ txt: '正在尝试点对点直连；连不上会自动改走服务器中转。', warn: false });
+    // 不只是告诉用户"你降级了"，要给一个能做的动作
+    if (deg) parts.push({ txt: `要直连请改用 HTTPS 入口：https://${location.hostname}:3443`, warn: true });
+    el.hidden = false;
+    el.innerHTML = parts.map((p) => `<span class="mode-i${p.warn ? ' warn' : ''}">${p.txt}</span>`).join('');
+  }
+
+  // 准备期/终态的按钮上锁。终态要放开，否则传完一次就只能刷新页面。
+  function lockForPhase(prefix, st) {
+    const prep = !codeReady(st); // 码还没算出来：复制/暂停/重连都还没有意义
+    const dead = TERMINAL.includes(st.phase);
+    const cp = $(`${prefix}-copy`), cpl = $(`${prefix}-copy-link`);
+    if (cp) { cp.disabled = prep; cp.title = prep ? '传输码还在算，请稍等' : ''; }
+    if (cpl) { cpl.disabled = prep; cpl.title = prep ? '传输码还在算，请稍等' : ''; }
+    // 会话没建立之前暂停/重连没有对象；建立之后只有终态才停
+    const ps = $(`${prefix}-pause`), rc = $(`${prefix}-recon`);
+    if (ps) ps.disabled = prep || dead;
+    if (rc) rc.disabled = prep || dead;
+    // 接收端入口：活动会话期间禁止再点（点了会起第二个会话），输入框也锁住
+    if (prefix === '#recv') {
+      const go = $('#recv-go'), inp = $('#recv-in');
+      const running = !dead;
+      if (go) { go.disabled = running; go.textContent = running ? '正在接收…' : '配对并开始接收'; }
+      if (inp) inp.readOnly = running;
+    } else {
+      // #start 的可用性由这里统一决定：点它的回调里改是不行的 —— 取消和"指纹算完"会赛跑，
+      // 谁后跑谁说了算，取消之后 #start 就可能一直卡在禁用上
+      const start = $('#start');
+      if (start) start.disabled = dead ? picked.length === 0 : true;
+    }
+    // 取消永远可用：准备期要能停下（文案改成"取消生成"），终态点了只是清理本地记录
+    const cn = $(`${prefix}-cancel`);
+    if (cn) {
+      cn.disabled = false;
+      cn.textContent = prep ? '取消生成' : (dead ? '关闭' : (prefix === '#send' ? '取消并销毁' : '取消'));
     }
   }
 
   function statusLine(prefix, st, box, cells, blkBytes, doneN) {
     const el = $(`${prefix}-status`);
     const err = st.error && st.phase !== 'retrying';
+    const etaEl = $(`${prefix}-eta`) || null;
+    if (etaEl) etaEl.hidden = true;
     el.className = err ? 'err' : '';
     const lines = [];
     lines.push(PHASE[st.phase] || st.phase || '待命');
+    // 准备期：还没有帧，进度长条还是空的。用 fpDone/fpTotal 给一条能看懂的行，
+    // 含百分比、已读字节和预计剩余时间 —— 用户必须知道还要等多久，而不是看到一个空框。
+    if (!codeReady(st) && st.fpTotal) {
+      const p = Math.min(100, Math.round((st.fpDone / st.fpTotal) * 100));
+      const e = etaFrom(st.fpDone, st.fpTotal, Date.now());
+      lines.push(`正在读本地文件算指纹 ${p}%（${fmt(st.fpDone)} / ${fmt(st.fpTotal)}${e.ready ? ` · 还要约 ${secs(e.eta)}` : ' · 正在估算剩余时间'}）`);
+    }
     // 安全码光显示出来不够，还得说清"对面那一端有没有核过同一组数"
     if (st.safety) lines.push(st.peerConfirmed ? '✓ 对方也确认了这组安全码，链路上没有别人' : '还在等对方确认安全码（先核对两边数字是否一致）');
     if (st.frames) {
@@ -615,6 +757,13 @@
     }
     if (err) lines.push(st.error);
     el.textContent = lines.filter(Boolean).join('\n');
+    // 传输中的预计剩余时间单独一行：状态行本身已经很长，混在一起手机上会折成一坨
+    if (!err && etaEl && (st.phase === 'transferring' || st.phase === 'paused' || st.phase === 'retrying') && st.speed > 0) {
+      const left = Math.max(0, st.totalBytes - Math.min(st.totalBytes, Math.round(doneN * (st.totalBytes / (st.frames || 1)))));
+      etaEl.hidden = false;
+      etaEl.textContent = `${fmt(st.speed)}/s${st.eta ? ` · 大约还剩 ${secs(st.eta)}` : ' · 剩余时间估算中'}`
+        + (left ? `（还剩 ${fmt(left)}）` : '');
+    }
   }
 
   function renderFiles(st) {
@@ -661,7 +810,9 @@
     });
     const total = picked.reduce((s, p) => s + p.size, 0);
     $('#staged-total').textContent = picked.length ? `${picked.length} 个文件 · 共 ${fmt(total)}` : '';
-    $('#start').disabled = picked.length === 0;
+    // 会话在跑时不要因为增删文件把 #start 放开：那一下就能开出第二个会话
+    const live = window.XferEngine.liveOf('sender');
+    $('#start').disabled = !!live || picked.length === 0;
   }
 
   $('#drop').addEventListener('click', () => $('#pick-in').click());
@@ -684,6 +835,11 @@
 
   $('#start').addEventListener('click', async () => {
     if (!picked.length) return;
+    // 防重入：一个角色只允许一个活动会话。第二个会话会抢同一批块、都往 IndexedDB 写、
+    // 都上报 ack，界面上就是"进度跳动"。引擎侧也拦，这里是让用户先得到一句话。
+    const live = window.XferEngine.liveOf('sender');
+    if (live) { toast(`上一次还没结束（${PHASE[live] || live}），先取消它再来`); return; }
+    resetEta(); // 新会话重新攒速率基线，否则会拿上一轮的字节数算出一个假 ETA
     $('#start').disabled = true;
     sender = mount('sender');
     $('#send-live').hidden = false;
@@ -694,7 +850,7 @@
       toast(err.message || '创建会话失败');
       $('#send-live').hidden = true;
     }
-    finally { $('#start').disabled = false; }
+    // 这里不再自己改 #start：由 paint→lockForPhase 按相位统一决定，避免和取消赛跑
   });
 
   $('#send-pause').addEventListener('click', () => {
@@ -705,9 +861,12 @@
   $('#send-recon').addEventListener('click', () => { if (sender) { sender.refresh().catch(() => toast('重连没成功，稍后再试')); toast('正在重新连接…'); } });
   $('#send-cancel').addEventListener('click', async () => {
     if (!sender) return;
-    if (!confirm('取消这次传输？服务器上的密文会被清掉，旧传输码作废。')) return;
+    // 准备期还没有会话上服务器（没有 sid），没有东西需要"确认销毁"：
+    // 这一下就是在说"别算了"，再弹一个确认框等于让用户为卡顿多等一次点击
+    const preparing = !sender.state.sid;
+    if (!preparing && !confirm('取消这次传输？服务器上的密文会被清掉，旧传输码作废。')) return;
     await sender.cancel();
-    toast('已取消');
+    toast(preparing ? '已停止生成' : '已取消');
   });
 
   // ---------------- 接收 ----------------
@@ -715,8 +874,15 @@
   $('#recv-in').addEventListener('keydown', (e) => { if (e.key === 'Enter') onReceive(); });
   async function onReceive() {
     const txt = $('#recv-in').value;
+    // 对方点链接进来会自动配对，这时按钮还是可点的：再点一次就起第二个会话。
+    // 活动会话期间一律拦掉，并把原因说清楚。
+    const live = window.XferEngine.liveOf('receiver');
+    if (live) { toast(`正在接收中（${PHASE[live] || live}），不用再点了`); return; }
+    resetEta();
     receiver = mount('receiver');
     $('#recv-live').hidden = false;
+    $('#recv-go').disabled = true;
+    $('#recv-in').readOnly = true;
     try { await receiver.accept(txt); toast('配对成功'); }
     catch (err) {
       console.error('[xfer-ui] 接收失败', err);
@@ -724,6 +890,9 @@
       $('#recv-live').hidden = true;
       receiver = null;
     }
+    // accept() 里只要 patch 过，上面 paint→lockForPhase 已经把按钮摆好了；
+    // 这一行兜住"还没 patch 就抛错"的情况，别把入口留在禁用态
+    finally { if (!receiver) { $('#recv-go').disabled = false; $('#recv-in').readOnly = false; $('#recv-go').textContent = '配对并开始接收'; } }
   }
   $('#recv-pause').addEventListener('click', () => {
     if (!receiver) return;
@@ -836,6 +1005,8 @@
       const b = document.createElement('button');
       b.type = 'button'; b.className = 'linkbtn'; b.textContent = sending ? '续传' : '接着收';
       b.addEventListener('click', async () => {
+        const live = window.XferEngine.liveOf(role);
+        if (live) { toast(`这个方向上已经有一个会话在跑（${PHASE[live] || live}），先取消它`); return; }
         if (sending) {
           if (!picked.length) { toast('先在上面选好同一批文件，再点续传'); return; }
           const rec = { record: Object.assign({}, it) };
