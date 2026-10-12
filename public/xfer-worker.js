@@ -29,7 +29,8 @@ self.onmessage = async (e) => {
       const r = await XferProto.open({
         key: new Uint8Array(m.key), sid8: new Uint8Array(m.sid8), frame: new Uint8Array(m.frame),
       });
-      self.postMessage({ id: m.id, fileId: r.fileId, chunkIdx: r.chunkIdx, type: r.type, plaintext: r.plaintext }, [r.plaintext.buffer]);
+      // plainLen 必须带回去：主线程拿它和帧头自述的长度对账，漏了这一项就永远比不出相等
+      self.postMessage({ id: m.id, fileId: r.fileId, chunkIdx: r.chunkIdx, type: r.type, plainLen: r.plainLen, plaintext: r.plaintext }, [r.plaintext.buffer]);
       return;
     }
     self.postMessage({ id: m.id, error: `未知操作 ${m.op}` });

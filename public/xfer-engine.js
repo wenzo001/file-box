@@ -41,8 +41,17 @@
         if (job) job.resolve(e.data);
         drain();
       };
+      // 脚本没加载成功时不会有 onmessage，只会 onerror —— 不接住就是永远吊着
+      w.onerror = () => dead();
       workers.push(w);
       idle.push(w);
+    }
+    function dead() {
+      const err = new Error('加密线程起不来（xfer-worker.js 没加载成功），传输已停止：刷新页面再试');
+      for (const job of queue.splice(0)) job.reject(err);
+      for (const job of pending.values()) job.reject(err);
+      pending.clear();
+      idle.length = 0;
     }
     function drain() {
       while (queue.length && idle.length) {
@@ -53,7 +62,8 @@
     }
     const call = (op, msg, transfer) => new Promise((resolve, reject) => {
       const id = ++seq;
-      queue.push({ id, msg: Object.assign({ id, op }, msg), transfer });
+      // resolve/reject 要跟着 job 走：只存 id 的话 worker 回信时找不到出口，每一块都会永远悬着
+      queue.push({ id, resolve, reject, msg: Object.assign({ id, op }, msg), transfer });
       drain();
     }).then((r) => { if (r.error) throw new Error(r.error); return r; });
     return {
@@ -237,7 +247,6 @@
           let pair = null;
           st.forEach((r) => { if (r.type === 'candidate-pair' && (r.selected || r.nominated)) pair = r; });
           if (!pair) return 'p2p';
-          const cand = st.get ? null : null;
           let relay = false;
           st.forEach((r) => {
             if (r.type !== 'local-candidate' && r.type !== 'remote-candidate') return;
@@ -284,7 +293,9 @@
     const cfg = Object.assign({}, DEFAULTS, opts.config || {});
     const role = opts.role;
     const emit = () => opts.on && opts.on(Object.assign({}, st));
-    const net = makeApi(role, opts);
+    // 凭证在闭包里、配对之后才有值 → 用 getter 视图交给 makeApi，
+    // 不能把 opts 直接当凭证袋：那样每个请求头都会是 undefined（服务端一律 403）
+    const net = makeApi(role, { get token() { return token; }, get proof() { return proof; } });
     const st = {
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
       sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
@@ -454,16 +465,18 @@
     }
 
     // ---------- 接收端 ----------
+    // 清单里文件号叫 id，发送端自己那份布局叫 fileId：这里一进来就统一成 fileId，
+    // 否则 fileMeta()/fileKey() 在接收端永远查不到文件（每块都被判成"不属于任何清单文件"）
     function applyManifest(m) {
       manifest = m;
       let seq = 1;
       const files = m.files.map((f) => {
-        const o = Object.assign({}, f, { seqBase: seq, relPath: f.relPath || f.name });
+        const o = Object.assign({}, f, { fileId: f.id, seqBase: seq, relPath: f.relPath || f.name });
         seq += f.chunks.length;
         return o;
       });
       layout = { files, totalFrames: seq, plainBlock: m.plainBlock };
-      st.files = files.map((f) => ({ fileId: f.id, name: f.name, size: f.size, seqBase: f.seqBase }));
+      st.files = files.map((f) => ({ fileId: f.fileId, name: f.name, size: f.size, seqBase: f.seqBase }));
       st.frames = seq;
       st.totalBytes = m.totalBytes;
       return files;
@@ -488,7 +501,7 @@
       if (!f) throw new Error('收到了不属于任何清单文件的块');
       const key = await fileKey(head.fileId);
       const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
-      if (r.chunkIdx !== head.chunkIdx || r.plainLen !== head.plainLen) throw new Error('帧自述与认证数据不一致');
+      if (r.chunkIdx !== head.chunkIdx || r.plainLen !== head.plainLen || r.plaintext.length !== head.plainLen) throw new Error('帧自述与认证数据不一致');
       if (head.plainLen !== f.chunks[head.chunkIdx]) throw new Error('这一块的长度和清单不符');
       await persist(f.seqBase + head.chunkIdx, frame);
     }
@@ -592,11 +605,17 @@
     }
 
     // ---------- 握手 ----------
+    // 密钥对必须在事件流打开之前就备好：服务器会补发对方的 key，晚一步生成就会在
+    // "还没有自己的私钥"时去算 ECDH，直接抛错
+    async function ensureKeys() { if (!myKeys) myKeys = await P.genEcdh(); }
     async function exchangeKeys() {
-      myKeys = await P.genEcdh();
+      await ensureKeys();
       await net.signal(st.sid, 'key', JSON.stringify({ kex: myKeys.kex, pub: P.hex(myKeys.pub) })).catch(() => {});
     }
     async function onPeerKey(body) {
+      // 重连时服务器会把历史 key 再补发一遍：已经握过手就不能再派生一次，
+      // 否则会话密钥被换掉，之前确认过的块全都解不开
+      if (handshakeDone) return;
       const peer = JSON.parse(body);
       if (resumeMode && sess) { // 恢复：密钥已经缓存，不再重新派生
         handshakeDone = true;
@@ -622,6 +641,10 @@
       else { pullMissing(); }
     }
     async function onPeerConfirm(body) {
+      // 握手已经完成后又收到 confirm，只会是重连时服务器补发的历史 —— 忽略它，
+      // 不然一句重复确认会把 verified 打回 false，把"可以保存"的界面变没
+      if (handshakeDone) return;
+      if (!sess) { patch({ phase: 'retrying', error: '还没拿到对方公钥，正在等' }); return; }
       const mine = await P.confirmMac(sess, role === 'sender' ? 'receiver' : 'sender', st.sid);
       if (JSON.parse(body) !== mine) throw new Error('配对校验不通过：链路上可能有第三方，已终止');
       patch({ verified: false });
@@ -753,8 +776,9 @@
         layout = P.planLayout(planned);
         st.frames = layout.totalFrames;
         st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
+        await ensureKeys();
+        await setupChannel(); // 同 fresh 分支：rtc 先于事件流
         openStream();
-        await setupChannel();
         await exchangeKeys();
         cacheKeys();
         return { code: st.code, resumed: true };
@@ -780,10 +804,12 @@
       st.frames = layout.totalFrames;
       st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
       patch({ phase: 'waiting', code: st.code });
+      await ensureKeys();
+      await setupChannel(); // 同上：rtc 必须先于事件流存在
       openStream();
-      await setupChannel();
       await exchangeKeys();
-      cacheKeys();
+      // 不在这里 cacheKeys：会话密钥要等对方公钥到了才派生得出来（onPeerKey 里落盘），
+      // 提前写会把 null 密钥存进本地记录，刷新后"看着能续"其实什么都解不开
       return { code: st.code, frames: st.frames };
     }
 
@@ -803,8 +829,9 @@
       st.expiresAt = j.expiresAt;
       patch({ phase: 'pairing', code: st.code, resumable: resumeMode });
       if (!resumeMode) writeLs('receiver', parsed.sid, { code: st.code, expiresAt: j.expiresAt });
+      await ensureKeys();
+      await setupChannel(); // rtc 先就位，再开流收补发的 offer/ice/key
       openStream();
-      await setupChannel();
       await exchangeKeys();
       return { frames: j.frames, totalBytes: j.totalBytes };
     }
