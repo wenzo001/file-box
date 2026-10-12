@@ -58,6 +58,7 @@ async function boot(dir, PORT, extra) {
     if (Date.now() - t0 > 15000) throw new Error('服务没起来: ' + log.slice(-500));
     await new Promise((r) => setTimeout(r, 60));
   }
+  let stopped = false;
   return {
     port: PORT,
     base: `http://127.0.0.1:${PORT}`,
@@ -65,11 +66,20 @@ async function boot(dir, PORT, extra) {
     log: () => log,
     child,
     async stop(opts = {}) {
-      await new Promise((r) => {
-        child.once('exit', r);
-        cp.execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-        setTimeout(r, 3000);
-      });
+      if (!stopped) {
+        stopped = true;
+        // 先问"还在不在"再动手：进程自己退了的话，taskkill 只会丢一个没头没尾的 128，
+        // 把退出码和日志尾巴交出来才知道是被测服务崩了还是夹具在找茬
+        if (child.exitCode === null && child.signalCode === null) {
+          await new Promise((r) => {
+            child.once('exit', r);
+            cp.execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+            setTimeout(r, 3000);
+          });
+        } else {
+          throw new Error(`被测服务提前退出（code=${child.exitCode} signal=${child.signalCode}）：\n${log.slice(-600)}`);
+        }
+      }
       // keep:true：重启类测试要留着数据目录再起一次，删了就没现场可验
       if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
     },
