@@ -21,12 +21,12 @@ function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-/** 起服务；extra 传业务相关的环境变量（如 UPLOAD_TTL_HOURS / TRANSFER_TTL_MINUTES） */
-async function startServer(extra = {}, dirOverride = null) {
+/** 起服务；extra 传业务相关的环境变量（如 UPLOAD_TTL_HOURS / XFER_TTL_MINUTES） */
+async function startServer(extra = {}, dirOverride = null, slot = 0) {
   const dir = dirOverride || fs.mkdtempSync(path.join(os.tmpdir(), 'fbtest-'));
-  // 每个测试文件是独立进程，端口按 pid 错开；真撞上就换个再来一次
+  // 每个测试文件是独立进程，端口按 pid + slot 错开；真撞上就换个再来一次
   for (let attempt = 0; ; attempt++) {
-    const PORT = 4600 + (process.pid % 300) + attempt * 41;
+    const PORT = 4600 + (process.pid % 300) + slot * 37 + attempt * 41;
     try {
       return await boot(dir, PORT, extra);
     } catch (err) {

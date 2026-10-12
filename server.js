@@ -524,6 +524,15 @@ app.get('/api/archive/:folder', async (req, res) => {
   }
 });
 
+// ---- 无痕传输：一次性会话 + 密文中转（独立模块，与上面的文件库完全分开） ----
+const { createTransferApi } = require('./lib/transfer');
+const transferApi = createTransferApi({
+  express,
+  TRANSFER_DIR: process.env.TRANSFER_DIR ? path.resolve(process.env.TRANSFER_DIR) : path.join(__dirname, '.transfer'),
+});
+transferApi.register(app);
+transferApi.bootReclaim();
+
 // ---- 前端静态页 ----
 app.use(express.static(path.join(__dirname, 'public')));
 
