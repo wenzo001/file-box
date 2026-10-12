@@ -229,6 +229,23 @@
   }
 
   // ---------------- WebRTC 适配器（直连与 TURN 中继共用一条通道，靠候选类型区分模式） ----------------
+  // 预热 WebRTC：Chromium 第一次 new RTCPeerConnection() 要花约 2 秒去初始化网络栈
+  // （实测：本机 2088ms，之后每次 1ms；about:blank 上只要 5ms，所以这是本页上下文的一次性开销）。
+  // 它正好落在用户点完"生成传输码"之后、码出来之前，看起来就像"卡住了"。
+  // 提前在用户挑文件的时候把这份开销付掉，点生成时就只剩指纹要算。
+  let warmed = null;
+  function warmUp() {
+    if (typeof RTCPeerConnection !== 'function') return false;
+    if (warmed) return true;
+    warmed = true;
+    // 用一个立刻关掉的连接把网络栈叫醒；失败了也无所谓，真用时照旧会建
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      pc.close();
+    } catch { /* 没有 WebRTC 就算了 */ }
+    return true;
+  }
+
   function p2p(iceServers, handlers) {
     if (typeof RTCPeerConnection !== 'function') return null;
     const pc = new RTCPeerConnection({ iceServers: iceServers, iceCandidatePoolSize: 2 });
@@ -1017,6 +1034,7 @@
     forget(role, sid) { writeLs(role, sid, null); },
     // 界面用它兜底"一个角色只允许一个会话"；界面自己也要在开局前拦一次
     liveOf(role) { const s = liveSession[role]; return s && isLive(s) ? s.state.phase : ''; },
+    warmUp,
     capabilities() {
       return {
         secure: Boolean(global.isSecureContext),

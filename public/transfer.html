@@ -597,6 +597,15 @@
     else { el.innerHTML = '本环境限制：' + miss.map((m) => `· ${m}`).join('<br>'); el.className = 'warn'; }
   })();
 
+  // 预热 WebRTC 网络栈。Chromium 第一次 new RTCPeerConnection() 要花约 2 秒（实测本机 2088ms，
+  // 之后 1ms），而它正好落在"点生成传输码"之后、码出来之前 —— 用户会以为卡住了。
+  // 放在这里付掉：用户还在挑文件，感受不到。失败也不影响功能。
+  (function warm() {
+    const go = () => { try { window.XferEngine.warmUp(); } catch { /* 没有就算了 */ } };
+    if (window.requestIdleCallback) requestIdleCallback(go, { timeout: 3000 });
+    else setTimeout(go, 300);
+  })();
+
   // ---------------- 会话挂接 ----------------
   let sender = null;
   let receiver = null;
