@@ -12,7 +12,7 @@ let srv;
 before(async () => { srv = await startServer({ XFER_TTL_MINUTES: '30', XFER_END_KEEP_MS: '300' }); });
 after(async () => { await srv.stop(); });
 
-const ABC = 'abcdefghijklmnopqrstuvwxyz23456789';
+const ABC = 'abcdefghjkmnpqrstuvwxyz123456789'; // 和协议层同一套 32 字符字母表
 const randSid = () => Array.from({ length: 8 }, () => ABC[crypto.randomInt(ABC.length)]).join('');
 const randProof = () => crypto.randomBytes(32).toString('hex');
 const randToken = () => crypto.randomBytes(16).toString('hex');
@@ -336,6 +336,16 @@ test('信令确实会转到对端：发送方 offer 到接收方、接收方 ans
   assert.ok(gotAnswer && gotAnswer.body === 'v=answer-fake', 'answer 没回到发送方');
   // 方向不能反：接收方不许发 offer
   assert.strictEqual((await sig(false, 'offer', 'x')).status, 400);
+  // 密钥交换与确认这两条腿也必须真转发：引擎里的 ECDH 公钥和 confirmMac 就走这两个 kind，
+  // 白名单少了它们，直连会在"看起来连上了"之后静默卡死
+  assert.strictEqual((await sig(true, 'key', '{"pub":"sender-pub"}')).status, 200);
+  const gotKey = await nextEvent(rStream, 'key');
+  assert.ok(gotKey && gotKey.body === '{"pub":"sender-pub"}', 'key 没转到接收方');
+  assert.strictEqual((await sig(false, 'confirm', '{"mac":"receiver-mac"}')).status, 200);
+  const gotConfirm = await nextEvent(sStream, 'confirm');
+  assert.ok(gotConfirm && gotConfirm.body === '{"mac":"receiver-mac"}', 'confirm 没回到发送方');
+  // 不在协议里的类型一律挡掉：信令不能变成一条任意名字的服务器转发通道
+  assert.strictEqual((await sig(true, 'download-plaintext', 'x')).status, 400);
   rStream.cancel(); sStream.cancel();
 });
 

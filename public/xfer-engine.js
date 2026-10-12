@@ -1,0 +1,874 @@
+// 无痕传输的客户端引擎：一套会话状态机 + 三个通道适配器 + 一份加密协议（xfer-proto.js）。
+//
+// 三条硬规矩，代码里到处都在为它们服务：
+//  1) 明文只在发送端内存里存在一瞬：读一块 → 立刻封帧 → 才交给任何通道。
+//  2) 通道只负责"搬运"：P2P / TURN 中继 / 服务器中转走的都是同一批已加密帧。切换通道不重新分配
+//     nonce（nonce = f(类型, 文件号, 块号)），重传就是重发同一段字节，接收端按块号幂等 ——
+//     所以不会出现"重复写入 / 丢块 / nonce 重用"。
+//  3) 进度分三级：已发上通道（本地）、已进中转区（服务器 uploaded）、已落盘（接收端写进
+//     IndexedDB 之后才 ack）。只有第三级算"接收完成"，也只有它允许 done。
+//
+// 直连可用时帧只走 DataChannel，服务器一个字节的内容都看不到；只有直连不可用/掉线时，
+// 未确认的那些块才进中转区（密文）。
+(function (global) {
+  'use strict';
+
+  const P = global.XferProto;
+  const META_ID = 0xffffffff;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const DEFAULTS = {
+    parallel: 6,            // 同时在飞的帧：6 × 128KiB ≈ 0.8MB，内存有上界
+    p2pTimeoutMs: 8000,     // 直连建链的耐心，到点走中转，不让用户干等
+    pollMs: 1500,
+    ackEvery: 8,            // 攒几块再报一次确认，省请求
+    dcBufferHigh: 4 * 1024 * 1024,
+  };
+
+  // ---------------- 加密线程池（主线程绝不碰 AES/SHA，否则手机端页面会冻） ----------------
+  function Pool(size) {
+    const n = Math.max(1, Math.min(size || 4, (navigator.hardwareConcurrency || 4) >= 4 ? 4 : 2));
+    const workers = [];
+    const idle = [];
+    const queue = [];
+    const pending = new Map();
+    let seq = 0;
+    for (let i = 0; i < n; i++) {
+      const w = new Worker('xfer-worker.js');
+      w.onmessage = (e) => {
+        const job = pending.get(e.data.id);
+        pending.delete(e.data.id);
+        idle.push(w);
+        if (job) job.resolve(e.data);
+        drain();
+      };
+      workers.push(w);
+      idle.push(w);
+    }
+    function drain() {
+      while (queue.length && idle.length) {
+        const job = queue.shift();
+        pending.set(job.id, job);
+        idle.shift().postMessage(job.msg, job.transfer || []);
+      }
+    }
+    const call = (op, msg, transfer) => new Promise((resolve, reject) => {
+      const id = ++seq;
+      queue.push({ id, msg: Object.assign({ id, op }, msg), transfer });
+      drain();
+    }).then((r) => { if (r.error) throw new Error(r.error); return r; });
+    return {
+      size: n,
+      sha256: (bytes) => call('sha256', { bytes }),
+      seal: (o) => call('seal', o, [o.plaintext.buffer]),
+      open: (o) => call('open', o, [o.frame.buffer.slice(0)]),
+      close() { workers.forEach((w) => { try { w.terminate(); } catch { /* 已终止 */ } }); },
+    };
+  }
+
+  // ---------------- 接收端本地存储：只存"已通过认证标签的密文帧" ----------------
+  const Store = {
+    _db: null,
+    open() {
+      if (!this._db) {
+        this._db = new Promise((resolve, reject) => {
+          const rq = indexedDB.open('fb-xfer', 1);
+          rq.onupgradeneeded = () => rq.result.createObjectStore('frames');
+          rq.onsuccess = () => resolve(rq.result);
+          rq.onerror = () => reject(new Error('本地存储不可用'));
+        });
+      }
+      return this._db;
+    },
+    async put(sid, seq, frame) {
+      const db = await this.open();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('frames', 'readwrite');
+        tx.objectStore('frames').put(frame.slice(0), `${sid}#${seq}`);
+        tx.onerror = () => reject(tx.error || new Error('本地写入失败'));
+        tx.onabort = () => reject(tx.error || new Error('本地写入被中止（磁盘或配额不足？）'));
+        tx.oncomplete = resolve;
+      });
+    },
+    async get(sid, seq) {
+      const db = await this.open();
+      return new Promise((resolve) => {
+        const rq = db.transaction('frames').objectStore('frames').get(`${sid}#${seq}`);
+        rq.onsuccess = () => resolve(rq.result || null);
+        rq.onerror = () => resolve(null);
+      });
+    },
+    async drop(sid) {
+      const db = await this.open();
+      const keys = await new Promise((resolve) => {
+        const rq = db.transaction('frames').objectStore('frames').getAllKeys();
+        rq.onsuccess = () => resolve((rq.result || []).filter((k) => String(k).startsWith(`${sid}#`)));
+        rq.onerror = () => resolve([]);
+      });
+      await new Promise((resolve) => {
+        const tx = db.transaction('frames', 'readwrite');
+        keys.forEach((k) => tx.objectStore('frames').delete(k));
+        tx.oncomplete = resolve;
+        tx.onerror = resolve;
+        tx.onabort = resolve;
+      });
+      return keys.length;
+    },
+  };
+
+  // ---------------- 服务端接口（凭证一律走请求头，不进 URL） ----------------
+  function makeApi(role, cred) {
+    const hdr = (extra) => Object.assign({}, extra,
+      role === 'sender' ? { 'X-Xfer-Sender': cred.token } : { 'X-Xfer-Proof': cred.proof });
+    const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+    const json = async (r) => {
+      const b = await r.json().catch(() => ({}));
+      if (!r.ok) { const e = new Error(b.error || `请求失败 (${r.status})`); e.status = r.status; throw e; }
+      return b;
+    };
+    return {
+      config: async () => json(await fetch('api/xfer/config')),
+      create: (sid, proof, frames, totalBytes) => fetch('api/xfer/create', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, proof, frames, totalBytes }),
+      }).then(json),
+      join: (sid, proof) => fetch('api/xfer/join', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, proof }),
+      }).then(json),
+      state: (sid) => fetch(`api/xfer/state?${qs({ sid })}`, { headers: hdr({}) }).then(json),
+      signal: (sid, kind, body) => fetch('api/xfer/signal', {
+        method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid, kind, body }),
+      }).then(json),
+      turn: (sid) => fetch(`api/xfer/turn?${qs({ sid })}`, { headers: hdr({}) }).then((r) => (r.ok ? r.json() : null)),
+      putSeg: (sid, i, frame) => fetch(`api/xfer/seg?${qs({ sid, i })}`, {
+        method: 'PUT', headers: hdr({ 'Content-Type': 'application/octet-stream' }), body: frame,
+      }).then((r) => (r.status === 429 ? Promise.reject(Object.assign(new Error('中转正忙'), { retry: true })) : json(r))),
+      getSeg: async (sid, i) => {
+        const r = await fetch(`api/xfer/seg?${qs({ sid, i })}`, { headers: hdr({}) });
+        if (r.status === 404) return null;
+        if (!r.ok) throw new Error(`拉取第 ${i} 块失败 (${r.status})`);
+        return new Uint8Array(await r.arrayBuffer());
+      },
+      ack: (sid, idx) => fetch('api/xfer/ack', {
+        method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid, idx }),
+      }).then(json),
+      finish: (sid, kind) => fetch(`api/xfer/${kind}`, {
+        method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid }),
+      }).then((r) => r.ok),
+    };
+  }
+
+  // EventSource 发不了自定义请求头，而这里凭证绝不能进 URL（会被访问日志记下来）→ 用 fetch 读流
+  function sse(url, headers, onEvent, onDown) {
+    let closed = false;
+    const ac = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(url, { headers, signal: ac.signal, cache: 'no-store' });
+        if (!res.ok) { onDown(new Error((await res.json().catch(() => ({}))).error || `事件流 ${res.status}`)); return; }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let bufTxt = '';
+        while (!closed) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bufTxt += dec.decode(value, { stream: true });
+          let at;
+          while ((at = bufTxt.indexOf('\n\n')) >= 0) {
+            const block = bufTxt.slice(0, at);
+            bufTxt = bufTxt.slice(at + 2);
+            const name = (block.match(/^event: (.*)$/m) || [])[1];
+            const data = (block.match(/^data: (.*)$/m) || [])[1];
+            if (name && data !== undefined) {
+              try { onEvent(name, JSON.parse(data)); } catch (err) { onDown(err); }
+            }
+          }
+          if (bufTxt.length > 65536) bufTxt = bufTxt.slice(-4096);
+        }
+      } catch (err) {
+        if (!closed) onDown(err);
+      }
+    })();
+    return { close() { closed = true; try { ac.abort(); } catch { /* 已关 */ } } };
+  }
+
+  // ---------------- WebRTC 适配器（直连与 TURN 中继共用一条通道，靠候选类型区分模式） ----------------
+  function p2p(iceServers, handlers) {
+    if (typeof RTCPeerConnection !== 'function') return null;
+    const pc = new RTCPeerConnection({ iceServers: iceServers, iceCandidatePoolSize: 2 });
+    let dc = null;
+    let open = false;
+    const early = [];
+    let remoteSet = false;
+    pc.onicecandidate = (e) => { if (e.candidate) handlers.onIce(e.candidate.toJSON()); };
+    pc.onconnectionstatechange = () => handlers.onState(pc.connectionState, open);
+    pc.ondatachannel = (e) => bind(e.channel);
+    function bind(ch) {
+      dc = ch;
+      dc.binaryType = 'arraybuffer';
+      dc.onopen = () => { open = true; handlers.onState(pc.connectionState, true); };
+      dc.onclose = () => { open = false; handlers.onState(pc.connectionState, false); };
+      dc.onmessage = (ev) => handlers.onFrame(new Uint8Array(ev.data));
+    }
+    const api = {
+      get open() { return open && !!dc && dc.readyState === 'open'; },
+      offerer() { bind(pc.createDataChannel('xfer', { ordered: true })); },
+      async offer() { await pc.setLocalDescription(await pc.createOffer()); return pc.localDescription.sdp; },
+      async takeOffer(sdp) {
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+        remoteSet = true;
+        flush();
+        await pc.setLocalDescription(await pc.createAnswer());
+        return pc.localDescription.sdp;
+      },
+      async takeAnswer(sdp) { await pc.setRemoteDescription({ type: 'answer', sdp }); remoteSet = true; flush(); },
+      async ice(json) {
+        if (!remoteSet) { early.push(json); return; }
+        try { await pc.addIceCandidate(json); } catch { /* 迟到或重复的候选，丢掉即可 */ }
+      },
+      send(bytes) {
+        if (!api.open) return false;
+        if (dc.bufferedAmount > DEFAULTS.dcBufferHigh) return false;  // 背压：让上层等一会再发
+        dc.send(bytes);
+        return true;
+      },
+      // 只有真的选中了 relay 候选才算"TURN 中继"，不能拿"配了 TURN"当直连成功
+      async mode() {
+        try {
+          const st = await pc.getStats();
+          let pair = null;
+          st.forEach((r) => { if (r.type === 'candidate-pair' && (r.selected || r.nominated)) pair = r; });
+          if (!pair) return 'p2p';
+          const cand = st.get ? null : null;
+          let relay = false;
+          st.forEach((r) => {
+            if (r.type !== 'local-candidate' && r.type !== 'remote-candidate') return;
+            if (pair.localCandidateId === r.id || pair.remoteCandidateId === r.id) {
+              if (r.candidateType === 'relay') relay = true;
+            }
+          });
+          return relay ? 'turn_relay' : 'p2p';
+        } catch { return open ? 'p2p' : 'none'; }
+      },
+      close() { try { dc && dc.close(); } catch { /* noop */ } try { pc.close(); } catch { /* noop */ } },
+    };
+    function flush() { const list = early.splice(0); list.forEach((c) => api.ice(c)); }
+    return api;
+  }
+
+  // ---------------- 连续序号压成区间 / 展开 ----------------
+  function toRanges(iterable) {
+    const arr = [...iterable].sort((a, b) => a - b);
+    const out = [];
+    for (const n of arr) {
+      const last = out[out.length - 1];
+      if (last && n === last[1] + 1) last[1] = n;
+      else out.push([n, n]);
+    }
+    return out;
+  }
+  const expand = (rs) => { const out = []; for (const [a, b] of rs || []) for (let i = a; i <= b; i++) out.push(i); return out; };
+
+  const LS = 'fb.xfer.';
+  const readLs = (k) => { try { return JSON.parse(localStorage.getItem(LS + k) || '{}') || {}; } catch { return {}; } };
+  function writeLs(k, sid, obj) {
+    try {
+      const all = readLs(k);
+      if (obj === null) delete all[sid];
+      else all[sid] = obj;
+      localStorage.setItem(LS + k, JSON.stringify(all));
+      return true;
+    } catch { return false; } // 隐私模式/配额满：只影响"刷新后能不能续"，不影响本次传输
+  }
+
+  // ---------------- 会话引擎 ----------------
+  function Session(opts) {
+    const cfg = Object.assign({}, DEFAULTS, opts.config || {});
+    const role = opts.role;
+    const emit = () => opts.on && opts.on(Object.assign({}, st));
+    const net = makeApi(role, opts);
+    const st = {
+      role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
+      sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
+      safety: '', kex: '', engine: '', error: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
+    };
+    let pool = null;
+    let secret = '';
+    let proof = '';
+    let token = '';
+    let layout = null;
+    let selFiles = [];              // 发送端：{relPath,name,size,mime,file}
+    let byRel = new Map();
+    let sess = null;                // 会话密钥
+    let manifest = null;
+    let link = null;
+    let rtc = null;
+    let iceServers = [];
+    let myKeys = null;
+    let handshakeDone = false;
+    let resumeMode = false;
+    const acked = new Set();        // 接收端已落盘并上报过的块（发送端从服务器读到）
+    const stored = new Set();       // 接收端本地已落盘
+    const late = [];                // 清单还没到时的迟到帧
+    let running = false;
+    let paused = false;
+    let closed = false;
+    let ackBuf = new Set();
+    let ackTimer = null;
+    const timers = [];
+    let sample = { t: 0, bytes: 0 };
+
+    function patch(o) { Object.assign(st, o); emit(); }
+    function fail(msg, recoverable) { patch({ phase: recoverable ? 'retrying' : 'failed', error: String(msg || '出错') }); }
+
+    const fileKeyCache = new Map();
+    function fileKey(fileId) {
+      if (fileKeyCache.has(fileId)) return fileKeyCache.get(fileId);
+      const k = P.hkdf(sess.kRec, sess.sid8, `file-v1|${st.sid}|${fileId}`, 32);
+      return k.then((kk) => { fileKeyCache.set(fileId, kk); return kk; });
+    }
+
+    // ---------- 帧的产出与消费 ----------
+    async function frameFor(seqN) {
+      if (seqN === 0) {
+        const bytes = P.manifestBytes(layout);
+        return new Uint8Array((await pool.seal({
+          key: Array.from(sess.kMeta), sid8: Array.from(sess.sid8), type: P.TYPE_META,
+          fileId: META_ID, chunkIdx: 0, plaintext: bytes,
+        })).frame);
+      }
+      const where = P.frameAt(layout, seqN);
+      if (!where) throw new Error(`第 ${seqN} 帧不属于任何文件`);
+      const f = byRel.get(where.file.relPath);
+      if (!f) throw new Error(`找不到文件 ${where.file.relPath}`);
+      const from = where.file.chunks.slice(0, where.chunkIdx).reduce((s, x) => s + x, 0);
+      const buf = new Uint8Array(await f.file.slice(from, from + where.plainLen).arrayBuffer());
+      const key = await fileKey(where.file.fileId);
+      return new Uint8Array((await pool.seal({
+        key: Array.from(key), sid8: Array.from(sess.sid8), type: P.TYPE_DATA,
+        fileId: where.file.fileId, chunkIdx: where.chunkIdx, plaintext: buf,
+      })).frame);
+    }
+
+    async function shipFrame(seqN, frame) {
+      if (rtc && rtc.open && rtc.send(frame)) { st.bytesOnWire += frame.length; return 'p2p'; }
+      for (let i = 0; i < 5; i++) {
+        if (closed) return null;
+        try {
+          await net.putSeg(st.sid, seqN, frame);
+          st.bytesOnWire += frame.length;
+          return 'relay';
+        } catch (err) {
+          if (!err.retry) throw err;
+          await sleep(300 * (i + 1));
+        }
+      }
+      throw new Error('中转区连续 5 次拒收这一块');
+    }
+
+    async function sendSeq(seqN) {
+      if (acked.has(seqN)) return;
+      const frame = await frameFor(seqN);
+      await shipFrame(seqN, frame);
+      st.sentFrames++;
+      if (st.phase === 'waiting' || st.phase === 'paired') patch({ phase: 'transferring' });
+      emit();
+    }
+
+    function switchChannel(to, why) {
+      if (st.channel === to) return;
+      if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
+      patch({ channel: to, error: why || st.error });
+    }
+
+    // ---------- 发送端主循环（并行窗口 + 只补没确认的块） ----------
+    async function pump() {
+      if (running || closed || !handshakeDone) return;
+      running = true;
+      try {
+        await sendSeq(0);                       // 清单先到，接收端才知道后面怎么摆
+        let cursor = 1;
+        const inflight = new Set();
+        while (cursor < st.frames || inflight.size) {
+          if (closed) return;
+          while (paused) await sleep(150);
+          while (cursor < st.frames && inflight.size < cfg.parallel) {
+            const s = cursor++;
+            if (acked.has(s)) continue;
+            const slot = {};
+            inflight.add(slot);
+            slot.p = sendSeq(s)
+              .catch((err) => { fail(err.message || err, true); })
+              .finally(() => inflight.delete(slot));
+          }
+          if (inflight.size) await Promise.race([...[...inflight].map((x) => x.p), sleep(300)]);
+          await refreshAck();
+          if (st.error && st.phase === 'retrying' && acked.size === st.frames) patch({ error: '', phase: 'transferring' });
+        }
+        for (let guard = 0; guard < 1200 && acked.size < st.frames; guard++) {
+          if (closed) return;
+          while (paused) await sleep(200);
+          await sleep(500);
+          await refreshAck();
+          for (const s of missingForRetry(acked, st.frames).slice(0, cfg.parallel)) {
+            try { await sendSeq(s); } catch (err) { fail(err.message || err, true); }
+          }
+        }
+        if (acked.size === st.frames) {
+          await net.finish(st.sid, 'done');
+          patch({ phase: 'done' });
+          writeLs('sender', st.sid, null);
+        } else {
+          fail('等接收端落盘的超时了；可以点"继续"接着传', true);
+        }
+      } catch (err) {
+        fail(err.message || err);
+      } finally {
+        running = false;
+      }
+    }
+    function missingForRetry(set, frames) {
+      const out = [];
+      for (let i = 0; i < frames && out.length < 64; i++) if (!set.has(i)) out.push(i);
+      return out;
+    }
+    async function refreshAck() {
+      try {
+        const s = await net.state(st.sid);
+        expand(s.acked).forEach((n) => acked.add(n));
+        st.uploaded = expand(s.uploaded).length;
+        st.frames = s.frames;
+        st.totalBytes = s.totalBytes;
+        if (role === 'sender') { st.stored = acked.size; sampleSpeed(acked.size * P.PLAIN_BLOCK); }
+        emit();
+      } catch { /* 服务器暂时不回，下一轮再问 */ }
+    }
+    function sampleSpeed(bytesNow) {
+      const now = Date.now();
+      if (!sample.t) { sample = { t: now, bytes: bytesNow }; return; }
+      const dt = (now - sample.t) / 1000;
+      if (dt < 1.5) return;
+      const d = bytesNow - sample.bytes;
+      st.speed = d > 0 ? d / dt : st.speed;
+      const left = Math.max(0, st.totalBytes - bytesNow);
+      st.eta = st.speed > 65536 ? Math.round(left / st.speed) : 0;
+      sample = { t: now, bytes: bytesNow };
+    }
+
+    // ---------- 接收端 ----------
+    function applyManifest(m) {
+      manifest = m;
+      let seq = 1;
+      const files = m.files.map((f) => {
+        const o = Object.assign({}, f, { seqBase: seq, relPath: f.relPath || f.name });
+        seq += f.chunks.length;
+        return o;
+      });
+      layout = { files, totalFrames: seq, plainBlock: m.plainBlock };
+      st.files = files.map((f) => ({ fileId: f.id, name: f.name, size: f.size, seqBase: f.seqBase }));
+      st.frames = seq;
+      st.totalBytes = m.totalBytes;
+      return files;
+    }
+    function fileMeta(fileId) {
+      return (layout ? layout.files : []).find((f) => f.fileId === fileId) || null;
+    }
+    async function acceptFrame(frame) {
+      if (!frame || frame.length < P.HEADER_LEN + P.TAG_LEN || frame[0] !== P.MAGIC) return;
+      let head;
+      try { head = P.parseHeader(frame); } catch { return; }
+      if (head.type === P.TYPE_META) {
+        const r = await pool.open({ key: Array.from(sess.kMeta), sid8: Array.from(sess.sid8), frame });
+        applyManifest(P.readManifest(new Uint8Array(r.plaintext)));
+        await persist(0, frame);
+        drainLate();
+        patch({ phase: st.phase === 'done' ? 'done' : 'transferring' });
+        return;
+      }
+      if (!layout) { late.push(frame); return; }       // 清单没到，先排队，别急着解
+      const f = fileMeta(head.fileId);
+      if (!f) throw new Error('收到了不属于任何清单文件的块');
+      const key = await fileKey(head.fileId);
+      const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
+      if (r.chunkIdx !== head.chunkIdx || r.plainLen !== head.plainLen) throw new Error('帧自述与认证数据不一致');
+      if (head.plainLen !== f.chunks[head.chunkIdx]) throw new Error('这一块的长度和清单不符');
+      await persist(f.seqBase + head.chunkIdx, frame);
+    }
+    function drainLate() {
+      const list = late.splice(0);
+      list.forEach((fr) => acceptFrame(fr).catch((e) => fail(e.message || e)));
+    }
+    async function persist(seqN, frame) {
+      if (stored.has(seqN)) return;
+      await Store.put(st.sid, seqN, frame);
+      stored.add(seqN);
+      st.stored = stored.size;
+      sampleSpeed(stored.size * P.PLAIN_BLOCK);
+      emit();
+      ackBuf.add(seqN);
+      if (ackBuf.size >= cfg.ackEvery) flushAcks();
+      else if (!ackTimer) ackTimer = setTimeout(() => { ackTimer = null; flushAcks(); }, 600);
+      if (stored.size === st.frames && manifest) finishReceive();
+    }
+    async function flushAcks() {
+      const list = [...ackBuf];
+      ackBuf.clear();
+      if (!list.length) return;
+      try { await net.ack(st.sid, list); } catch { /* 本地已经存好了，服务器记账晚一点不要紧 */ }
+    }
+    async function pullMissing() {
+      try {
+        const s = await net.state(st.sid);
+        const up = new Set(expand(s.uploaded));
+        st.uploaded = up.size;
+        for (const q of up) {
+          if (closed || stored.has(q)) continue;
+          const got = await net.getSeg(st.sid, q);
+          if (got) await acceptFrame(got);
+        }
+        if (st.error && st.phase === 'retrying') patch({ error: '', phase: 'transferring' });
+      } catch (err) {
+        if (err.status === 404) { patch({ phase: 'waiting', error: '服务器上的这个会话已经过期了' }); return false; }
+        patch({ error: err.message || '网络不稳，正在重试', phase: 'retrying' });
+      }
+      emit();
+      return true;
+    }
+    async function finishReceive() {
+      if (st.verified) return;
+      patch({ phase: 'verifying' });
+      try {
+        for (const f of layout.files) {
+          const chain = [];
+          let total = 0;
+          for (let c = 0; c < f.chunks.length; c++) {
+            const frame = new Uint8Array(await Store.get(st.sid, f.seqBase + c));
+            if (!frame.length) throw new Error(`「${f.name}」第 ${c} 块本地读不到了`);
+            const key = await fileKey(f.fileId);
+            const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
+            const pt = new Uint8Array(r.plaintext);
+            if (pt.length !== f.chunks[c]) throw new Error(`「${f.name}」第 ${c} 块长度不对`);
+            chain.push(await P.sha256(pt));
+            total += pt.length;
+          }
+          if (total !== f.size) throw new Error(`「${f.name}」总长度不对`);
+          if (f.sha256 && P.hex(await P.sha256(P.cat(...chain))) !== f.sha256) {
+            throw new Error(`「${f.name}」内容校验失败，可能被人动过`);
+          }
+        }
+        await flushAcks();
+        patch({ phase: 'ready', verified: true });
+        writeLs('receiver', st.sid, Object.assign({}, readLs('receiver')[st.sid] || {}, { verified: true }));
+      } catch (err) {
+        fail(err.message || err);
+      }
+    }
+
+    // 保存：能流式写盘就流式写；否则交给调用方处理 Blob（浏览器下载会自己落临时文件）
+    async function saveAll(streamToFile) {
+      if (!st.verified) throw new Error('还没通过完整性校验');
+      patch({ phase: 'saving' });
+      for (const f of layout.files) {
+        const key = await fileKey(f.fileId);
+        let w = null;
+        if (streamToFile) w = await streamToFile(f);
+        for (let c = 0; c < f.chunks.length; c++) {
+          const frame = new Uint8Array(await Store.get(st.sid, f.seqBase + c));
+          const pt = new Uint8Array((await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame })).plaintext);
+          if (w) await w.write(pt);
+          else yieldBlob(f, pt);
+        }
+        if (w) await w.close();
+      }
+      patch({ phase: 'done', saved: true });
+      function yieldBlob(f, pt) { (blobs[f.name] = blobs[f.name] || []).push(pt); }
+    }
+    const blobs = {};
+    async function collected() {
+      const out = [];
+      for (const f of layout.files) {
+        const parts = blobs[f.name] || [];
+        out.push({ name: f.name, size: f.size, blob: new Blob(parts) });
+      }
+      return out;
+    }
+
+    // ---------- 握手 ----------
+    async function exchangeKeys() {
+      myKeys = await P.genEcdh();
+      await net.signal(st.sid, 'key', JSON.stringify({ kex: myKeys.kex, pub: P.hex(myKeys.pub) })).catch(() => {});
+    }
+    async function onPeerKey(body) {
+      const peer = JSON.parse(body);
+      if (resumeMode && sess) { // 恢复：密钥已经缓存，不再重新派生
+        handshakeDone = true;
+        patch({ safety: sess.safety, kex: sess.kex });
+        await net.signal(st.sid, 'confirm', JSON.stringify(await P.confirmMac(sess, role, st.sid)));
+        afterHandshake();
+        return;
+      }
+      const shared = await P.ecdhShared(myKeys && myKeys.priv, P.unhex(peer.pub));
+      sess = await P.deriveSession({
+        sid: st.sid, secret, kex: myKeys.kex === peer.kex ? myKeys.kex : 'mismatch',
+        shared, pubSelf: myKeys.pub, pubPeer: P.unhex(peer.pub),
+      });
+      if (sess.kex === 'mismatch') throw new Error('两端的加密能力不一致（一边 HTTPS、一边 HTTP），已终止：不做静默降级');
+      patch({ safety: sess.safety, kex: sess.kex, engine: P.engine });
+      cacheKeys();
+      handshakeDone = true;
+      await net.signal(st.sid, 'confirm', JSON.stringify(await P.confirmMac(sess, role, st.sid)));
+      afterHandshake();
+    }
+    function afterHandshake() {
+      if (role === 'sender') pump();
+      else { pullMissing(); }
+    }
+    async function onPeerConfirm(body) {
+      const mine = await P.confirmMac(sess, role === 'sender' ? 'receiver' : 'sender', st.sid);
+      if (JSON.parse(body) !== mine) throw new Error('配对校验不通过：链路上可能有第三方，已终止');
+      patch({ verified: false });
+      if (role === 'receiver' && !layout) pullMissing();
+    }
+    function cacheKeys() {
+      const rec = {
+        code: P.formatCode(st.sid, secret), expiresAt: st.expiresAt, frames: st.frames, totalBytes: st.totalBytes,
+        keys: { kRec: P.hex(sess.kRec), kMeta: P.hex(sess.kMeta), kConfirm: P.hex(sess.kConfirm), sid8: P.hex(sess.sid8) },
+      };
+      if (role === 'sender') {
+        rec.token = token;
+        rec.files = layout ? layout.files.map((f) => ({ relPath: f.relPath, name: f.name, size: f.size, sha256: f.sha256 })) : [];
+      } else {
+        rec.files = layout ? layout.files.map((f) => ({ relPath: f.relPath, name: f.name, size: f.size, sha256: f.sha256 })) : [];
+      }
+      st.resumable = writeLs(role, st.sid, rec);
+    }
+    function restoreKeys(rec) {
+      sess = {
+        kRec: P.unhex(rec.keys.kRec), kMeta: P.unhex(rec.keys.kMeta),
+        kConfirm: P.unhex(rec.keys.kConfirm), sid8: P.unhex(rec.keys.sid8),
+        safety: '', kex: 'resumed',
+      };
+      token = rec.token || token;
+      st.expiresAt = rec.expiresAt;
+      st.frames = rec.frames;
+      st.totalBytes = rec.totalBytes;
+    }
+
+    // ---------- 通道 ----------
+    async function setupChannel() {
+      const c = await net.config().catch(() => null);
+      const caps = global.XferEngine.capabilities();
+      if (!c || !caps.rtc || !caps.subtle) { switchChannel('server_relay', caps.secure ? '' : '当前是 HTTP 入口，直连不可用，走服务器中转（仍然只传密文）'); return; }
+      iceServers = (c.stun || []).map((u) => ({ urls: u }));
+      if (c.turnConfigured) {
+        const t = await net.turn(st.sid).catch(() => null);
+        if (t && t.urls && t.urls.length) iceServers.push({ urls: t.urls, username: t.username, credential: t.credential });
+      }
+      rtc = p2p(iceServers, {
+        onIce: (json) => { net.signal(st.sid, 'ice', JSON.stringify(json)).catch(() => {}); },
+        onFrame: (frame) => { if (role === 'receiver') acceptFrame(frame).catch((e) => fail(e.message || e)); },
+        onState: async (state, open) => {
+          if (open) {
+            const mode = await rtc.mode();
+            switchChannel(mode, mode === 'turn_relay' ? '走了 TURN 中继（不是直连）' : '已建立点对点直连');
+            afterHandshake();
+          } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+            if (st.channel !== 'server_relay') {
+              switchChannel('server_relay', `直连中断（${state}），已改用服务器中转（只传密文）`);
+              afterHandshake();
+            }
+          }
+        },
+      });
+      if (role === 'sender' && rtc) {
+        rtc.offerer();
+        patch({ channel: 'p2p_connecting' });
+        const sdp = await rtc.offer();
+        await net.signal(st.sid, 'offer', sdp).catch(() => {});
+        timers.push(setTimeout(() => {
+          if (rtc && !rtc.open) { switchChannel('server_relay', '直连建立超时，已改用服务器中转'); afterHandshake(); }
+        }, cfg.p2pTimeoutMs));
+      }
+      if (role === 'receiver' && rtc) patch({ channel: 'p2p_connecting' });
+    }
+
+    function openStream() {
+      const url = `api/xfer/events?sid=${encodeURIComponent(st.sid)}&role=${role}`;
+      const headers = role === 'sender' ? { 'X-Xfer-Sender': token } : { 'X-Xfer-Proof': proof };
+      link = sse(url, headers, async (name, data) => {
+        try {
+          if (name === 'joined') patch({ phase: 'pairing' });
+          else if (name === 'key') await onPeerKey(data.body);
+          else if (name === 'confirm') await onPeerConfirm(data.body);
+          else if (name === 'offer') { const sdp = await rtc.takeOffer(data.body); await net.signal(st.sid, 'answer', sdp).catch(() => {}); }
+          else if (name === 'answer') await rtc.takeAnswer(data.body);
+          else if (name === 'ice') await rtc.ice(JSON.parse(data.body));
+          else if (name === 'ack') { await refreshAck(); if (role === 'sender') pump(); }
+          else if (name === 'done') { if (role === 'receiver') { await pullMissing(); if (stored.size === st.frames) await finishReceive(); } else patch({ phase: 'done' }); }
+          else if (name === 'cancelled') { patch({ phase: 'cancelled', error: '对方取消了这次传输' }); close(); }
+        } catch (err) { fail(err.message || err); }
+      }, (err) => {
+        if (closed) return;
+        patch({ error: (err && err.message) || '事件连接断了', phase: 'retrying' });
+        timers.push(setTimeout(openStream, 2000));
+      });
+    }
+
+    function close() {
+      closed = true;
+      timers.forEach(clearTimeout);
+      timers.length = 0;
+      if (link) link.close();
+      if (rtc) rtc.close();
+      if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
+      pool && pool.close();
+    }
+
+    // ---------- 对外：发送 ----------
+    // resume = { sid, record }：用之前缓存的会话密钥接着传；重新选的文件必须逐个对指纹
+    async function send(list, resume) {
+      pool = pool || new Pool();
+      selFiles = list;
+      byRel = new Map(list.map((f) => [f.relPath, f]));
+      if (resume && resume.record && resume.record.keys) {
+        const rec = resume.record;
+        const parsed = P.parseCode(rec.code);
+        if (!parsed) throw new Error('本地存的传输码读不回来了');
+        st.sid = parsed.sid;
+        secret = parsed.secret;
+        proof = await P.proofOf(parsed.sid, parsed.secret);
+        token = rec.token;
+        st.code = P.formatCode(parsed.sid, parsed.secret);
+        restoreKeys(rec);
+        resumeMode = true;
+        patch({ phase: 'fingerprinting', code: st.code, resumable: true });
+        const planned = [];
+        for (const f of list) {
+          const want = (rec.files || []).find((x) => x.relPath === f.relPath);
+          if (!want) throw new Error(`这次的清单里没有「${f.name}」，不能续原会话`);
+          if (want.size !== f.size) throw new Error(`「${f.name}」大小变了（${want.size} → ${f.size}），不能续原会话`);
+          const fp = await fingerprintFile(f.file, (p) => patch({ error: `正在核对「${f.name}」的指纹 ${Math.round(p * 100)}%` }));
+          if (want.sha256 && fp.fileSha256 !== want.sha256) throw new Error(`「${f.name}」内容已经变了，不能续原会话：请重新发一次`);
+          planned.push({ relPath: f.relPath, name: f.name, size: f.size, mime: f.mime, sha256: fp.fileSha256 });
+        }
+        patch({ error: '' });
+        layout = P.planLayout(planned);
+        st.frames = layout.totalFrames;
+        st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
+        openStream();
+        await setupChannel();
+        await exchangeKeys();
+        cacheKeys();
+        return { code: st.code, resumed: true };
+      }
+      if (resume && resume.record && !resume.record.keys) {
+        throw new Error('这个会话的密钥本地已经没了（换过浏览器或清过站点数据），无法续传：请重新发一次');
+      }
+      patch({ phase: 'fingerprinting' });
+      const planned = [];
+      for (const f of selFiles) {
+        const fp = await fingerprintFile(f.file, (p) => patch({ error: `正在读文件内容算指纹 ${Math.round(p * 100)}%` }));
+        planned.push({ relPath: f.relPath, name: f.name, size: f.size, mime: f.mime, sha256: fp.fileSha256 });
+      }
+      patch({ error: '' });
+      layout = P.planLayout(planned);
+      secret = P.genSecret();
+      st.sid = P.genSid();
+      proof = await P.proofOf(st.sid, secret);
+      st.code = P.formatCode(st.sid, secret);
+      const created = await net.create(st.sid, proof, layout.totalFrames, layout.files.reduce((s, f) => s + f.size, 0));
+      token = created.token;
+      st.expiresAt = created.expiresAt;
+      st.frames = layout.totalFrames;
+      st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
+      patch({ phase: 'waiting', code: st.code });
+      openStream();
+      await setupChannel();
+      await exchangeKeys();
+      cacheKeys();
+      return { code: st.code, frames: st.frames };
+    }
+
+    async function accept(codeText) {
+      pool = pool || new Pool();
+      const parsed = P.parseCode(codeText);
+      if (!parsed) throw new Error('传输码格式不对：应为 8 + 24 个字符（不含 i/l/o/0）');
+      st.sid = parsed.sid;
+      secret = parsed.secret;
+      proof = await P.proofOf(parsed.sid, parsed.secret);
+      st.code = P.formatCode(parsed.sid, parsed.secret);
+      const rec = readLs('receiver')[parsed.sid];
+      if (rec && rec.keys) { restoreKeys(rec); resumeMode = true; }
+      const j = await net.join(parsed.sid, proof);
+      st.frames = j.frames;
+      st.totalBytes = j.totalBytes;
+      st.expiresAt = j.expiresAt;
+      patch({ phase: 'pairing', code: st.code, resumable: resumeMode });
+      if (!resumeMode) writeLs('receiver', parsed.sid, { code: st.code, expiresAt: j.expiresAt });
+      openStream();
+      await setupChannel();
+      await exchangeKeys();
+      return { frames: j.frames, totalBytes: j.totalBytes };
+    }
+
+    return {
+      state: st,
+      send,
+      accept,
+      pause() { paused = true; patch({ phase: 'paused' }); },
+      resume() { paused = false; patch({ phase: 'transferring' }); if (role === 'sender') pump(); else pullMissing(); },
+      async cancel() { await net.finish(st.sid, 'cancel').catch(() => {}); patch({ phase: 'cancelled' }); close(); },
+      async refresh() { await refreshAck(); if (role === 'receiver') await pullMissing(); },
+      close,
+      saveAll,
+      collected,
+      blobs,
+      _test: {
+        get sess() { return sess; },
+        get acked() { return acked; },
+        get storedSet() { return stored; },
+        frameFor, acceptFrame, applyManifest, toRanges, expand,
+      },
+    };
+  }
+
+  // 文件指纹：逐块 SHA-256 → 链摘要 → 再哈希。全程流式，内存里最多两块。
+  async function fingerprintFile(file, onProgress) {
+    const B = P.PLAIN_BLOCK;
+    const chain = [];
+    for (let off = 0; off < file.size; off += B) {
+      const bytes = new Uint8Array(await file.slice(off, Math.min(file.size, off + B)).arrayBuffer());
+      chain.push(await P.sha256(bytes));
+      if (onProgress) onProgress(Math.min(1, (off + B) / file.size));
+      if ((off / B) % 64 === 0) await sleep(0);
+    }
+    if (!chain.length) chain.push(await P.sha256(new Uint8Array(0)));
+    return { fileSha256: P.hex(await P.sha256(P.cat(...chain))), size: file.size };
+  }
+
+  global.XferEngine = {
+    Session,
+    fingerprintFile,
+    Pool,
+    Store,
+    toRanges,
+    expand,
+    listSaved(role) {
+      const all = readLs(role);
+      const now = Date.now();
+      return Object.entries(all)
+        .map(([sid, rec]) => ({ sid, code: rec.code, expiresAt: rec.expiresAt, frames: rec.frames, totalBytes: rec.totalBytes, verified: !!rec.verified, token: rec.token }))
+        .filter((x) => x.expiresAt > now);
+    },
+    forget(role, sid) { writeLs(role, sid, null); },
+    capabilities() {
+      return {
+        secure: Boolean(global.isSecureContext),
+        subtle: Boolean(global.crypto && global.crypto.subtle),
+        rtc: typeof RTCPeerConnection === 'function',
+        fsAccess: typeof global.showSaveFilePicker === 'function',
+        idb: typeof indexedDB !== 'undefined',
+        workers: typeof Worker === 'function',
+        sse: typeof EventSource === 'function',
+      };
+    },
+  };
+})(typeof window !== 'undefined' ? window : globalThis);

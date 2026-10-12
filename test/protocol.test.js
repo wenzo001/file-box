@@ -153,11 +153,12 @@ test('会话密钥阶梯：诚实双方算出同一套；换码/换公钥都会�
   assert.strictEqual(sa.safety, sb.safety, '安全码必须两边一致');
   assert.match(sa.safety, /^[a-z1-9]{5}$/);
   // 互相确认：各自的 confirmMac 对方能验（角色不同，不能拿对方的确认冒充）
-  const ca = await P.confirmMac(sa, 'sender');
-  const cb = await P.confirmMac(sb, 'receiver');
-  assert.strictEqual(ca, await P.confirmMac(sb, 'sender'));
+  const ca = await P.confirmMac(sa, 'sender', sid);
+  const cb = await P.confirmMac(sb, 'receiver', sid);
+  assert.strictEqual(ca, await P.confirmMac(sb, 'sender', sid));
   assert.notStrictEqual(ca, cb, '发送方和接收方的确认值不能相同，否则可互相冒充');
-  assert.notStrictEqual(ca, await P.confirmMac(sb, 'nonsense'));
+  assert.notStrictEqual(ca, await P.confirmMac(sb, 'nonsense', sid));
+  assert.notStrictEqual(ca, await P.confirmMac(sb, 'sender', P.genSid()), '换个会话号确认值必须不同');
 
   // 中间人：知道全部公钥但不知道秘密段 → 密钥完全不同
   const eve = await P.deriveSession({ sid, secret: P.genSecret(), kex: 'p256', shared: await P.ecdhShared(a.priv, b.pub), pubSelf: a.pub, pubPeer: b.pub });

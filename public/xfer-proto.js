@@ -147,9 +147,11 @@
     for (let i = 0; i < 5; i++) safety += ALPHABET[safetyRaw[i] & 31];
     return { kex, transcript, safety, kRec, kMeta, kConfirm, sid8: await sidTag(sid) };
   }
-  /** 配对完成后的相互认证：角色写进消息里，A 冒充 B 的确认过不了 */
-  async function confirmMac(s, role) {
-    return hex(await hmac(s.kConfirm, cat(te.encode(`filebox-xfer-v1/confirm|${role}|`), s.transcript)));
+  /** 配对完成后的相互认证。绑 协议版本 + 角色 + 会话号，**不绑本次连接的 transcript**：
+   *  这样"刷新页面 / 换通道重连"还能用同一份会话密钥重新确认；而中间人替换公钥会让 kConfirm
+   *  本身变掉，确认照样过不了 —— 防冒充的强度来自密钥派生，不来自这个 MAC 里写了什么。 */
+  async function confirmMac(s, role, sid) {
+    return hex(await hmac(s.kConfirm, te.encode(`filebox-xfer-v1/confirm|${role}|${sid}`)));
   }
 
   // ---------- 帧 ----------
