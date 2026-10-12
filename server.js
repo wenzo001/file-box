@@ -12,7 +12,7 @@ app.use(express.json({ limit: '2mb' })); // init/finish 这类小 JSON 请求体
 // ---- 配置（均可通过环境变量覆盖） ----
 const PORT = Number(process.env.PORT) || 3000;              // HTTP 端口（完整服务）
 const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;   // HTTPS 端口（传输层加密 + 原生加密引擎）
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, 'uploads');
 const STORAGE_LIMIT_GB = Number(process.env.STORAGE_LIMIT_GB) || 10; // 存储总量上限
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || 90;      // 超过 N 天的目录自动清理
 const STORAGE_LIMIT = STORAGE_LIMIT_GB * 1024 * 1024 * 1024;
@@ -113,7 +113,7 @@ setInterval(cleanupExpired, 6 * 60 * 60 * 1000).unref();
 // 分块先落到 uploads 之外的 .uploading/<批次>/，全部块传完再按「完成那一刻」的时间
 // 命名并搬进 uploads。所以：列表里永远看不到上传到一半的目录，展示的时间就是传完的时刻。
 // 中断后重新发起同一批文件（客户端用批次指纹识别），只补缺失的块即可接着传。
-const STAGING_DIR = path.join(__dirname, '.uploading');
+const STAGING_DIR = process.env.STAGING_DIR ? path.resolve(process.env.STAGING_DIR) : path.join(__dirname, '.uploading');
 const UPLOAD_TTL_MS = Number(process.env.UPLOAD_TTL_HOURS || 48) * 60 * 60 * 1000; // 未完成批次留 2 天：过期回收，下次上传从头再来
 const MAX_CHUNK = 32 * 1024 * 1024;        // 单块上限（客户端约 4MB 一块）
 const MAX_FILES = 200;                     // 单批文件数上限
