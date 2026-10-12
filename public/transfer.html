@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#F2F2F7">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000">
+<title>无痕传输 · 文件盒子</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%23007AFF'/><path d='M12 16V7M7.5 11.5L12 7l4.5 4.5' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<style>
+  /* 与文件库页面同一套 iOS 系统色 token，不另起一套设计 */
+  :root {
+    --bg: #F2F2F7;
+    --card: #FFFFFF;
+    --hdr: rgba(242,242,247,.82);
+    --text: #1C1C1E;
+    --text2: #565B62;
+    --text3: rgba(60,60,67,.32);
+    --accent: #0059B3;
+    --accent-fill: #0071E3;
+    --accent-ink: var(--accent);
+    --label-ink: #4A4F55;
+    --red: #FF3B30;
+    --sep: rgba(60,60,67,.29);
+    --fill: rgba(120,120,128,.12);
+    --ok: #34C759;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --card: #1C1C1E;
+      --hdr: rgba(0,0,0,.72);
+      --text: #FFFFFF;
+      --text2: rgba(235,235,245,.6);
+      --text3: rgba(235,235,245,.32);
+      --accent: #0A84FF;
+      --accent-fill: #0A69E8;
+      --accent-ink: #0A84FF;
+      --label-ink: #C7C9CF;
+      --red: #FF453A;
+      --sep: rgba(84,84,88,.6);
+      --fill: rgba(120,120,128,.24);
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro SC",
+      "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    font-size: 17px; line-height: 1.4; min-height: 100svh;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    transition: background-color .3s;
+  }
+
+  header {
+    position: sticky; top: 0; z-index: 60;
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+    padding: calc(14px + env(safe-area-inset-top)) 20px 8px;
+    background: var(--hdr);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
+  header h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.4px; }
+  header a.back {
+    border: none; color: var(--accent); font-size: 17px; font-weight: 500;
+    text-decoration: none; padding: 8px 2px; border-radius: 8px;
+    -webkit-user-select: none; user-select: none;
+  }
+  header a.back:active { opacity: .4; }
+
+  .wrap { max-width: 720px; margin: 0 auto; padding: 6px 16px 40px;
+    padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
+
+  .sec {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    font-size: 13px; font-weight: 600; color: var(--text2);
+    text-transform: uppercase; letter-spacing: .4px;
+    margin: 24px 4px 7px;
+  }
+  .sec .sec-note { font-size: 12px; font-weight: 400; color: var(--text3); text-transform: none; letter-spacing: 0; }
+
+  .panel { background: var(--card); border-radius: 12px; overflow: hidden; }
+
+  /* 分段控件：发送 / 接收 */
+  .segbar {
+    display: flex; gap: 4px; margin: 8px 0 4px; padding: 3px;
+    background: var(--fill); border-radius: 10px;
+  }
+  .segbar button {
+    flex: 1; border: none; background: transparent; color: var(--text);
+    font: inherit; font-size: 15px; font-weight: 500; cursor: pointer;
+    padding: 8px 4px; border-radius: 8px;
+    -webkit-user-select: none; user-select: none; touch-action: manipulation;
+    transition: background .18s, box-shadow .18s;
+  }
+  .segbar button.on { background: var(--card); font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+
+  .pad { padding: 16px; }
+  .hint { font-size: 13px; color: var(--text2); line-height: 1.6; }
+  .hint strong { font-weight: 600; color: var(--text); }
+
+  .drop {
+    border: 1.5px dashed var(--sep); border-radius: 12px; padding: 22px 16px;
+    text-align: center; color: var(--text2); font-size: 15px; cursor: pointer;
+    transition: background .2s, border-color .2s;
+    -webkit-user-select: none; user-select: none;
+  }
+  .drop.dragging { border-color: var(--accent); background: var(--fill); color: var(--accent); }
+
+  /* 已选清单（沿用文件库页面的行样式） */
+  #staged { max-height: 216px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  #staged .row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 0; border-bottom: 0.5px solid var(--sep); font-size: 15px;
+  }
+  #staged .row:last-child { border-bottom: none; }
+  #staged .row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #staged .row b { font-weight: 400; color: var(--text2); flex-shrink: 0; font-size: 13px; }
+  /* 视觉小、可点区域 44×44；右边距必须是 0，否则 overflow-y:auto 会连带把横向也变成 auto */
+  #staged .rm {
+    flex-shrink: 0; width: 44px; height: 44px; margin: -11px 0 -11px -6px;
+    border: none; background: transparent; color: var(--text3);
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    -webkit-user-select: none; user-select: none; touch-action: manipulation;
+  }
+  #staged .rm:active { opacity: .4; }
+
+  .btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; border: none; cursor: pointer;
+    font: inherit; font-size: 17px; font-weight: 600;
+    height: 50px; border-radius: 12px; margin-top: 14px;
+    -webkit-user-select: none; user-select: none;
+    transition: opacity .15s; touch-action: manipulation;
+  }
+  .btn:disabled { opacity: .4; }
+  .btn-primary { background: var(--accent-fill); color: #fff; }
+  .btn-primary:active:not(:disabled) { opacity: .6; }
+  .btn-ghost { background: var(--fill); color: var(--text); }
+  .btn-ghost:active:not(:disabled) { opacity: .6; }
+
+  .linkbtn {
+    border: none; background: transparent; color: var(--accent-ink);
+    font: inherit; font-size: 15px; font-weight: 500; cursor: pointer;
+    padding: 8px 6px; border-radius: 8px;
+    -webkit-user-select: none; user-select: none; touch-action: manipulation;
+  }
+  .linkbtn:active { opacity: .4; }
+  .linkbtn:disabled { opacity: .4; cursor: default; }
+
+  /* 触摸设备：可点控件至少 44×44（Apple HIG），只放大命中区域不动外观 */
+  @media (pointer: coarse) {
+    .linkbtn, .segbar button, .copy-code {
+      min-height: 44px; min-width: 44px;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+  }
+
+  /* 传输码 */
+  .code-box {
+    display: flex; align-items: stretch; gap: 8px;
+    background: var(--bg); border-radius: 10px; padding: 10px 10px 10px 14px;
+  }
+  .code-box .code {
+    flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 15px; letter-spacing: .2px; line-height: 1.5;
+    word-break: break-all; user-select: text; -webkit-user-select: text;
+    -webkit-touch-callout: default;
+  }
+  .copy-code {
+    flex-shrink: 0; border: none; background: var(--accent-fill); color: #fff;
+    font: inherit; font-size: 15px; font-weight: 600; cursor: pointer;
+    padding: 9px 16px; border-radius: 9px; align-self: center;
+    -webkit-user-select: none; user-select: none; touch-action: manipulation;
+  }
+  .copy-code:active { opacity: .6; }
+
+  /* 安全码：两端必须一致才算没人夹在中间 */
+  .safety {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: var(--fill);
+  }
+  .safety .num {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 22px; font-weight: 700; letter-spacing: 3px; color: var(--text);
+  }
+  .safety .say { font-size: 12px; color: var(--label-ink); line-height: 1.5; flex: 1; min-width: 180px; }
+
+  /* 通道 + 状态 */
+  .chan {
+    display: flex; align-items: center; gap: 8px; margin-top: 14px;
+    font-size: 13px; color: var(--label-ink);
+  }
+  .chan .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); flex-shrink: 0; }
+  .chan.live .dot { background: var(--ok); }
+  .chan.relay .dot { background: var(--accent-fill); }
+  .chan.warn .dot { background: var(--red); }
+
+  /* 进度长条：与文件库页面 #blocks 同一组件、同一配色、同一动画 */
+  #blocks {
+    display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
+    margin-top: 14px; padding: 3px; border-radius: 7px; background: var(--fill);
+    --blk-w: 9px; --blk-h: 12px;
+  }
+  #blocks .blk {
+    width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
+    transition: background .12s, opacity .12s;
+  }
+  #blocks .blk.done { background: var(--accent-fill); }
+  #blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
+  #blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); }
+  @keyframes blkPulse { 50% { opacity: .3; } }
+
+  #send-status, #recv-status {
+    font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
+    font-variant-numeric: tabular-nums; white-space: pre-line;
+  }
+  #send-status.err, #recv-status.err { color: var(--red); font-weight: 500; }
+
+  .subtle { font-size: 12px; color: var(--text3); margin-top: 8px; line-height: 1.5; }
+
+  .warn {
+    margin-top: 10px; border-radius: 10px; padding: 10px 12px;
+    background: rgba(255,59,48,.12); color: var(--red); font-size: 13px; line-height: 1.5;
+  }
+  .note {
+    margin-top: 10px; border-radius: 10px; padding: 10px 12px;
+    background: var(--fill); color: var(--label-ink); font-size: 13px; line-height: 1.5;
+  }
+
+  input.code-in {
+    width: 100%; font: inherit; font-size: 16px; color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg); border: 1px solid var(--sep); border-radius: 10px;
+    padding: 12px 14px; -webkit-user-select: text; user-select: text;
+  }
+  input.code-in:focus { outline: none; border-color: var(--accent); }
+
+  .ops { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 12px; }
+
+  /* 收到的文件（校验通过后才出现） */
+  .got { display: flex; align-items: center; gap: 12px; padding: 12px 0;
+    border-bottom: 0.5px solid var(--sep); font-size: 15px; }
+  .got:last-child { border-bottom: none; }
+  .got .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .got .size { color: var(--text2); font-size: 13px; flex-shrink: 0; }
+
+  /* 本地恢复记录 */
+  .resume-item {
+    display: flex; align-items: center; gap: 10px; padding: 11px 0;
+    border-bottom: 0.5px solid var(--sep); font-size: 14px;
+  }
+  .resume-item:last-child { border-bottom: none; }
+  .resume-item .m { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .resume-item .m small { display: block; color: var(--text2); font-size: 12px; margin-top: 2px; }
+
+  [hidden] { display: none !important; }
+
+  /* Toast：与文件库页面同一支 */
+  #toast {
+    position: fixed; left: 50%; top: calc(12px + env(safe-area-inset-top));
+    transform: translateX(-50%) translateY(-80px);
+    background: rgba(28,28,30,.88); color: #fff; padding: 10px 18px; border-radius: 13px;
+    font-size: 14px; max-width: 86vw; text-align: center; z-index: 200;
+    box-shadow: 0 12px 32px rgba(0,0,0,.28);
+    -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px);
+    opacity: 0; transition: transform .32s cubic-bezier(.32,.72,0,1), opacity .25s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<header>
+  <h1>无痕传输</h1>
+  <a class="back" href="index.html">文件库</a>
+</header>
+
+<div class="wrap">
+  <div class="segbar" role="tablist">
+    <button type="button" id="tab-send" role="tab" aria-selected="true">我要发送</button>
+    <button type="button" id="tab-recv" role="tab" aria-selected="false">我要接收</button>
+  </div>
+
+  <div class="note" id="caps"></div>
+
+  <!-- ---------------- 发送 ---------------- -->
+  <section id="view-send">
+    <div class="sec">1 · 选文件<span class="sec-note">这一步不上传任何东西</span></div>
+    <div class="panel">
+      <div class="pad">
+        <div class="drop" id="drop">点击选择，或把文件拖到这里</div>
+        <input type="file" id="pick-in" multiple hidden>
+        <div id="staged"></div>
+        <div class="hint" id="staged-total" style="margin-top:10px"></div>
+        <button type="button" class="btn btn-primary" id="start" disabled>生成传输码并开始加密</button>
+      </div>
+    </div>
+
+    <div id="send-live" hidden>
+      <div class="sec">2 · 把传输码给对方<span class="sec-note">对方在「我要接收」里输入</span></div>
+      <div class="panel">
+        <div class="pad">
+          <div class="code-box">
+            <div class="code" id="send-code"></div>
+            <button type="button" class="copy-code" id="send-copy">复制</button>
+          </div>
+          <div class="safety">
+            <div class="num" id="send-safety">— — — — —</div>
+            <div class="say">配对成功后，两边屏幕上必须显示<b>同一组安全码</b>。不一样就立刻取消 —— 服务器看不到内容，但它能看到谁在配对，靠这组数字确认中间没别人。</div>
+          </div>
+          <div class="chan" id="send-chan"><span class="dot"></span><span id="send-chan-t">还没连接</span></div>
+          <div id="blocks" hidden></div>
+          <div id="send-status">等待接收方…</div>
+          <div class="ops">
+            <button type="button" class="linkbtn" id="send-pause">暂停</button>
+            <button type="button" class="linkbtn" id="send-recon">重新连接</button>
+            <button type="button" class="linkbtn" id="send-cancel" style="color:var(--red)">取消并销毁</button>
+          </div>
+          <div class="subtle">会话是临时的：过期、取消或传完后服务器上的密文会被清掉；不生成永久链接，也不会进文件库。</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="send-resume-wrap" hidden>
+      <div class="sec">没传完的会话<span class="sec-note">重新选同一批文件才能续</span></div>
+      <div class="panel"><div class="pad" id="send-resume"></div></div>
+    </div>
+  </section>
+
+  <!-- ---------------- 接收 ---------------- -->
+  <section id="view-recv" hidden>
+    <div class="sec">传输码<span class="sec-note">粘贴或手输都行，不区分大小写</span></div>
+    <div class="panel">
+      <div class="pad">
+        <input type="text" class="code-in" id="recv-in" placeholder="abc1def2-34jk-…" autocomplete="off"
+          autocapitalize="off" spellcheck="false" inputmode="text">
+        <button type="button" class="btn btn-primary" id="recv-go">配对并开始接收</button>
+        <div class="subtle">码里前 8 位只是"会话在哪"，后 24 位是只有两端知道的秘密 —— 只凭前 8 位什么也做不了。</div>
+      </div>
+    </div>
+
+    <div id="recv-live" hidden>
+      <div class="sec">安全确认</div>
+      <div class="panel">
+        <div class="pad">
+          <div class="safety">
+            <div class="num" id="recv-safety">— — — — —</div>
+            <div class="say">和发送方屏幕上那组一模一样才可以收。不一样 = 有人在中间换过密钥，请取消并让对方重发。</div>
+          </div>
+          <div class="chan" id="recv-chan"><span class="dot"></span><span id="recv-chan-t">还没连接</span></div>
+          <div id="r-blocks" hidden></div>
+          <div id="recv-status">等待对方开始…</div>
+          <div class="ops">
+            <button type="button" class="linkbtn" id="recv-pause">暂停</button>
+            <button type="button" class="linkbtn" id="recv-recon">重新连接</button>
+            <button type="button" class="linkbtn" id="recv-cancel" style="color:var(--red)">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="recv-done-wrap" hidden>
+        <div class="sec">校验通过的文件<span class="sec-note">名字是密文里解出来的，之前不给服务器看</span></div>
+        <div class="panel"><div class="pad">
+          <div id="recv-files"></div>
+          <button type="button" class="btn btn-primary" id="recv-save">保存到这设备</button>
+          <div class="subtle" id="recv-save-note"></div>
+        </div></div>
+      </div>
+    </div>
+
+    <div id="recv-resume-wrap" hidden>
+      <div class="sec">本机接收记录<span class="sec-note">刷新页面后用同一个码接着收</span></div>
+      <div class="panel"><div class="pad" id="recv-resume"></div></div>
+    </div>
+  </section>
+
+  <div class="sec">这页做不到什么</div>
+  <div class="panel"><div class="pad">
+    <div class="hint">
+      · 服务器只搬运密文，看不到文件内容、文件名，也没有解密密钥。<br>
+      · "无痕"指会话过期/取消后服务器逻辑删除密文；<b>不保证</b> SSD、快照、备份里查不到痕迹。<br>
+      · 通过 HTTP（非安全上下文）打开时浏览器不给加密接口，直连不可用，会自动走服务器中转 —— 仍然全程密文，只是纯 JS 加密慢一些。想要直连请用 HTTPS 入口。<br>
+      · 双方都要在线；短暂断线会保留恢复状态，但过期时间一到旧码就废了。
+    </div>
+  </div></div>
+</div>
+
+<div id="toast"></div>
+
+<script src="crypto.js"></script>
+<script src="xfer-proto.js"></script>
+<script src="xfer-engine.js"></script>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const fmt = (n) => {
+    if (!Number.isFinite(n) || n < 0) return '—';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)}${u[i]}`;
+  };
+  const secs = (s) => {
+    if (!Number.isFinite(s) || s <= 0) return '';
+    if (s < 60) return `${Math.round(s)} 秒`;
+    if (s < 3600) return `${Math.round(s / 60)} 分钟`;
+    return `${(s / 3600).toFixed(1)} 小时`;
+  };
+  let toastTimer;
+  function toast(msg) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 2400);
+  }
+  async function copyText(txt) {
+    try { await navigator.clipboard.writeText(txt); return true; }
+    catch {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      ta.remove();
+      return ok;
+    }
+  }
+
+  const PHASE = {
+    idle: '', fingerprinting: '正在算文件指纹（只读本地内容，不上传）',
+    waiting: '等待接收方输入传输码', pairing: '正在配对、核对安全码',
+    transferring: '加密传输中', paused: '已暂停（恢复状态还在）',
+    retrying: '连接断了，正在自动重连或改走中转', verifying: '全部到齐，正在逐块校验并算总 SHA-256',
+    ready: '校验通过，可以保存了', saving: '正在解密写盘', done: '传输完成',
+    cancelled: '已取消，服务器上的密文正在清理', failed: '出错了',
+  };
+  const CHAN = {
+    none: ['还没连接', ''], p2p_connecting: ['正在尝试点对点直连…', ''],
+    p2p: ['点对点直连（不经过服务器）', 'live'],
+    turn_relay: ['TURN 中继（不是直连）', 'relay'],
+    server_relay: ['服务器密文中转', 'relay'],
+  };
+  const chanOf = (c) => CHAN[c] || CHAN.none;
+
+  // ---------------- 进度长条（复用 #blocks 组件；格数封顶，每格代表若干帧） ----------------
+  const MAXCELL = 600;
+  const STRIP = { wMax: 9, wMin: 3, hMax: 12, hMin: 4, rows: 6, budget: 96 };
+  function makeStrip(box, cells) {
+    if (box.dataset.cells === String(cells)) return;
+    box.dataset.cells = String(cells);
+    box.innerHTML = '';
+    box.hidden = false;
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < cells; i++) {
+      const d = document.createElement('div');
+      d.className = 'blk';
+      frag.appendChild(d);
+    }
+    box.appendChild(frag);
+    layoutStrip(box);
+  }
+  function layoutStrip(box) {
+    const n = box.children.length;
+    if (!n) return;
+    const inner = box.clientWidth - 6;
+    if (inner <= 0) return;
+    const perMax = Math.max(1, Math.floor((inner + 2) / (STRIP.wMax + 2)));
+    let w = STRIP.wMax;
+    if (n > perMax * STRIP.rows) {
+      const need = Math.ceil(n / STRIP.rows);
+      w = Math.max(STRIP.wMin, Math.floor((inner + 2) / need) - 2);
+    }
+    const rows = Math.max(1, Math.ceil(n / Math.max(1, Math.floor((inner + 2) / (w + 2)))));
+    const h = Math.max(STRIP.hMin, Math.min(STRIP.hMax, Math.floor(STRIP.budget / rows) - 2));
+    box.style.setProperty('--blk-w', w + 'px');
+    box.style.setProperty('--blk-h', h + 'px');
+  }
+  /** done/total 只单调往前：通道切换时 counters 是同一批 Set，不会倒退也不会重复计 */
+  function paintStrip(box, frames, done) {
+    const cells = Math.max(1, Math.min(frames, MAXCELL));
+    makeStrip(box, cells);
+    const per = frames / cells;
+    const filled = Math.min(cells, Math.floor(done / per));
+    const kids = box.children;
+    for (let i = 0; i < cells; i++) {
+      const el = kids[i];
+      const want = i < filled ? 'blk done' : i === filled && done < frames ? 'blk active' : 'blk';
+      if (el.className !== want) el.className = want;
+    }
+    return { cells, per };
+  }
+
+  // ---------------- 能力横幅 ----------------
+  const caps = window.XferEngine.capabilities();
+  (function banner() {
+    const miss = [];
+    if (!caps.subtle) miss.push('浏览器没给 WebCrypto（HTTP 入口）→ 用纯 JS 加密，约 7MB/s');
+    if (!caps.rtc) miss.push('没有 WebRTC → 不会尝试直连');
+    if (!caps.idb) miss.push('没有 IndexedDB → 接收端断线恢复不可用');
+    if (!caps.fsAccess) miss.push('没有流式写盘接口 → 保存大文件会占内存');
+    const el = $('#caps');
+    if (!miss.length) { el.textContent = '本环境可以走点对点直连，加密由浏览器原生 WebCrypto 完成。'; el.className = 'note'; }
+    else { el.innerHTML = '本环境限制：' + miss.map((m) => `· ${m}`).join('<br>'); el.className = 'warn'; }
+  })();
+
+  // ---------------- 会话挂接 ----------------
+  let sender = null;
+  let receiver = null;
+
+  function mount(role) {
+    const isSend = role === 'sender';
+    const box = $(isSend ? '#blocks' : '#r-blocks');
+    const s = window.XferEngine.Session({
+      role,
+      on(st) { paint(isSend ? '#send' : '#recv', st, box); },
+    });
+    return s;
+  }
+
+  function paint(prefix, st, box) {
+    const t = (id) => $(`${prefix}-${id}`);
+    if (st.code) t('code') && (t('code').textContent = st.code);
+    if (st.safety) t('safety').textContent = st.safety.replace(/(.{1})(?=.)/g, '$1 ');
+    const [ctext, ccls] = chanOf(st.channel);
+    const chanEl = t('chan');
+    chanEl.className = 'chan' + (ccls ? ' ' + ccls : '');
+    const why = st.error && st.phase === 'retrying' ? ` · ${st.error}` : '';
+    t('chan-t').textContent = (st.channel === 'none' ? ctext : `${ctext}${why}`);
+
+    const frames = st.frames || 0;
+    const doneN = st.role === 'sender'
+      ? (st.channel === 'server_relay' ? st.uploaded : st.sentFrames)
+      : st.stored;
+    if (prefix === '#recv') $('#recv-live').hidden = st.phase === 'idle';
+    else if (st.phase !== 'idle') $('#send-live').hidden = false;
+
+    if (frames && st.phase !== 'idle') {
+      const { cells, per } = paintStrip(box, frames, doneN);
+      // 每格多大要说清楚：格数被封顶后一格可能代表好几块
+      const blkBytes = per * (window.XferProto ? XferProto.PLAIN_BLOCK : 131072);
+      box.hidden = false;
+      statusLine(prefix, st, box, cells, blkBytes, doneN);
+    } else {
+      box.hidden = true;
+      statusLine(prefix, st, box, 0, 0, 0);
+    }
+
+    if (st.role === 'receiver') {
+      const ok = st.verified;
+      $('#recv-done-wrap').hidden = !ok;
+      if (ok) renderFiles(st);
+      const p = t('pause');
+      if (p) p.textContent = st.phase === 'paused' ? '继续接收' : '暂停';
+    } else {
+      const p = t('pause');
+      if (p) p.textContent = st.phase === 'paused' ? '继续发送' : '暂停';
+    }
+  }
+
+  function statusLine(prefix, st, box, cells, blkBytes, doneN) {
+    const el = $(`${prefix}-status`);
+    const err = st.error && st.phase !== 'retrying';
+    el.className = err ? 'err' : '';
+    const lines = [];
+    lines.push(PHASE[st.phase] || st.phase || '待命');
+    if (st.frames) {
+      const pct = Math.min(100, Math.round((doneN / st.frames) * 100));
+      const moved = Math.min(st.totalBytes, Math.round(doneN * (st.totalBytes / st.frames)));
+      lines.push(`${pct}% · ${fmt(moved)} / ${fmt(st.totalBytes)}（${cells} 格，每格 ≈ ${fmt(blkBytes)}）`);
+      if (st.role === 'sender') {
+        const ack = st.stored || 0;
+        lines.push(`对方已落盘确认 ${ack}/${st.frames} 块 —— 只有这一档才算真的收到`);
+      }
+      if (st.speed) lines.push(`${fmt(st.speed)}/s` + (st.eta ? ` · 大约还剩 ${secs(st.eta)}` : ' · 剩余时间估算中'));
+    }
+    if (st.expiresAt) {
+      const left = st.expiresAt - Date.now();
+      lines.push(left > 0 ? `会话还剩 ${secs(left / 1000)}` : '会话已过期');
+    }
+    if (err) lines.push(st.error);
+    el.textContent = lines.filter(Boolean).join('\n');
+  }
+
+  function renderFiles(st) {
+    const wrap = $('#recv-files');
+    if (wrap.dataset.n === String(st.files.length)) return;
+    wrap.dataset.n = String(st.files.length);
+    wrap.innerHTML = '';
+    for (const f of st.files) {
+      const row = document.createElement('div');
+      row.className = 'got';
+      const n = document.createElement('div'); n.className = 'name'; n.textContent = f.name;
+      const s = document.createElement('div'); s.className = 'size'; s.textContent = fmt(f.size);
+      row.append(n, s);
+      wrap.appendChild(row);
+    }
+    $('#recv-save-note').textContent = caps.fsAccess
+      ? '直接流式写盘，整文件不进内存。'
+      : '这个浏览器没有流式写盘接口：保存时会把文件凑成 Blob 交给下载，几个 GB 的包会吃内存，建议换 Edge/Chrome。';
+  }
+
+  // ---------------- 发送 ----------------
+  const picked = [];   // {file, relPath, name, size, mime}
+  function relOf(f) { return f.webkitRelativePath || f.name; }
+  function addFiles(list) {
+    for (const f of Array.from(list)) {
+      if (picked.some((p) => p.relPath === relOf(f) && p.size === f.size)) continue;
+      picked.push({ file: f, relPath: relOf(f), name: f.name, size: f.size, mime: f.type || 'application/octet-stream' });
+    }
+    renderPicked();
+  }
+  function renderPicked() {
+    const box = $('#staged');
+    box.innerHTML = '';
+    picked.forEach((p, i) => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const nm = document.createElement('span'); nm.textContent = p.name; nm.title = p.relPath;
+      const sz = document.createElement('b'); sz.textContent = fmt(p.size);
+      const rm = document.createElement('button');
+      rm.type = 'button'; rm.className = 'rm'; rm.textContent = '✕'; rm.setAttribute('aria-label', `移除 ${p.name}`);
+      rm.addEventListener('click', () => { picked.splice(i, 1); renderPicked(); });
+      row.append(nm, sz, rm);
+      box.appendChild(row);
+    });
+    const total = picked.reduce((s, p) => s + p.size, 0);
+    $('#staged-total').textContent = picked.length ? `${picked.length} 个文件 · 共 ${fmt(total)}` : '';
+    $('#start').disabled = picked.length === 0;
+  }
+
+  $('#drop').addEventListener('click', () => $('#pick-in').click());
+  $('#pick-in').addEventListener('change', (e) => { addFiles(e.target.files); e.target.value = ''; });
+  const drop = $('#drop');
+  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('dragging'); }));
+  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('dragging'); }));
+  drop.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+  document.addEventListener('dragover', (e) => e.preventDefault());
+  document.addEventListener('drop', (e) => e.preventDefault());
+
+  $('#send-copy').addEventListener('click', async () => {
+    const txt = $('#send-code').textContent;
+    toast((await copyText(txt)) ? '传输码已复制' : '复制没成功，请手动选中复制');
+  });
+
+  $('#start').addEventListener('click', async () => {
+    if (!picked.length) return;
+    $('#start').disabled = true;
+    sender = mount('sender');
+    $('#send-live').hidden = false;
+    $('#send-live').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    try { await sender.send(picked.map((p) => Object.assign({}, p))); }
+    catch (err) {
+      console.error('[xfer-ui] 发送失败', err);
+      toast(err.message || '创建会话失败');
+      $('#send-live').hidden = true;
+    }
+    finally { $('#start').disabled = false; }
+  });
+
+  $('#send-pause').addEventListener('click', () => {
+    if (!sender) return;
+    if (sender.state.phase === 'paused') { sender.resume(); $('#send-pause').textContent = '暂停'; }
+    else { sender.pause(); $('#send-pause').textContent = '继续发送'; }
+  });
+  $('#send-recon').addEventListener('click', () => { if (sender) { sender.refresh().catch(() => toast('重连没成功，稍后再试')); toast('正在重新连接…'); } });
+  $('#send-cancel').addEventListener('click', async () => {
+    if (!sender) return;
+    if (!confirm('取消这次传输？服务器上的密文会被清掉，旧传输码作废。')) return;
+    await sender.cancel();
+    toast('已取消');
+  });
+
+  // ---------------- 接收 ----------------
+  $('#recv-go').addEventListener('click', onReceive);
+  $('#recv-in').addEventListener('keydown', (e) => { if (e.key === 'Enter') onReceive(); });
+  async function onReceive() {
+    const txt = $('#recv-in').value;
+    receiver = mount('receiver');
+    $('#recv-live').hidden = false;
+    try { await receiver.accept(txt); toast('配对成功'); }
+    catch (err) {
+      console.error('[xfer-ui] 接收失败', err);
+      toast(err.message || '配对失败');
+      $('#recv-live').hidden = true;
+      receiver = null;
+    }
+  }
+  $('#recv-pause').addEventListener('click', () => {
+    if (!receiver) return;
+    if (receiver.state.phase === 'paused') receiver.resume();
+    else receiver.pause();
+  });
+  $('#recv-recon').addEventListener('click', () => { if (receiver) receiver.refresh().catch(() => toast('重连没成功')); });
+  $('#recv-cancel').addEventListener('click', async () => {
+    if (!receiver) return;
+    if (!confirm('取消接收？本机已收的密文和服务器上的都会清掉。')) return;
+    await receiver.cancel();
+    toast('已取消');
+  });
+
+  $('#recv-save').addEventListener('click', async () => {
+    if (!receiver || !receiver.state.verified) return;
+    try {
+      if (caps.fsAccess && window.showDirectoryPicker && receiver.state.files.length > 1) {
+        const dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+        await receiver.saveAll(async (f) => {
+          const fh = await dir.getFileHandle(f.name, { create: true });
+          return fh.createWritable();
+        });
+      } else if (caps.fsAccess && window.showSaveFilePicker) {
+        const fh = await window.showSaveFilePicker({ suggestedName: receiver.state.files[0].name });
+        await receiver.saveAll(async () => fh.createWritable());
+      } else {
+        const single = receiver.state.files.length === 1;
+        await receiver.saveAll(null);
+        const list = await receiver.collected();
+        for (const it of list) {
+          const url = URL.createObjectURL(it.blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = it.name;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 4000);
+          if (!single) await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+      toast('已保存');
+    } catch (err) {
+      if (err && err.name === 'AbortError') return; // 用户自己关掉了保存框
+      toast(err.message || '保存失败');
+    }
+  });
+
+  // ---------------- 分段切换 + 恢复入口 ----------------
+  function showTab(which) {
+    const send = which !== 'recv';
+    $('#view-send').hidden = !send;
+    $('#view-recv').hidden = send;
+    $('#tab-send').classList.toggle('on', send);
+    $('#tab-recv').classList.toggle('on', !send);
+    $('#tab-send').setAttribute('aria-selected', String(send));
+    $('#tab-recv').setAttribute('aria-selected', String(!send));
+    if (location.hash !== '#' + (send ? 'send' : 'recv')) history.replaceState(null, '', '#' + (send ? 'send' : 'recv'));
+    renderResume();
+  }
+  $('#tab-send').addEventListener('click', () => showTab('send'));
+  $('#tab-recv').addEventListener('click', () => showTab('recv'));
+  addEventListener('hashchange', () => showTab(location.hash === '#recv' ? 'recv' : 'send'));
+
+  function renderResume() {
+    const sending = !$('#view-send').hidden;
+    const role = sending ? 'sender' : 'receiver';
+    const wrap = $(sending ? '#send-resume-wrap' : '#recv-resume-wrap');
+    const box = $(sending ? '#send-resume' : '#recv-resume');
+    const list = window.XferEngine.listSaved(role);
+    wrap.hidden = list.length === 0;
+    if (!list.length) return;
+    box.innerHTML = '';
+    list.forEach((it) => {
+      const row = document.createElement('div');
+      row.className = 'resume-item';
+      const m = document.createElement('div');
+      m.className = 'm';
+      const nm = document.createElement('div');
+      nm.textContent = it.code;
+      m.appendChild(nm);
+      const small = document.createElement('small');
+      small.textContent = `${fmt(it.totalBytes)} · 还有 ${secs(Math.max(0, it.expiresAt - Date.now()) / 1000)}`
+        + (it.verified ? ' · 已校验通过' : '') + (sending ? ' · 要重新选同一批文件' : '');
+      m.appendChild(small);
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'linkbtn'; b.textContent = sending ? '续传' : '接着收';
+      b.addEventListener('click', async () => {
+        if (sending) {
+          if (!picked.length) { toast('先在上面选好同一批文件，再点续传'); return; }
+          const rec = { record: Object.assign({}, it) };
+          sender = mount('sender');
+          $('#send-live').hidden = false;
+          try { await sender.send(picked.map((p) => Object.assign({}, p)), rec); toast('已接上原会话'); }
+          catch (err) { toast(err.message || '续传失败'); $('#send-live').hidden = true; }
+        } else {
+          $('#recv-in').value = it.code;
+          await onReceive();
+        }
+      });
+      const q = document.createElement('button');
+      q.type = 'button'; q.className = 'linkbtn'; q.textContent = '忘记';
+      q.addEventListener('click', () => { window.XferEngine.forget(role, it.sid); renderResume(); });
+      row.append(m, b, q);
+      box.appendChild(row);
+    });
+  }
+
+  showTab(location.hash === '#recv' ? 'recv' : 'send');
+  addEventListener('resize', () => {
+    ['#blocks', '#r-blocks'].forEach((s) => { const b = $(s); if (b && !b.hidden) layoutStrip(b); });
+  });
+  // 从后台切回来时刷新一次确认状态（浏览器会冻结 SSE 与计时器）
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    if (sender && !['done', 'cancelled', 'failed'].includes(sender.state.phase)) sender.refresh().catch(() => {});
+    if (receiver && !['done', 'cancelled', 'failed'].includes(receiver.state.phase)) receiver.refresh().catch(() => {});
+  });
+  // 关页面前提个醒：传一半走了，服务器上的密文留着但会话过期就没了
+  addEventListener('beforeunload', (e) => {
+    const live = [sender, receiver].find((s) => s && ['transferring', 'retrying', 'paused', 'pairing'].includes(s.state.phase));
+    if (live) { e.preventDefault(); e.returnValue = ''; }
+  });
+})();
+</script>
+</body>
+</html>

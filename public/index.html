@@ -80,6 +80,12 @@
     padding: 8px 2px; border-radius: 8px; -webkit-user-select: none; user-select: none;
   }
   header button.refresh:active { opacity: .4; }
+  .hdr-acts { display: flex; align-items: baseline; gap: 16px; }
+  header a.xfer {
+    color: var(--accent); font-size: 17px; font-weight: 500; text-decoration: none;
+    padding: 8px 2px; border-radius: 8px; -webkit-user-select: none; user-select: none;
+  }
+  header a.xfer:active { opacity: .4; }
 
   .wrap { max-width: 720px; margin: 0 auto; padding: 6px 16px 40px;
     padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
@@ -233,7 +239,7 @@
   /* ---------- 触摸设备：所有可点控件至少 44×44（Apple HIG 最小触摸目标） ----------
      只放大命中区域，不改字号与外观；桌面（精确指针）不受影响。 */
   @media (pointer: coarse) {
-    .linkbtn, .file-row a, .copy-btn, header button.refresh {
+    .linkbtn, .file-row a, .copy-btn, header button.refresh, header a.xfer {
       min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center;
     }
     .del { width: 44px; height: 44px; }
@@ -347,7 +353,10 @@
 <body>
 <header>
   <h1>文件盒子</h1>
-  <button class="refresh" onclick="loadList()">刷新</button>
+  <div class="hdr-acts">
+    <a class="xfer" href="transfer.html">无痕传输</a>
+    <button class="refresh" onclick="loadList()">刷新</button>
+  </div>
 </header>
 
 <div class="wrap">
