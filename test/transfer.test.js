@@ -247,9 +247,14 @@ test('配额与并发：空间不够 413、写不过来 429，都不会把内存
       method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Xfer-Sender': c.body.token }, body: crypto.randomBytes(30000),
     });
     assert.strictEqual(r.status, 413, `超过中转配额要 413，实际 ${r.status}`);
-    // 声明量本身超上限，建会话就该拒
+    // 声明量超过配额**不能**成为拒建会话的理由：直连是默认路径，多数会话服务器一个字节都不存。
+    // 但配额本身还得在"真的往中转区写字节"时挡住——所以这里两半都要验。
     const big = await createSession(s3, { totalBytes: 10 * 1024 * 1024 });
-    assert.strictEqual(big.status, 413, '声明的总量超过配额要在建会话时就挡住');
+    assert.strictEqual(big.status, 200, '明文总量大于中转配额也要能建会话（直连时服务器不存东西）');
+    const bigWrite = await fetch(`${s3.base}/api/xfer/seg?sid=${big.sid}&i=0`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Xfer-Sender': big.body.token }, body: crypto.randomBytes(30000),
+    });
+    assert.strictEqual(bigWrite.status, 413, '真要把超配额的字节的写进中转区，仍然必须 413');
   } finally { await s3.stop(); }
 
   // 并发上界要真的重叠才算验证过：undici/Node 的 fetch 会把同域请求排队，全 200 是假绿。

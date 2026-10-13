@@ -214,7 +214,7 @@ env: {
 | `GET /api/download/*` / `/api/archive/*` | 下载任何密文（无密钥解不开，但密文本身会泄露文件量级与元数据） |
 | `DELETE /api/folder/*` | **无确认直接删除你的任何目录** —— 这是最大的风险点 |
 | `GET /api/xfer/sessions` | 看到当前有多少无痕传输在进行 |
-| `POST /api/xfer/create`（限速后仍可用） | 反复建会话占用中转区配额（2GB） |
+| `POST /api/xfer/create`（限速后仍可用） | 反复建会话占住活跃会话槽位（默认 20 个），把别人正在用的会话挤掉 |
 
 「在反代层加认证」的意思是：不改这个项目的代码，让 nginx/caddy 在请求到达 file-box 之前先要求输密码。这样所有接口都在认证之后，上表的每一行都打不通。nginx 最小配置（basic auth）：
 

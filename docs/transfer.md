@@ -167,7 +167,7 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 |---|---|---|
 | `TRANSFER_DIR` | `./.transfer` | 中转区根目录，必须与 `UPLOAD_DIR` 分开（已在 `.gitignore` 里） |
 | `XFER_TTL_MINUTES` | 30 | 会话有效期；到点清密文 + 账本，旧码作废 |
-| `XFER_LIMIT_GB` | 2 | 中转区总配额 |
+| `XFER_LIMIT_GB` | 2 | 中转区总配额（按**真正落盘的密文字节**计；点对点直连一个字节都不进中转区，所以不受它限制） |
 | `XFER_MAX_SESSIONS` | 20 | 同时存在的会话数 |
 | `XFER_MAX_INFLIGHT` | 8 | 同时在写的分块数（超过回 429） |
 | `XFER_MAX_SEG` | 8 MiB | 单帧上限 |
