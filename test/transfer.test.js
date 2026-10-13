@@ -476,3 +476,74 @@ test('TURN：未配置时 503；配了密钥就给短期凭证，且每次不同
 test('随机令牌形状：32 位 hex，猜中一个的概率可以忽略', () => {
   for (let i = 0; i < 200; i++) assert.match(randToken(), /^[a-f0-9]{32}$/);
 });
+
+/** 开一条事件流、收 ms 毫秒内的所有事件后关掉（只用于验"补发"，不指望 live 事件） */
+async function readEvents(s, sid, role, headers, ms = 900) {
+  const ac = new AbortController();
+  const res = await fetch(`${s.base}/api/xfer/events?sid=${sid}&role=${role}`, { headers, signal: ac.signal });
+  const out = [];
+  (async () => {
+    const dec = new TextDecoder();
+    let buf = '';
+    for await (const chunk of res.body) {
+      buf += dec.decode(chunk, { stream: true });
+      let at;
+      while ((at = buf.indexOf('\n\n')) >= 0) {
+        const blk = buf.slice(0, at);
+        buf = buf.slice(at + 2);
+        const name = (blk.match(/^event: (.*)$/m) || [])[1];
+        const data = (blk.match(/^data: (.*)$/m) || [])[1];
+        if (name) out.push({ name, data });
+      }
+    }
+  })().catch(() => {});
+  await new Promise((r) => setTimeout(r, ms));
+  ac.abort();
+  return out;
+}
+const bodiesOf = (list, name) => list.filter((e) => e.name === name).map((e) => JSON.parse(e.data).body);
+
+test('信令补发要按方向分槽：双方都发 key/confirm，后发的一方不能把先发的顶掉', async () => {
+  // 现场：接收方的事件流比它自己发的 key 还晚建立（真机上就是 openStream 与
+  // exchangeKeys 抢跑输了的那一次）—— 这时服务器必须仍然把发送方的 key 补发给它，
+  // 否则接收端永远停在"还没拿到对方公钥，正在等"，界面上就是"对方用码连不上"。
+  const { sid, proof, body } = await createSession();
+  const token = body.token;
+  await join(srv, sid, proof);
+  const post = (kind, b, h) => fetch(`${srv.base}/api/xfer/signal`, {
+    method: 'POST', headers: hdr(h), body: JSON.stringify({ sid, kind, body: b }),
+  }).then((r) => r.status);
+  assert.strictEqual(await post('key', 'SENDER-PUB', { 'X-Xfer-Sender': token }), 200);
+  assert.strictEqual(await post('confirm', 'SENDER-CONFIRM', { 'X-Xfer-Sender': token }), 200);
+  assert.strictEqual(await post('key', 'RECEIVER-PUB', { 'X-Xfer-Proof': proof }), 200);
+  assert.strictEqual(await post('confirm', 'RECEIVER-CONFIRM', { 'X-Xfer-Proof': proof }), 200);
+
+  const recv = await readEvents(srv, sid, 'receiver', { 'X-Xfer-Proof': proof });
+  const send = await readEvents(srv, sid, 'sender', { 'X-Xfer-Sender': token });
+  assert.ok(bodiesOf(recv, 'key').includes('SENDER-PUB'), `接收端补发里丢了发送方的 key（被自己那条顶掉了）: ${JSON.stringify(recv)}`);
+  assert.ok(bodiesOf(send, 'key').includes('RECEIVER-PUB'), `发送端补发里丢了接收方的 key: ${JSON.stringify(send)}`);
+  assert.ok(bodiesOf(recv, 'confirm').includes('SENDER-CONFIRM'), '接收端补发里丢了发送方的 confirm');
+  assert.ok(bodiesOf(send, 'confirm').includes('RECEIVER-CONFIRM'), '发送端补发里丢了接收方的 confirm');
+});
+
+test('ice 补发也按方向分槽：一方刷候选不能把另一方的候选挤光', async () => {
+  // 同一族缺陷的另一条腿：候选列表只有一条 48 格的公共队列，一方多网卡/多候选
+  // 刷一遍，另一方重连时补到的全是"自己发出去的"，直连就建不起来。
+  const { sid, proof, body } = await createSession();
+  const token = body.token;
+  await join(srv, sid, proof);
+  const post = (kind, b, h) => fetch(`${srv.base}/api/xfer/signal`, {
+    method: 'POST', headers: hdr(h), body: JSON.stringify({ sid, kind, body: b }),
+  }).then((r) => r.status);
+  for (let i = 0; i < 40; i++) assert.strictEqual(await post('ice', `S-${i}`, { 'X-Xfer-Sender': token }), 200);
+  for (let i = 0; i < 40; i++) assert.strictEqual(await post('ice', `R-${i}`, { 'X-Xfer-Proof': proof }), 200);
+
+  const recv = await readEvents(srv, sid, 'receiver', { 'X-Xfer-Proof': proof });
+  const send = await readEvents(srv, sid, 'sender', { 'X-Xfer-Sender': token });
+  const mine = bodiesOf(recv, 'ice');
+  const theirs = bodiesOf(send, 'ice');
+  assert.strictEqual(mine.length, 40, `接收端应补到发送方全部 40 条候选，实际 ${mine.length} 条（被自己那 40 条挤掉了）: ${mine.slice(0, 3)}`);
+  assert.strictEqual(theirs.length, 40, `发送端应补到接收方全部 40 条候选，实际 ${theirs.length} 条`);
+  assert.ok(mine.every((x) => x.startsWith('S-')), '补发给接收端的候选必须都来自发送方');
+  assert.ok(theirs.every((x) => x.startsWith('R-')), '不该把自己发的候选补发给自己');
+});
