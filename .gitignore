@@ -24,10 +24,6 @@ transfer/
 .DS_Store
 Thumbs.db
 
-# 验证工装（ui-check / mutate / gate-warm / perf-fp）与它们的临时载荷
-# 留在盘上方便下次回归，但不进仓库、也不进发布包
-.devtmp/
-
 # 环境变量与密钥
 .env
 .env.*

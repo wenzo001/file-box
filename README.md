@@ -199,8 +199,51 @@ env: {
 ## 反向代理部署
 
 - **子路径挂载可用**：两个页面的 API 全部用相对路径（`api/...`），`https://host/box/` 这种挂载方式下只要代理把前缀透传，功能完整可用。
-- **无身份验证，请勿直接暴露公网**：文件库的列表/上传/下载/删除接口没有登录机制，设计目标是内网或"信任的使用者"场景。要上公网请在反代层加认证（basic auth / SSO），并给 `docs/transfer.md` §6 里的无痕传输加上 TURN 配置评估。
 - **SSE 透传**：无痕传输的事件流是 SSE，反代需关闭缓冲（nginx 加 `proxy_buffering off` 或保持 `X-Accel-Buffering: no` 透传，服务端已发送该响应头）。
+- **真实客户端 IP**：反代后请设 `TRUST_PROXY=1` 启动（如 `TRUST_PROXY=1 pm2 start ecosystem.config.js`），
+  否则无痕传输的限流按代理 IP 记账，一个用户连错 30 次传输码会把所有用户冻住 10 分钟。
+
+### 为什么必须加认证（上公网前必读）
+
+这个项目**没有任何登录机制**——这是刻意的架构选择（内网工具，零配置），但也意味着只要端口能被访问到，任何人都拥有**全部权限**：
+
+| 接口 | 匿名能做什么 |
+|---|---|
+| `POST /api/upload/init` + `PUT /api/upload/part` | 把任意文件加密后塞满你的磁盘（直到 10GB 上限） |
+| `GET /api/list` | 看到你所有上传批次的时间、密文文件名和大小 |
+| `GET /api/download/*` / `/api/archive/*` | 下载任何密文（无密钥解不开，但密文本身会泄露文件量级与元数据） |
+| `DELETE /api/folder/*` | **无确认直接删除你的任何目录** —— 这是最大的风险点 |
+| `GET /api/xfer/sessions` | 看到当前有多少无痕传输在进行 |
+| `POST /api/xfer/create`（限速后仍可用） | 反复建会话占用中转区配额（2GB） |
+
+「在反代层加认证」的意思是：不改这个项目的代码，让 nginx/caddy 在请求到达 file-box 之前先要求输密码。这样所有接口都在认证之后，上表的每一行都打不通。nginx 最小配置（basic auth）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name files.example.com;
+
+    # 1) 先要求密码：htpasswd -c /etc/nginx/file-box.htpasswd 用户名
+    auth_basic "File Box";
+    auth_basic_user_file /etc/nginx/file-box.htpasswd;
+
+    # 2) 把请求转给本机跑着的 file-box
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;          # 无痕传输的 SSE 需要关缓冲
+        client_max_body_size 64m;     # 分块上传的单块上限（服务端是 32MB，留余量）
+    }
+}
+```
+
+配套两件事：
+
+- **file-box 本身只监听本机回环**，公网只能走 nginx：`PORT=127.0.0.1:3000` 不行（PORT 只支持端口号），用防火墙拦掉 3000/3443 对外，或 pm2 里保持端口不对外开。
+- **HTTPS 证书由 nginx 负责**（Let's Encrypt 免费签），此时浏览器是安全上下文，原生 WebCrypto 可用，比直连 IP:3443 的自签证书体验更好——自签证书那套「点高级→继续访问」就不再需要了。
+
+只想在内网用、不想加认证的话：保持现状即可，但请确认 3000/3443 没有被端口转发到公网。
 
 ## 存储与自动清理
 
