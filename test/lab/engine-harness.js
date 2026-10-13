@@ -175,7 +175,7 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0 };
+  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0 };
   const nativeFetch = g.fetch;
   defg('fetch', (url, opt = {}) => {
     const u = String(url).startsWith('http') ? String(url) : base + '/' + String(url).replace(/^\//, '');
@@ -187,6 +187,19 @@ function boot({ link, base }) {
     if (pathname === '/api/xfer/ack' && method === 'POST' && counters.failAck > 0) {
       counters.failAck--;
       return Promise.reject(new TypeError('fetch 失败（夹具注入）'));
+    }
+    // 注入"请求挂住不返回"：真浏览器里 socket 死了但连接没断时 fetch 就是这个样子 ——
+    // 它既不 resolve 也不 reject，只会一直占着那个并行槽（2GB 实测就是这么整段停摆的）。
+    // 只有拿 signal 取消它的人才拿得回来，所以这里如实实现 signal 语义。
+    if (pathname === '/api/xfer/seg' && method === 'PUT' && counters.hangPut > 0) {
+      counters.hangPut--;
+      return new Promise((_res, rej) => {
+        const sig = opt && opt.signal;
+        if (sig) {
+          if (sig.aborted) return rej(new DOMException('Aborted', 'AbortError'));
+          sig.addEventListener && sig.addEventListener('abort', () => rej(new DOMException('Aborted', 'AbortError')));
+        }
+      });
     }
     return nativeFetch(u, opt);
   });

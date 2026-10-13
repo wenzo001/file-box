@@ -99,6 +99,14 @@ const KNIVES = {
     from: '        for (const n of list) ackBuf.add(n);',
     to: '        /* 吞掉 */',
   },
+  // 刀十五：把请求超时彻底不排（ac 建了但永远不会 abort）—— 挂住的 PUT 就又永远占着并行槽，
+  //         「中转 PUT 挂住不返回时必须到点重投」那条腿必须红（2GB 实测的那种静默停摆）。
+  //         不要用 "ms = 86400000" 那种写法：那会留下一个 24 小时的 setTimeout，
+  //         断言早就红了但 node --test 进程不肯退出（我第一次就这么把自己挂住过五分钟）。
+  'no-net-timeout': {
+    from: '      const t = setTimeout(() => ac.abort(), ms);',
+    to: '      const t = 0;',
+  },
 };
 
 const mode = process.argv[2];

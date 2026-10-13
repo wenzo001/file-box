@@ -26,6 +26,7 @@
     dcDrainTimeoutMs: 30000,        // 缓冲 30 秒还排不动 = 链路真的不行了，这时才允许降级
     dcRegraceMs: 5000,              // disconnected 后的宽限：能自己回到 connected 就不必掐掉一条直连
     retryGapMs: 5000,               // 同一帧两次重发之间至少隔这么久：否则慢确认会被当成"没送到"反复重发
+    netTimeoutMs: 30000,            // 单个请求的耐心：超时不算失败到底，只把这一槽位放出来重投
   };
 
   // ---------------- 加密线程池（主线程绝不碰 AES/SHA，否则手机端页面会冻） ----------------
@@ -158,7 +159,7 @@
   };
 
   // ---------------- 服务端接口（凭证一律走请求头，不进 URL） ----------------
-  function makeApi(role, cred) {
+  function makeApi(role, cred, getCfg) {
     const hdr = (extra) => Object.assign({}, extra,
       role === 'sender' ? { 'X-Xfer-Sender': cred.token } : { 'X-Xfer-Proof': cred.proof });
     const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
@@ -167,32 +168,45 @@
       if (!r.ok) { const e = new Error(b.error || `请求失败 (${r.status})`); e.status = r.status; throw e; }
       return b;
     };
+    // 每个请求都带超时。理由不是"慢一点不好看"：socket 死了但连接没断时 fetch **既不 resolve 也不 reject**，
+    // 于是那一个请求会永远占着发送窗口的一个并行槽 —— 槽被吃满之后整段传输静默停摆，
+    // 界面上不报错、进度不动（2GB 真浏览器实测：四个槽全挂住，停在 506/16385 块）。
+    // 超时只标成"可重试"，交回原有的重投路；重投同一块是幂等的（nonce 由 type/fileId/chunkIdx 决定，字节完全一样）。
+    const timed = (url, opt = {}) => {
+      const ms = ((getCfg && getCfg()) || DEFAULTS).netTimeoutMs;
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), ms);
+      return fetch(url, Object.assign({}, opt, { signal: ac.signal })).catch((err) => {
+        if (err && err.name === 'AbortError') throw Object.assign(new Error(`请求超时（${ms}ms 没回来）`), { retry: true });
+        throw err;
+      }).finally(() => clearTimeout(t));
+    };
     return {
-      config: async () => json(await fetch('api/xfer/config')),
-      create: (sid, proof, frames, totalBytes) => fetch('api/xfer/create', {
+      config: async () => json(await timed('api/xfer/config')),
+      create: (sid, proof, frames, totalBytes) => timed('api/xfer/create', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, proof, frames, totalBytes }),
       }).then(json),
-      join: (sid, proof) => fetch('api/xfer/join', {
+      join: (sid, proof) => timed('api/xfer/join', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, proof }),
       }).then(json),
-      state: (sid) => fetch(`api/xfer/state?${qs({ sid })}`, { headers: hdr({}) }).then(json),
-      signal: (sid, kind, body) => fetch('api/xfer/signal', {
+      state: (sid) => timed(`api/xfer/state?${qs({ sid })}`, { headers: hdr({}) }).then(json),
+      signal: (sid, kind, body) => timed('api/xfer/signal', {
         method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid, kind, body }),
       }).then(json),
-      turn: (sid) => fetch(`api/xfer/turn?${qs({ sid })}`, { headers: hdr({}) }).then((r) => (r.ok ? r.json() : null)),
-      putSeg: (sid, i, frame) => fetch(`api/xfer/seg?${qs({ sid, i })}`, {
+      turn: (sid) => timed(`api/xfer/turn?${qs({ sid })}`, { headers: hdr({}) }).then((r) => (r.ok ? r.json() : null)),
+      putSeg: (sid, i, frame) => timed(`api/xfer/seg?${qs({ sid, i })}`, {
         method: 'PUT', headers: hdr({ 'Content-Type': 'application/octet-stream' }), body: frame,
       }).then((r) => (r.status === 429 ? Promise.reject(Object.assign(new Error('中转正忙'), { retry: true })) : json(r))),
       getSeg: async (sid, i) => {
-        const r = await fetch(`api/xfer/seg?${qs({ sid, i })}`, { headers: hdr({}) });
+        const r = await timed(`api/xfer/seg?${qs({ sid, i })}`, { headers: hdr({}) });
         if (r.status === 404) return null;
         if (!r.ok) throw new Error(`拉取第 ${i} 块失败 (${r.status})`);
         return new Uint8Array(await r.arrayBuffer());
       },
-      ack: (sid, idx) => fetch('api/xfer/ack', {
+      ack: (sid, idx) => timed('api/xfer/ack', {
         method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid, idx }),
       }).then(json),
-      finish: (sid, kind) => fetch(`api/xfer/${kind}`, {
+      finish: (sid, kind) => timed(`api/xfer/${kind}`, {
         method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid }),
       }).then((r) => r.ok),
     };
@@ -387,7 +401,7 @@
     const emit = () => opts.on && opts.on(Object.assign({}, st));
     // 凭证在闭包里、配对之后才有值 → 用 getter 视图交给 makeApi，
     // 不能把 opts 直接当凭证袋：那样每个请求头都会是 undefined（服务端一律 403）
-    const net = makeApi(role, { get token() { return token; }, get proof() { return proof; } });
+    const net = makeApi(role, { get token() { return token; }, get proof() { return proof; } }, () => cfg);
     const st = {
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
       sentFrames: 0, bytesOnWire: 0, dcFrames: 0, relayFrames: 0,

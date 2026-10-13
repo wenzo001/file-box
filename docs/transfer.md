@@ -125,6 +125,7 @@ HTTP 入口（非安全上下文）没有 WebCrypto 时，走同一套接口的�
 | 发送方建 rtc 时还没配对、`/turn` 回 409 | rtc 必须先于事件流建好（否则会漏掉对方的 offer）。收到 `joined` 之后再补取一次凭证，用 `setConfiguration` 把 relay 服务器加进正在进行的 ICE；否则发送方永远只有本机候选，TURN 形同虚设 |
 | TURN 拿不到 / 被防火墙挡 / 仍然不通 | 转服务器中转；三方都不行 → `retrying`/`failed`，给出可操作文案，不会无限等 |
 | 中转区写入失败、429 太忙 | 指数退避重试 5 次，再失败就把错误报给用户并且可以续传 |
+| **单个请求挂住不返回**（socket 死了但连接没断，`fetch` 既不 resolve 也不 reject） | 每个请求都带 `netTimeoutMs`（默认 30 秒）到点 `abort` 并按"可重试"重投这一块。**没有这层超时时会整段静默停摆**：那一个请求永远占着发送窗口的一个并行槽，槽被吃满之后进度不再动、界面也不报错（2GB 实测停在 506/16385 块，服务器只有 66MB，接收端已把服务器手上的块全存完了）。重投是幂等的：nonce 由 `type/fileId/chunkIdx` 决定，同一块重发的字节完全一样 |
 | 重算校验时某一块从 IndexedDB 读不回来 | **不是降级理由，也不是"文件坏了"**：那一帧服务器手上还有 —— 先补拉这一帧、重新落盘再继续。补拉也拿不到才报"本地和服务器都读不到了，请让对方重发一次"。（600MB 实测：4801 帧全收齐，却卡在第 1799 块的读失败上，整单被判"合成错误"） |
 | 降级之后才迟到的 `offer` / `answer` / `ice` | 收下就算，直接丢掉。此时 rtc 已经关了，拿着 null 去 `takeOffer/takeAnswer` 会把一句 TypeError 顶到用户界面上——传输其实还在正常走中转 |
 
@@ -225,7 +226,8 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 **保存落盘分三条路**（按"能不能不把整份文件攥在 JS 堆里"排序，接收端点保存时自动选）：
 ① 有 File System Access（`showSaveFilePicker` / `showDirectoryPicker`）→ 选真实目录，逐块流式写盘；
 ② 没有 FS Access 但有 OPFS（`navigator.storage.getDirectory`）→ 逐块写进站点私有目录
-`xfer-out/`，交回界面的是**磁盘支撑的 File**，浏览器下载时自己流式读，JS 堆里不攒整份；
+`xfer-out/`，交回界面的是**磁盘支撑的 File**，JS 侧不再攒整份（浏览器自己怎么读这份 File 不在这条判据里，
+进程级内存只能按映像名汇总、会把用户自己开着的 Chrome 算进来，所以不作数）；
 ③ 两样都没有 → 才退回"明文块攒进 Blob"，这一条会占住整份文件的内存（小文件尚可，大文件不合适）。
 因为 ② 落的是**明文**，它有自己明确的清理路径：下载之后 `dropSaved()` 扫干净，
 每次新会话开工前再 `sweepSaved()` 兜一次（上一轮没走完就关页也不留）；
@@ -271,15 +273,25 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 
 ## 10 测试与验证口径
 
-`node --test --test-concurrency=1 "test/*.test.js"` → **86 条全绿 / 0 失败**。
+`node --test --test-concurrency=1 "test/*.test.js"` → **87 条全绿 / 0 失败**。
 （注意：这个仓库里 `node --test test/` 会报 Cannot find module，必须用 glob 形式；
 并行跑会因端口/负载互撞产生一批假的 ETIMEDOUT，所以要 `--test-concurrency=1`。）
 
-同一份代码本轮跑过 5 遍，红的那两遍**不是代码**：600MB 实验室还在同时跑的时候两遍是 80/86 和 83/86，
-红因全是 `connect ETIMEDOUT 127.0.0.1:<端口>` 和 `Error: bad port`，且每遍红的不是同一批；
-等实验室跑完之后再连跑三遍都是 86/86、ETIMEDOUT 计数 0。
-其中一度出现过一条看着像缺陷的 `发送端没收敛到 done` —— 空载三遍里没再出现，
-按"共用的取输入通路"处理（那一秒整台机器在同时打中转端口），记为负载互撞，不记为产品缺陷。
+同一份代码本轮跑过 7 遍。带 600MB 实验室并发的那两遍是 80/86 和 83/86（红 6 条与 3 条），
+红因两类：`connect ETIMEDOUT 127.0.0.1:<端口>`（7391 / 7432 / 7728 / 7839）与 `Error: bad port`，
+外加一条 `发送端没收敛到 done（停在 transferring）`。空载连跑四遍（含改动之后两遍）87/87。
+
+**那条"收敛到 done"后来查清了，不是负载**：它是我自己的判据在**没落定的读数上判卷**——
+那条腿先等接收端 `verified`，然后**立刻**断言发送端已经是 `done`，而发送端要等下一轮把确认账读回来
+才会落定（两个时刻本来就不同）。空载单跑三遍全绿、整跑里红过一次，正是这种时序抖动的形状。
+改成"轮询到落定（上限 20 秒）再断言"，判据内容没变（仍然要求收敛到 done），
+并且下了一刀验证它还会红：把 `net.finish` + `patch({phase:'done'})` 摘掉 → 立刻红
+（"停在 transferring，等了 20007ms"），还原后引擎逐字节回到基线。
+
+剩下的 ETIMEDOUT / bad port 那一族**仍是负载推断，没有单变量复现**：并发条件成立
+（同一时刻另一批进程在打本机回环，机器只剩 7.3GB 空闲物理内存），
+但我没做"只加负载、别的不改"的复现，所以记为疑似，不记为已证的无关红。
+要坐实它：空载连跑三遍取基线，再原样跑一遍 600MB 实验室、同一时间跑套件，比较红因是否只剩端口类错误。
 
 ### 真正执行并有判据的
 
@@ -288,12 +300,14 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 - **600MB 协议级**（`test/big.test.js`，用与浏览器同一份 `xfer-proto.js`）：
   本轮实测 上传 54.1s（11.1MB/s）、下载解密 46.1s（13.0MB/s）、峰值 RSS 147MB、
   前后 SHA-256 一致、盘上只有密文且无原名。
-- **通道决策与降级状态机 14 条**（`test/xfer-channel.test.js`）：背压不降级、真失效才降级、
+- **通道决策与降级状态机 15 条**（`test/xfer-channel.test.js`）：背压不降级、真失效才降级、
   抖动先宽限、接收端超时改标、迟到信令不报错、慢确认不重复 PUT、本地读不到要补拉、
-  确认丢一次必须重试且会话收尾后密文真被清、乱序到达按块号归位、TURN 配对后补凭证。
+  确认丢一次必须重试且会话收尾后密文真被清、乱序到达按块号归位、TURN 配对后补凭证、
+  **请求挂住不返回时必须到点重投（不许把并行槽吃满导致整段停摆）**。
   关键判据逐条配了变异刀（`test/lab/mutate-channel.js`：`no-recheck` / `grace-zero` / `turn` /
   `open-blind` / `late-blind` / `recv-timeout` / `switch-order` / `no-sess-guard` /
-  `degrade-reentrancy` / `no-dedup` / `no-dedup-main` / `ack-drop` / `reverse-read`）。
+  `degrade-reentrancy` / `no-dedup` / `no-dedup-main` / `ack-drop` / `reverse-read` /
+  `no-net-timeout`）。
   两把刀（`switch-order`、`no-sess-guard`）单独下都不见血 —— 那是纵深，已如实登记，不当已证。
 
 ### 真浏览器（两台独立上下文）实测，`test/lab/xfer-big-lab.js`

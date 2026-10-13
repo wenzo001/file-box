@@ -316,7 +316,13 @@ test('传输途中对端重新加入，不许把发送端相位打回"正在配�
   assert.notStrictEqual(sender.state.phase, 'pairing', '一条 joined 把正在传输的发送端打回了"正在配对"');
   const st = await waitVerified(receiver, 60000);
   assert.ok(st.verified, `重连之后传输断了：phase=${st.phase} error=${st.error}`);
-  assert.strictEqual(sender.state.phase, 'done', `发送端没收敛到 done（停在 ${sender.state.phase}），服务器密文就一直不会被清`);
+  // 接收端"校验通过"和发送端"收敛到 done"是两个时刻：后者要等它下一轮把确认账读回来。
+  // 原来这里紧接着就 assert，等于在 unsettled 的读数上判卷 —— 整机一忙就假红（空载单跑三遍全绿、
+  // 整跑里红过一次，就是这么暴露的）。判据本身不变，仍然要求收敛到 done，只是给它落到定的窗口。
+  const t1 = Date.now();
+  while (Date.now() - t1 < 20000 && sender.state.phase !== 'done') await sleep(100);
+  assert.strictEqual(sender.state.phase, 'done',
+    `发送端没收敛到 done（停在 ${sender.state.phase}，等了 ${Date.now() - t1}ms），服务器密文就一直不会被清`);
   assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 61)));
 }));
 
@@ -383,4 +389,26 @@ test('传输中途降级：关 pc 的那一下不许把降级再触发一遍，�
   assert.strictEqual(sender.state.error, '', `发送端同样被报错：${sender.state.error}`);
   assert.ok(sender.state.sentFrames > 0, '这条判据要建立在"降级确实发生在传输中途（已经有块发出去）"之上');
   assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 23)));
+}));
+
+// 2GB 真浏览器实测撞出来的：中转 PUT 的 socket 死了但连接没断时，fetch **既不 resolve 也不 reject**，
+// 就那样一直占着并行槽 —— 四个槽填满之后整段传输静默停摆，界面上没有报错、进度不再动，
+// 只有接收端偶尔冒一句 "Failed to fetch"。这条判据要的是"到点自己散开"，不是"最后碰巧收敛"。
+test('中转 PUT 挂住不返回时，必须到点重投；不许把并行槽吃满导致整段停摆', () => withLab({
+  slot: 85, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, parallel: 4, netTimeoutMs: 400, retryGapMs: 200 },
+}, async ({ env, sender, receiver }) => {
+  const size = 2 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  // 恰好挂住"填满所有并行槽"那么多请求：这就是那一次网络抖动留下的死连接
+  env.counters.hangPut = 4;
+  const code = (await sender.send([{ relPath: 'h.bin', name: 'h.bin', size, mime: 'application/octet-stream', file: fakeFile('h.bin', size, 83) }])).code;
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 15000);
+  assert.ok(st.verified,
+    `挂住的 PUT 没被超时接管：接收端 phase=${st.phase} 只存了 ${st.stored}/${frames} 块，发送端 sentFrames=${sender.state.sentFrames}/${frames}`);
+  // 正向：超时确实触发过重投（挂住的 4 次也算请求）；反向：不许退化成重发风暴
+  assert.ok(env.counters.segPut >= frames + 4 && env.counters.segPut <= frames + 8,
+    `写入次数应落在 ${frames}+4 到 ${frames}+8 之间（超时重投过、但没乱发），实际 ${env.counters.segPut}`);
+  assert.strictEqual(sender.state.phase, 'done', `发送端没收尾：${sender.state.phase}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 83)));
 }));
