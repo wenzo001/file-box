@@ -482,6 +482,24 @@ test('随机令牌形状：32 位 hex，猜中一个的概率可以忽略', () =
   for (let i = 0; i < 200; i++) assert.match(randToken(), /^[a-f0-9]{32}$/);
 });
 
+test('静态 TURN 账号不再下发：匿名建会话+自己配对也领不到长期口令', async () => {
+  // 攻击链本来只要三步：create（无凭证端点）→ 用自己的 proof 配对 → 领凭证。
+  // 长期账号一旦被任意网络对端领走，就不再是"凭证"，而是给外人开放的 TURN 账单。
+  const s9 = await startServer({ TURN_URLS: 'turn:10.9.9.9:3478', TURN_USER: 'ops-static', TURN_PASS: 'SUPER-STATIC-PASS' }, null, 8);
+  try {
+    const c = await createSession(s9);
+    const j = await join(s9, c.sid, c.proof);
+    assert.strictEqual(j.status, 200, '夹具要先成立：自己配对才能过"已配对"这道门');
+    const t = await fetch(`${s9.base}/api/xfer/turn?sid=${c.sid}`, { headers: { 'X-Xfer-Sender': c.body.token } });
+    const body = await t.text();
+    assert.ok(!body.includes('SUPER-STATIC-PASS'), `长期 TURN 口令被匿名请求领走了: ${body}`);
+    assert.strictEqual(t.status, 503, `只配了静态账号就该说没有 TURN，实际 ${t.status}`);
+    const cfg = await (await fetch(`${s9.base}/api/xfer/config`)).json();
+    assert.strictEqual(cfg.turnConfigured, false, '领不到凭证就不能对外说 TURN 可用（客户端会白等一轮 ICE 超时）');
+    assert.match(s9.log(), /静态 TURN|TURN_USER/, '启动时要告诉运维这套配置为什么不再生效');
+  } finally { await s9.stop(); }
+});
+
 /** 开一条事件流、收 ms 毫秒内的所有事件后关掉（只用于验"补发"，不指望 live 事件） */
 async function readEvents(s, sid, role, headers, ms = 900) {
   const ac = new AbortController();

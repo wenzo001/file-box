@@ -124,7 +124,8 @@ HTTP 入口（非安全上下文）没有 WebCrypto 时，走同一套接口的�
 TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证：`username = 过期时间戳:随机串`，
 `credential = base64(HMAC-SHA1(TURN_SECRET, username))`，有效期 `TURN_TTL_SECONDS`；
 长期共享密钥只留在服务端环境变量里，前端拿不到它。TURN 服务器必须以同一个 `static-auth-secret` 配置才能验通。
-`TURN_SECRET` 与静态 `TURN_USER/TURN_PASS` 都没配时，前端不会尝试 TURN。
+没配 `TURN_SECRET` 时服务端不发凭证（静态 `TURN_USER/TURN_PASS` 已不再下发，见 §7），
+`/api/xfer/config` 的 `turnConfigured` 也就是 false，前端不会尝试 TURN、不会白等一轮 ICE 超时。
 
 **配对机制的定位（不夸大）**：这里没有用 PAKE。传输码里真正承担安全的部分是
 `secret`（120 bit 随机，字母表 32 个字符 × 24 位），它不是"人类可猜的短码"，
@@ -144,7 +145,7 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 | `POST /join` | 接收方配对 | proof | 失败计数进限流 |
 | `GET /events` | SSE：`joined/key/confirm/offer/answer/ice/ack/done/cancelled` | sender token 或 proof | 断线后服务端补发最近一条同类信令 |
 | `POST /signal` | 转发一条信令 | 同上 | kind 白名单：offer/answer/ice/key/confirm/channel-ready/xfer-error |
-| `GET /turn` | 领取短期 TURN 凭证 | proof/token | 未配置则返回空 |
+| `GET /turn` | 领取短期 TURN 凭证 | proof/token | 没配 `TURN_SECRET`（含只配了静态账号的情况）一律 503 |
 | `PUT /seg?sid&i` | 上传一帧密文 | sender token | 单帧上限 `XFER_MAX_SEG`，并发上限 `XFER_MAX_INFLIGHT` |
 | `GET /seg?sid&i` | 拉一帧密文 | proof | 幂等：同一 i 返回同一字节 |
 | `GET /state?sid` | 查 uploaded/acked/frames/totalBytes/expiresAt | 任一凭证 | 只回区间，不回内容 |
@@ -178,7 +179,7 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 | `STUN_URLS` | 空 | 逗号分隔 |
 | `TURN_URLS` | 空 | 逗号分隔 |
 | `TURN_SECRET` | 空 | 短期凭证的 HMAC 根密钥；不配就不会用 TURN |
-| `TURN_USER` / `TURN_PASS` | 空 | 静态 TURN 账号（不推荐，优先用 `TURN_SECRET` 派生的短期口令） |
+| `TURN_USER` / `TURN_PASS` | 空 | **已不再下发**：`/api/xfer/create` 是无凭证端点，任何人自建会话、自己配对就能把这份长期账号领走。配了它们而没配 `TURN_SECRET` 时启动会打一行提示，`/turn` 一律 503。请给 coturn 配 `static-auth-secret` 并用 `TURN_SECRET` |
 | `TURN_TTL_SECONDS` | 3600 | 短期 TURN 口令有效期 |
 | `TRUST_PROXY` | 空（server.js） | 反代部署时设 `1`，`req.ip` 才是真实客户端地址；限流按 IP 记账，反代不设的话所有用户共享一个桶 |
 
