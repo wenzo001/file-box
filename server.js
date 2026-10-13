@@ -7,6 +7,9 @@ const express = require('express');
 const selfsigned = require('selfsigned');
 
 const app = express();
+// 反代部署时设 TRUST_PROXY=1（或 express 支持的 trust proxy 配置串），
+// req.ip 才是真实客户端地址 —— 限流按 IP 记账，不设的话反代后所有用户共享一个桶
+if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(express.json({ limit: '2mb' })); // init/finish 这类小 JSON 请求体
 
 // ---- 配置（均可通过环境变量覆盖） ----
@@ -364,19 +367,27 @@ app.put('/api/upload/part', gateParts, express.raw({ type: 'application/octet-st
 });
 
 // 3) 收尾：校验块齐了 → 按序拼成文件 → 迁入 uploads（此时才出现在列表里）
+// 正在拼装中的批次：finish 是逐块删除式的，两次并发 finish 会互相拼坏文件再互相 500，
+// 第二个请求要么等待要么直接拒绝 —— 这里选"在拼的直接 409"，客户端重试会拿到 404/结果
+const assembling = new Set();
+
 app.post('/api/upload/finish', (req, res) => {
   const { uploadId } = req.body || {};
   const meta = isUploadId(uploadId) ? readMeta(uploadId) : null;
   if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
+  if (assembling.has(uploadId)) return res.status(409).json({ error: '该批次正在合并中，请勿重复提交' });
+  assembling.add(uploadId);
+  const done = () => assembling.delete(uploadId);
   const dir = uploadDirOf(uploadId);
   const have = new Set(haveParts(uploadId).map((p) => `${p.f}-${p.c}`));
   const total = meta.files.reduce((s, f) => s + f.chunks.length, 0);
   if (have.size !== total) {
+    done();
     return res.status(409).json({ error: `还有 ${total - have.size} 块没传完`, have: [...have] });
   }
   (async () => {
     try {
-      if (usedBytes() >= STORAGE_LIMIT) return tooLarge(res); // 落盘前再确认一次，别把上限撑破
+      if (usedBytes() >= STORAGE_LIMIT) { done(); return tooLarge(res); } // 落盘前再确认一次，别把上限撑破
       for (let fi = 0; fi < meta.files.length; fi++) {
         const f = meta.files[fi];
         const out = path.join(dir, `${f.enc}.assembling`);
@@ -396,6 +407,7 @@ app.post('/api/upload/finish', (req, res) => {
       }
       const folder = commitStaging(dir); // 名字 = 完成时刻
       forgetUsage(); // 刚搬进 uploads，缓存里的占用已经不准了
+      done();
       res.json({ ok: true, folder, count: meta.files.filter((f) => f.enc !== MANIFEST).length });
     } catch (err) {
       console.error('[上传] 合并分块失败', err);
@@ -403,6 +415,7 @@ app.post('/api/upload/finish', (req, res) => {
       // 留着只会留下拼一半的文件，下次追加拼接就成了坏文件
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 删不掉也得先回复客户端 */ }
       forgetUsage();
+      done();
       try {
         if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
       } catch { /* 连接已经断了，没什么可做的 */ }
@@ -528,6 +541,7 @@ app.get('/api/archive/:folder', async (req, res) => {
 const { createTransferApi } = require('./lib/transfer');
 const transferApi = createTransferApi({
   express,
+  HTTPS_PORT,
   TRANSFER_DIR: process.env.TRANSFER_DIR ? path.resolve(process.env.TRANSFER_DIR) : path.join(__dirname, '.transfer'),
 });
 transferApi.register(app);

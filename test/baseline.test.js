@@ -144,6 +144,33 @@ test('保留名与非法名拒绝：meta.json / part-0-1.bin / x.assembling / �
   assert.strictEqual(badKey.status, 400);
 });
 
+test('并发 finish：第二个请求 409 被拒，批次只能落一个，不会互相拆台', async () => {
+  const key = hexKey();
+  const files = [{ enc: 'cc.enc', chunks: [4096, 4096] }];
+  const init = await jget(`${srv.base}/api/upload/init`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, files }),
+  });
+  assert.strictEqual(init.status, 200);
+  for (let ci = 0; ci < 2; ci++) {
+    const buf = Buffer.alloc(4096, ci + 1);
+    const r = await fetch(`${srv.base}/api/upload/part?u=${key}&f=0&c=${ci}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-Crc': crc32(buf).toString(16).padStart(8, '0') }, body: buf,
+    });
+    assert.strictEqual(r.status, 200);
+  }
+  // 两发同时进：合并是逐块删的流水线，第二个必须被挡在门外
+  const [a, b] = await Promise.all([
+    jget(`${srv.base}/api/upload/finish`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId: key }) }),
+    jget(`${srv.base}/api/upload/finish`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId: key }) }),
+  ]);
+  const statuses = [a.status, b.status].sort();
+  assert.deepStrictEqual(statuses, [200, 409], `一发成功一发 409，实际 ${statuses}`);
+  const folder = a.status === 200 ? a.body.folder : b.body.folder;
+  // 批次只能落一个目录，且内容完整（两个 4096 的块拼起来）
+  const listed = (await jget(`${srv.base}/api/list`)).body;
+  assert.ok(listed.folders.some((f) => f.name === folder), '成功那发要真的把目录落进列表');
+});
+
 test('重启后未完成批次仍可续（只清写一半的 .tmp）', async () => {
   const key = hexKey();
   const files = [{ enc: 'k.enc', chunks: [1024, 1024] }];

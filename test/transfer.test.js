@@ -9,7 +9,7 @@ const path = require('path');
 const { startServer } = require('./helpers');
 
 let srv;
-before(async () => { srv = await startServer({ XFER_TTL_MINUTES: '30', XFER_END_KEEP_MS: '300' }); });
+before(async () => { srv = await startServer({ XFER_TTL_MINUTES: '30', XFER_END_KEEP_MS: '300', XFER_CREATE_LIMIT: '1000' }); });
 after(async () => { await srv.stop(); });
 
 const ABC = 'abcdefghjkmnpqrstuvwxyz123456789'; // 和协议层同一套 32 字符字母表
@@ -133,12 +133,41 @@ test('三级进度：服务端 uploaded 用区间给，acked 只由接收方本�
   const ackBad = await fetch(`${srv.base}/api/xfer/ack`, { method: 'POST', headers: hdr({}), body: JSON.stringify({ sid, proof, idx: [0] }) });
   assert.strictEqual(ackBad.status, 409, '还没配对的会话不接受落盘确认');
   await join(srv, sid, proof);
-  const ack = await fetch(`${srv.base}/api/xfer/ack`, { method: 'POST', headers: hdr({}), body: JSON.stringify({ sid, proof, idx: [0, 1] }) });
-  assert.strictEqual((await ack.json()).acked, 2);
+  // ack 是信任声明而不是可验证事实（P2P 直连的块根本不过服务器）：
+  // 协议帧号空间内的序号都接受；伪造 ack 的攻击面与直接 cancel 相同，不新增风险
+  const ack2 = await fetch(`${srv.base}/api/xfer/ack`, { method: 'POST', headers: hdr({}), body: JSON.stringify({ sid, proof, idx: [0, 1] }) });
+  assert.strictEqual((await ack2.json()).acked, 2);
   await fetch(`${srv.base}/api/xfer/ack`, { method: 'POST', headers: hdr({}), body: JSON.stringify({ sid, proof, idx: [0] }) });
   const st2 = await (await fetch(`${srv.base}/api/xfer/state?sid=${sid}`, { headers: { 'X-Xfer-Proof': proof } })).json();
   assert.strictEqual(st2.acked.length, 1, '重复 ack 不能再累计');
   assert.deepStrictEqual(st2.acked, [[0, 1]]);
+});
+
+test('配对凭证只落哈希：meta.json 里查不到 proof 原文', async () => {
+  const { sid, proof } = await createSession();
+  await join(srv, sid, proof);
+  const raw = fs.readFileSync(path.join(srv.dir, 'transfer', sid, 'meta.json'), 'utf8');
+  assert.ok(!raw.includes(proof), 'proof 原文出现在 meta.json 里，读到目录的人就能重放配对');
+  assert.ok(/proofHash/.test(raw), 'meta.json 应存 proof 摘要');
+});
+
+test('配额绕过堵住：先传小块再覆写成大块，账本要按磁盘实况补账', async () => {
+  // 0.00002GB ≈ 21KB：三段 100B 能全过，逐段覆写成 8192B 就必须开始拒绝
+  const s8 = await startServer({ XFER_LIMIT_GB: '0.00002' }, null, 7);
+  try {
+    const c = await createSession(s8, { totalBytes: 300 });
+    const put = (i, len) => fetch(`${s8.base}/api/xfer/seg?sid=${c.sid}&i=${i}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Xfer-Sender': c.body.token }, body: crypto.randomBytes(len),
+    });
+    for (let i = 0; i < 3; i++) assert.strictEqual((await put(i, 100)).status, 200);
+    // 原缺陷：覆写不计账，三段各涨到 8192B → 盘上 24576B 账面还是 300B。
+    // 补账后：前两段覆写账面 16484 还能过，涨第三段（+8092）就该被挡
+    assert.strictEqual((await put(0, 8192)).status, 200);
+    assert.strictEqual((await put(1, 8192)).status, 200);
+    assert.strictEqual((await put(2, 8192)).status, 413, '覆写涨大的部分要计入配额');
+    const st = await (await fetch(`${s8.base}/api/xfer/state?sid=${c.sid}`, { headers: { 'X-Xfer-Sender': c.body.token } })).json();
+    assert.ok(st.bytes <= 21474, `账面字节数 ${st.bytes} 超过了配额记账`);
+  } finally { await s8.stop(); }
 });
 
 test('done 必须等每块都被确认；完成后密文要被清掉，同一个码不能重开', async () => {
