@@ -27,6 +27,10 @@
     dcRegraceMs: 5000,              // disconnected 后的宽限：能自己回到 connected 就不必掐掉一条直连
     retryGapMs: 5000,               // 同一帧两次重发之间至少隔这么久：否则慢确认会被当成"没送到"反复重发
     netTimeoutMs: 30000,            // 单个请求的耐心：超时不算失败到底，只把这一槽位放出来重投
+    stallMs: 60000,                 // 主发送循环里"任何一块都没进展"的耐心。只用于主循环：
+                                    // 那一段 sentFrames 本该连续推进；而"发完了等对方逐块确认/校验"
+                                    // 那一段本来就可能几分钟没有发送侧进展（2GB 的校验就要几分钟），
+                                    // 它有自己的 1200×500ms 上界，不该被这把尺子量。
   };
 
   // ---------------- 加密线程池（主线程绝不碰 AES/SHA，否则手机端页面会冻） ----------------
@@ -571,6 +575,22 @@
         await sendSeq(0);                       // 清单先到，接收端才知道后面怎么摆
         let cursor = 1;
         const inflight = new Set();
+        // 卡住看门狗：主循环每 300ms 转一圈，可"在转圈"不等于"在前进"。
+        // sendSeq 里除了网络还有别的会永远不回来的 await（比如某个加密线程被浏览器杀掉：
+        // postMessage 发出去了、onmessage 再也不来），那种情况下并行槽被占满、
+        // 进度不再动、界面也不报错 —— 2GB 实测撞到的就是这种"静默挂着"。
+        // 这里不假装能救活（救不活），只保证**不装死**：一段时间任何一块都没有进展，就把话说出来，
+        // 并且留在可以继续的档位上，而不是停在"传输中"永远等一个不会来的东西。
+        let beatKey = '', beatAt = Date.now();
+        const stalled = () => {
+          const now = Date.now();
+          // 暂停是用户按的，不是卡住：暂停期间不检查，恢复时把计时基准挪过去，
+          // 否则"按下暂停 → 过一分钟继续"会被报成卡住（假警报比沉默更糟）
+          if (paused) { beatAt = now; return false; }
+          const key = `${st.sentFrames}|${acked.size}|${cursor}`;
+          if (key !== beatKey) { beatKey = key; beatAt = now; return false; }
+          return now - beatAt > cfg.stallMs;
+        };
         while (cursor < st.frames || inflight.size) {
           if (closed) return;
           while (paused) await sleep(150);
@@ -588,6 +608,7 @@
           if (inflight.size) await Promise.race([...[...inflight].map((x) => x.p), sleep(300)]);
           await refreshAck();
           if (st.error && st.phase === 'retrying' && acked.size === st.frames) patch({ error: '', phase: 'transferring' });
+          if (stalled()) { fail(`传输卡住了：${Math.round(cfg.stallMs / 1000)} 秒没有任何一块有进展；点"继续"接着传`, true); return; }
         }
         for (let guard = 0; guard < 1200 && acked.size < st.frames; guard++) {
           if (closed) return;
@@ -605,9 +626,22 @@
           }
         }
         if (acked.size === st.frames) {
-          await net.finish(st.sid, 'done');
-          patch({ phase: 'done' });
-          writeLs('sender', st.sid, null);
+          // 收尾以前是"请求发出去就算成"：服务器 409 拒收时界面照样报"传输完成"，
+          // 而服务器账本还停在 paired —— 中转配额不释放，同时对用户撒了谎（实测：账本 paired / 界面说完成）。
+          // 现在只认服务器的答复；挂住或抖动就重投，四次都不成也留在"可以继续"的档位，不报死。
+          let accepted = false;
+          for (let i = 0; i < 4 && !accepted; i++) {
+            if (closed) return;
+            try { accepted = await net.finish(st.sid, 'done'); }
+            catch { /* 超时或抖动：下一轮再来，别把已经传完的一单报成失败 */ }
+            if (!accepted && i < 3) await sleep(400 * (i + 1));
+          }
+          if (accepted) {
+            patch({ phase: 'done' });
+            writeLs('sender', st.sid, null);
+          } else {
+            fail('这一单内容都传完了，但服务器没收下收尾；点"继续"可以再收一次', true);
+          }
         } else {
           fail('等接收端落盘的超时了；可以点"继续"接着传', true);
         }

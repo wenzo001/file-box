@@ -133,6 +133,9 @@ function boot({ link, base }) {
         const back = (data) => this.onmessage && this.onmessage({ data: Object.assign({ id: msg.id }, data) });
         try {
           if (msg.op === 'sha256') back({ hex: P.hex(await P.sha256(new Uint8Array(msg.bytes))) });
+          // 注入"某个加密线程再也不回话"（真浏览器里对应 worker 被杀/卡死：postMessage 发出去了，
+          // onmessage 永远不会来）。这是 sendSeq 里第三个也会永久挂住的 await 点。
+          else if (msg.op === 'seal' && counters.stuckSeal > 0) { counters.stuckSeal--; }
           else if (msg.op === 'seal') back({ frame: await P.seal({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), type: msg.type, fileId: msg.fileId, chunkIdx: msg.chunkIdx, plaintext: new Uint8Array(msg.plaintext) }) });
           else if (msg.op === 'open') {
             const r = await P.open({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), frame: new Uint8Array(msg.frame) });
@@ -175,7 +178,7 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0 };
+  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0 };
   const nativeFetch = g.fetch;
   defg('fetch', (url, opt = {}) => {
     const u = String(url).startsWith('http') ? String(url) : base + '/' + String(url).replace(/^\//, '');
@@ -187,6 +190,21 @@ function boot({ link, base }) {
     if (pathname === '/api/xfer/ack' && method === 'POST' && counters.failAck > 0) {
       counters.failAck--;
       return Promise.reject(new TypeError('fetch 失败（夹具注入）'));
+    }
+    // 收尾那一步也会挂住 / 被服务器拒收（还有块没确认落盘）。这两条是真浏览器 2GB 那一跑之后
+    // 顺着"裸 fetch 没有超时"这条线扫出来的第二个洞：收尾没成，界面却已经报"传输完成"。
+    if (pathname === '/api/xfer/done' && method === 'POST') {
+      if (counters.hangFinish > 0) {
+        counters.hangFinish--;
+        return new Promise((_res, rej) => {
+          const sig = opt && opt.signal;
+          if (sig) sig.addEventListener && sig.addEventListener('abort', () => rej(new DOMException('Aborted', 'AbortError')));
+        });
+      }
+      if (counters.refuseFinish > 0) {
+        counters.refuseFinish--;
+        return Promise.resolve(new Response(JSON.stringify({ error: '还有块没被接收端确认落盘' }), { status: 409 }));
+      }
     }
     // 注入"请求挂住不返回"：真浏览器里 socket 死了但连接没断时 fetch 就是这个样子 ——
     // 它既不 resolve 也不 reject，只会一直占着那个并行槽（2GB 实测就是这么整段停摆的）。

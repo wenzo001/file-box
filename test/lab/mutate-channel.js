@@ -107,6 +107,17 @@ const KNIVES = {
     from: '      const t = setTimeout(() => ac.abort(), ms);',
     to: '      const t = 0;',
   },
+  // 刀十六：收尾只看"请求发出去了"、不看服务器怎么答 —— 「服务器拒收收尾不许报完成」那条腿必须红
+  //         （这正是改前的真实行为：界面说完成，服务器账本还写着 paired，密文永远占着配额）
+  'finish-blind': {
+    from: '          if (accepted) {',
+    to: '          if (true) {',
+  },
+  // 刀十七：把"卡住看门狗"关掉 —— 加密线程不回话那一条腿必须回红（静默挂着，界面上什么也没有）
+  'no-stall-watch': {
+    from: '          if (stalled()) { fail(',
+    to: '          if (false && stalled()) { fail(',
+  },
 };
 
 const mode = process.argv[2];

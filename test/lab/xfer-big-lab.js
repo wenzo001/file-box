@@ -420,9 +420,13 @@ async function main() {
       // 心跳：这一等最长 15 分钟，没有它的话"卡住"和"还在传"在输出上长得一模一样
       // （2026-10-13 一次 24MB 跑就在此处静默卡满 10 分钟，机器上当时只剩 7GB 空闲内存）
       if (beat++ % 10 === 0) {
+        const sd = (await readState(pa)) || {};
         console.log(`   … +${((Date.now() - t1) / 1000).toFixed(0)}s 接收 phase=${last.phase || '?'} `
           + `stored=${last.stored || 0}/${last.frames || '?'} verified=${!!last.verified} `
           + `chan=${last.channel || '?'} err=${last.error || '无'}`);
+        // 发送端那一侧也一起打：只有两端都在动的时候，"接收端不动"才说明问题在接收侧
+        console.log(`      发送 sent=${sd.sentFrames || 0}/${last.frames || '?'} `
+          + `已投${sd.relayFrames || 0}/道传${sd.dcFrames || 0} phase=${sd.phase || '?'} err=${sd.error || '无'}`);
       }
       if (last.verified || last.phase === 'failed') break;
       await sleep(1500);

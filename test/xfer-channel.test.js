@@ -62,7 +62,10 @@ test('P2P 正常但缓冲区满（背压）时，不许把剩下的块改投服�
   // 传输本身要成、内容要逐字节对得上、进度不许重复累计
   assert.ok(st.verified, `接收端没通过校验：phase=${st.phase} error=${st.error}`);
   assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 11)), '内容不对');
-  assert.strictEqual(sender.state.phase, 'done');
+  // 同样要等发送端自己落定：done 是它读完自己那一轮确认账之后才出现的，不跟着接收端的 verified 一起到
+  const tD = Date.now();
+  while (Date.now() - tD < 20000 && sender.state.phase !== 'done') await sleep(100);
+  assert.strictEqual(sender.state.phase, 'done', `发送端没收尾：${sender.state.phase}（等了 ${Date.now() - tD}ms）`);
   assert.ok(sender.state.sentFrames <= frames + 2, `发送帧数 ${sender.state.sentFrames} > 应有 ${frames}，进度重复累计了`);
   // 判据一：通道没失效就不许降级
   assert.strictEqual(sender.state.channel, 'p2p', `通道被判成 ${sender.state.channel}，背压不是断线`);
@@ -406,9 +409,124 @@ test('中转 PUT 挂住不返回时，必须到点重投；不许把并行槽吃
   const st = await waitVerified(receiver, 15000);
   assert.ok(st.verified,
     `挂住的 PUT 没被超时接管：接收端 phase=${st.phase} 只存了 ${st.stored}/${frames} 块，发送端 sentFrames=${sender.state.sentFrames}/${frames}`);
+  // 发送端的 done 要等它自己那一轮账读回来才落定 —— 接收端 verified 之后立刻断言会读到没收敛的一帧
+  // （整跑里就是这么红过一次，和本批 leg 83 是同一根病：借"A 稳了"推"B 也该稳了"）
+  const tDone = Date.now();
+  while (Date.now() - tDone < 20000 && sender.state.phase !== 'done') await sleep(100);
   // 正向：超时确实触发过重投（挂住的 4 次也算请求）；反向：不许退化成重发风暴
   assert.ok(env.counters.segPut >= frames + 4 && env.counters.segPut <= frames + 8,
     `写入次数应落在 ${frames}+4 到 ${frames}+8 之间（超时重投过、但没乱发），实际 ${env.counters.segPut}`);
-  assert.strictEqual(sender.state.phase, 'done', `发送端没收尾：${sender.state.phase}`);
+  assert.strictEqual(sender.state.phase, 'done', `发送端没收尾：${sender.state.phase}（等了 ${Date.now() - tDone}ms）`);
   assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 83)));
+}));
+
+// 顺着"裸 fetch 没有超时"这条线往下扫的第二站：收尾那一步（POST /api/xfer/done）。
+// 它挂住的时候整单已经传完了，却因为一个收尾请求把用户推进死路（failed），密文也不释放。
+test('收尾请求挂住时必须重试并真的收尾，不许把已经传完的一单报成失败', () => withLab({
+  slot: 86, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 300, parallel: 4 },
+}, async ({ env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'f.bin', name: 'f.bin', size, mime: 'application/octet-stream', file: fakeFile('f.bin', size, 91) }])).code;
+  // 注入必须在 accept 之前挂上：整单很短，等 verified 之后再设，收尾早就发完了（第一版就是这么空转的）
+  env.counters.hangFinish = 1;
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 30000);
+  assert.ok(st.verified, `接收端没校验通过：phase=${st.phase} error=${st.error}`);
+  // 计数要**在断言那一刻**读：收尾的第二投是在这之后才发生的，提前抓一份快照会把"确实重投过"
+  // 判成"只发了一次"（第一版就是这么红的 —— 红因在量具上，不在产品上）
+  const attempts = () => env.counters.byPath['POST /api/xfer/done'] || 0;
+  const t = Date.now();
+  while (Date.now() - t < 20000 && sender.state.phase !== 'done') await sleep(100);
+  assert.strictEqual(sender.state.phase, 'done',
+    `收尾挂住一次之后没能重投回来：phase=${sender.state.phase} error=${sender.state.error} 收尾尝试=${attempts()} 次`);
+  assert.ok(attempts() >= 2, `判据要建立在"收尾确实重发过"之上，实际只发了 ${attempts()} 次`);
+}));
+
+// 服务器拒收收尾（还有块没被确认落盘）时，客户端原来只看 fetch 成没成、不看响应 —— 于是
+// 界面报"传输完成"，服务器那边状态还停在 paired、密文永远占着中转配额。**这是假成功**。
+// 这里把"服务器到底怎么写的"当成判据（meta.json），不看客户端自己怎么说。
+test('服务器拒收收尾时，不许把界面报成"传输完成"（要看响应，不是看请求发没发出去）', () => withLab({
+  slot: 87, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, parallel: 4 },
+  serverEnv: { XFER_END_KEEP_MS: '4000' },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'q.bin', name: 'q.bin', size, mime: 'application/octet-stream', file: fakeFile('q.bin', size, 97) }])).code;
+  env.counters.refuseFinish = 1;                  // 第一次收尾被 409 挡回来
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 30000);
+  assert.ok(st.verified, `接收端没校验通过：phase=${st.phase} error=${st.error}`);
+  const t = Date.now();
+  while (Date.now() - t < 20000 && sender.state.phase !== 'done') await sleep(100);
+  // 客户端最终要落定在 done（拒收过一次之后重投成功）
+  assert.strictEqual(sender.state.phase, 'done',
+    `收尾被拒之后没收敛：phase=${sender.state.phase} error=${sender.state.error} `
+    + `收尾尝试=${env.counters.byPath['POST /api/xfer/done'] || 0} 次 `
+    + `已确认=${sender.state.stored || '?'}/${sender.state.frames || '?'}`);
+  // 而且"报完成"必须与服务器账本一致：meta 里的状态真的是 done（或目录已清）
+  const sid = (await env.P.parseCode(code)).sid;
+  const metaPath = path.join(srv.dir, 'transfer', sid, 'meta.json');
+  const gone = !fs.existsSync(metaPath);
+  const persisted = gone ? null : JSON.parse(fs.readFileSync(metaPath, 'utf8')).state;
+  assert.ok(gone || persisted === 'done',
+    `界面说完成了，服务器账本却还写着 ${persisted} —— 收尾没成就不许报"传输完成"（密文也不会被清）`);
+  assert.ok((env.counters.byPath['POST /api/xfer/done'] || 0) >= 2, '判据要建立在"被拒之后确实重投过"之上');
+}));
+
+// 上面那条只拒一次，重投就成功了 —— 所以它对"客户端不看响应"这把刀是**等价变异**（我试出来过：
+// 把 if (accepted) 改成 if (true) 三条腿全绿）。这条把拒收变成一直拒，
+// 于是唯一能区分"看请求"和"看答复"的就是这条判据：客户端不许宣称完成，也不许把服务器没认的单据说成收尾了。
+test('收尾被一直拒收时，客户端不许宣称"完成"，报错要留在可以继续的档位', () => withLab({
+  slot: 89, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, parallel: 4 },
+  serverEnv: { XFER_END_KEEP_MS: '4000' },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'n.bin', name: 'n.bin', size, mime: 'application/octet-stream', file: fakeFile('n.bin', size, 109) }])).code;
+  env.counters.refuseFinish = 99;                 // 收尾一直被 409 挡
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 30000);
+  assert.ok(st.verified, `接收端没校验通过：phase=${st.phase} error=${st.error}`);
+  const t = Date.now();
+  // 等到"我关心的那件事落定"再读，而不是"相位一变就读"：相位可能因为别的瞬时错误先离开
+  // transferring，那一刻屏上挂着的是别的话，判据就会把产品没做错的地方报成红（第一版就是这么抖的）
+  while (Date.now() - t < 20000) {
+    const s = sender.state;
+    if (s.phase === 'done' || /收尾/.test(s.error)) break;
+    await sleep(100);
+  }
+  const s = sender.state;
+  assert.notStrictEqual(s.phase, 'done',
+    `服务器四次都没收下收尾（拒收=${env.counters.byPath['POST /api/xfer/done'] || 0} 次），界面却直接报"传输完成" —— 这是假成功`);
+  assert.ok(/继续|重试/.test(s.error), `要给出可操作动作，实际 phase=${s.phase} error="${s.error}"`);
+  const sid = (await env.P.parseCode(code)).sid;
+  const meta = JSON.parse(fs.readFileSync(path.join(srv.dir, 'transfer', sid, 'meta.json'), 'utf8'));
+  assert.strictEqual(meta.state, 'paired', `服务器账本和界面要说同一件事：账本=${meta.state}，界面 phase=${s.phase}`);
+}));
+
+// 2GB 那一跑反复撞到的形状：进度不再动，界面也不报错，会话就那么挂着。
+// 网络那一侧已经有超时兜着了（上面那条腿），但 sendSeq 里还有别的 await 点会永远不回来 ——
+// 比如某个加密线程被浏览器杀掉：postMessage 发出去、onmessage 再也不来，那一格并行窗口就没了。
+// 这条要的不是"救活"（worker 死了救不活），而是**不许装死**：一段时间一块都没进展，必须说出来并且可续传。
+test('没有任何一块有进展时，不许静默挂着：到点必须把"卡住了"说出去', () => withLab({
+  slot: 88, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, parallel: 4, stallMs: 900, netTimeoutMs: 400 },
+}, async ({ env, sender, receiver }) => {
+  const size = 4 * MB;
+  const code = (await sender.send([{ relPath: 's.bin', name: 's.bin', size, mime: 'application/octet-stream', file: fakeFile('s.bin', size, 103) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12000 && !sender.state.sentFrames) await sleep(50);
+  const base = sender.state.sentFrames;
+  assert.ok(base > 0, `夹具坏了：一条帧都没发出去就没法证明"之后不动了"（phase=${sender.state.phase} error=${sender.state.error}）`);
+  env.counters.stuckSeal = 4;                     // 恰好把 4 个并行槽全喂给不回话的线程
+  const t = Date.now();
+  let hit = null;
+  while (Date.now() - t < 12000) {
+    const s = sender.state;
+    if (['retrying', 'failed'].includes(s.phase) && /卡住/.test(s.error)) { hit = s; break; }
+    await sleep(150);
+  }
+  assert.ok(hit, `卡住之后一路静默：phase=${sender.state.phase} error="${sender.state.error}" `
+    + `（发出 ${sender.state.sentFrames}/${base} 块之后不动了，界面上什么也没有）`);
+  assert.notStrictEqual(sender.state.phase, 'done', '一块都没进展却报"传输完成"');
+  assert.notStrictEqual(receiver.state.verified, true, '发送端卡住了接收端却被判通过');
+  assert.ok(/继续|重试/.test(sender.state.error), `报错要给出可操作动作，实际="${sender.state.error}"`);
 }));
