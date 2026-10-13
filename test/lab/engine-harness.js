@@ -76,7 +76,8 @@ class FakePC {
     }
   }
   async addIceCandidate() {}
-  async getStats() { const arr = []; arr.forEach = Array.prototype.forEach.bind(arr); return arr; }
+  setConfiguration(c) { this.link.setConfigs.push(c); return true; }
+  async getStats() { const arr = this.link.stats || []; arr.forEach = Array.prototype.forEach.bind(arr); return arr; }
   close() {
     if (this.connectionState === 'closed') return; // 真 pc.close() 不会再触发状态回调；不拦住就是引擎↔桩的无限递归
     this.connectionState = 'closed';
@@ -91,6 +92,7 @@ function makeLink(opts = {}) {
     drainRate: opts.drainRate || 2 * 1024 * 1024,
     highMark: opts.highMark || 4 * 1024 * 1024,
     dcSends: 0, dcBytes: 0, maxBuffered: 0,
+    setConfigs: [], stats: null,
     a: null, b: null, aCh: null, bCh: null,
     other(ch) { return ch === link.aCh ? link.bCh : ch === link.bCh ? link.aCh : null; },
     /** 模拟 ICE 选通、通道打开 */

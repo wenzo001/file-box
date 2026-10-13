@@ -24,6 +24,7 @@
     dcBufferHigh: 4 * 1024 * 1024,
     dcBufferLow: 1 * 1024 * 1024,   // 背压恢复的低水位：降到这里才继续发（配合 bufferedamountlow）
     dcDrainTimeoutMs: 30000,        // 缓冲 30 秒还排不动 = 链路真的不行了，这时才允许降级
+    dcRegraceMs: 5000,              // disconnected 后的宽限：能自己回到 connected 就不必掐掉一条直连
     retryGapMs: 5000,               // 同一帧两次重发之间至少隔这么久：否则慢确认会被当成"没送到"反复重发
   };
 
@@ -340,6 +341,8 @@
         } catch { return open ? 'p2p' : 'none'; }
       },
       close() { try { dc && dc.close(); } catch { /* noop */ } try { pc.close(); } catch { /* noop */ } },
+      // 配对之后才拿到 TURN 凭证时，用它把 relay 服务器补进 ICE（不需要重建 pc）
+      setConfig(c) { try { pc.setConfiguration(c); return true; } catch { return false; } },
     };
     function flush() { const list = early.splice(0); list.forEach((c) => api.ice(c)); }
     return api;
@@ -532,6 +535,13 @@
       if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
       // 通道说明走 note：写进 error 会让整块状态（含"校验通过"）一直显示成报错色
       patch({ channel: to, note: why || st.note });
+    }
+    let regraceTimer = null;
+    /** 认定直连已失效：改走中转并把该跑的循环叫起来（幂等，重复调用不会重复降级） */
+    function degradeNow(why) {
+      if (st.channel === 'server_relay') return;
+      switchChannel('server_relay', `直连中断（${why}），已改用服务器中转（只传密文）`);
+      afterHandshake();
     }
 
     // ---------- 发送端主循环（并行窗口 + 只补没确认的块） ----------
@@ -880,6 +890,22 @@
     }
 
     // ---------- 通道 ----------
+    let turnApplied = false;
+    /**
+     * 发送方的 rtc 必须先于事件流建好（否则会漏掉对方的 offer），可那一刻会话还没配对，
+     * /turn 会 409 —— 于是发送方永远拿不到 relay 候选，TURN 形同虚设。
+     * 收到 joined 之后补取一次，并用 setConfiguration 把 relay 服务器加进正在进行的 ICE。
+     */
+    async function upgradeIceWithTurn() {
+      if (turnApplied || !rtc) return;
+      const t = await net.turn(st.sid).catch(() => null);
+      if (!t || !t.urls || !t.urls.length) return; // 服务器没配 TURN 就是没有，不是错误
+      turnApplied = true;
+      iceServers = iceServers.filter((s) => !s.credential).concat([{ urls: t.urls, username: t.username, credential: t.credential }]);
+      if (!rtc.setConfig({ iceServers })) {
+        console.log('[无痕] 该浏览器不支持配对后补 TURN：直连失败时只能走服务器中转');
+      }
+    }
     async function setupChannel() {
       const c = await net.config().catch(() => null);
       const caps = global.XferEngine.capabilities();
@@ -887,21 +913,32 @@
       iceServers = (c.stun || []).map((u) => ({ urls: u }));
       if (c.turnConfigured) {
         const t = await net.turn(st.sid).catch(() => null);
-        if (t && t.urls && t.urls.length) iceServers.push({ urls: t.urls, username: t.username, credential: t.credential });
+        if (t && t.urls && t.urls.length) {
+          iceServers.push({ urls: t.urls, username: t.username, credential: t.credential });
+          turnApplied = true; // 接收方走到这里时已经配对，凭证一次就拿到了
+        }
       }
       rtc = p2p(iceServers, {
         onIce: (json) => { net.signal(st.sid, 'ice', JSON.stringify(json)).catch(() => {}); },
         onFrame: (frame) => { if (role === 'receiver') acceptFrame(frame).catch((e) => fail(e.message || e)); },
         onState: async (state, open) => {
           if (open) {
+            if (regraceTimer) { clearTimeout(regraceTimer); regraceTimer = null; } // 自己回来了，之前的"要降级"作废
             const mode = await rtc.mode();
             switchChannel(mode); // 直连/TURN 各自的说明由界面 CHAN 文案给，不重复塞一句
             afterHandshake();
-          } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-            if (st.channel !== 'server_relay') {
-              switchChannel('server_relay', `直连中断（${state}），已改用服务器中转（只传密文）`);
-              afterHandshake();
-            }
+          } else if (state === 'failed' || state === 'closed') {
+            degradeNow(state);
+          } else if (state === 'disconnected') {
+            // disconnected 常常几秒内自己回到 connected（切网、休眠唤醒、ICE 重选）。
+            // 立刻降级会把一条还能用的直连主动掐掉，所以先等 dcRegraceMs，确实回不来才降级。
+            if (regraceTimer) return;
+            regraceTimer = setTimeout(() => {
+              regraceTimer = null;
+              if (!rtc || rtc.open) return;
+              degradeNow('disconnected');
+            }, cfg.dcRegraceMs);
+            if (regraceTimer.unref) regraceTimer.unref();
           }
         },
       });
@@ -922,7 +959,7 @@
       const headers = role === 'sender' ? { 'X-Xfer-Sender': token } : { 'X-Xfer-Proof': proof };
       link = sse(url, headers, async (name, data) => {
         try {
-          if (name === 'joined') patch({ phase: 'pairing' });
+          if (name === 'joined') { patch({ phase: 'pairing' }); upgradeIceWithTurn().catch(() => {}); }
           else if (name === 'key') await onPeerKey(data.body);
           else if (name === 'confirm') await onPeerConfirm(data.body);
           else if (name === 'offer') { const sdp = await rtc.takeOffer(data.body); await net.signal(st.sid, 'answer', sdp).catch(() => {}); }
@@ -942,6 +979,7 @@
     function close() {
       closed = true;
       if (liveSession[role] === api) liveSession[role] = null;
+      if (regraceTimer) { clearTimeout(regraceTimer); regraceTimer = null; }
       timers.forEach(clearTimeout);
       timers.length = 0;
       if (link) link.close();

@@ -14,11 +14,11 @@ const FRAME = 131072;
 
 /** 一条用例的完整生命周期：起服务、装台架、跑 body、保证关掉两端会话再停服务 */
 async function withLab(opts, body) {
-  const srv = await startServer({ XFER_CREATE_LIMIT: '1000' }, null, opts.slot);
+  const srv = await startServer(Object.assign({ XFER_CREATE_LIMIT: '1000' }, opts.serverEnv || {}), null, opts.slot);
   const link = makeLink({ drainRate: opts.drainRate });
   const env = boot({ link, base: srv.base });
-  const sender = env.E.Session({ role: 'sender', on() {} });
-  const receiver = env.E.Session({ role: 'receiver', on() {} });
+  const sender = env.E.Session({ role: 'sender', on() {}, config: opts.cfg });
+  const receiver = env.E.Session({ role: 'receiver', on() {}, config: opts.cfg });
   try {
     return await body({ srv, link, env, sender, receiver });
   } finally {
@@ -111,4 +111,65 @@ test('服务器中转单独一条路：没有通道可用时也要能传完并�
   const tdir = path.join(srv.dir, 'transfer');
   const segs = fs.readdirSync(tdir).flatMap((d) => fs.readdirSync(path.join(tdir, d)).filter((f) => /^seg-\d+\.bin$/.test(f)));
   assert.ok(segs.length >= frames, `中转区磁盘上应有 ${frames} 个密文分段，实际 ${segs.length}`);
+}));
+
+test('直连只是抖一下（disconnected 后又自己回来）时，不许把它掐掉改走中转', () => withLab({ slot: 74, drainRate: 8 * MB, cfg: { dcRegraceMs: 1500 } }, async ({ link, env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'd.bin', name: 'd.bin', size, mime: 'application/octet-stream', file: fakeFile('d.bin', size, 3) }])).code;
+  assert.ok(await waitChannels(link), '夹具坏了：两端通道没建起来');
+  link.connect();
+  await receiver.accept(code);
+  await sleep(300);
+  link.a.connectionState = 'disconnected';
+  link.a.onconnectionstatechange();          // 通道本身还开着：这就是一次抖动
+  await sleep(2400);                          // 比宽限期还长
+  assert.strictEqual(sender.state.channel, 'p2p', `一次 disconnected 就把直连掐了（channel=${sender.state.channel}）`);
+  assert.strictEqual(env.counters.segPut, 0, '抖动期间不该产生任何中转写入');
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `抖完之后没能传完：phase=${st.phase} error=${st.error}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 3)));
+}));
+
+test('disconnected 过了宽限期仍然没回来，这时才降级走中转', () => withLab({ slot: 75, drainRate: 2 * MB, cfg: { dcRegraceMs: 900 } }, async ({ link, env, sender, receiver }) => {
+  const size = 12 * MB;   // 排速 2MB/s：降级发生在传输中途，而不是"已经传完了才降级"
+  const code = (await sender.send([{ relPath: 'g.bin', name: 'g.bin', size, mime: 'application/octet-stream', file: fakeFile('g.bin', size, 7) }])).code;
+  assert.ok(await waitChannels(link), '夹具坏了：两端通道没建起来');
+  link.connect();
+  await receiver.accept(code);
+  await sleep(250);
+  link.drop();                                // 通道真的没了
+  link.a.connectionState = 'disconnected';
+  link.a.onconnectionstatechange();
+  await sleep(300);                            // 宽限期 900ms 之内再看一次
+  assert.strictEqual(sender.state.channel, 'p2p', '宽限期内就降级了，没给 ICE 自己恢复的机会');
+  const st = await waitVerified(receiver, 60000);
+  assert.strictEqual(sender.state.channel, 'server_relay', '过了宽限期仍没回来才该降级');
+  assert.ok(st.verified, `降级后没能传完：phase=${st.phase} error=${st.error}`);
+  assert.ok(env.counters.segPut > 0, '降级后应当有中转写入');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 7)));
+}));
+
+test('TURN：发送方建链时还没配对拿不到凭证，joined 之后必须补进 ICE', () => withLab({
+  slot: 76, drainRate: 8 * MB,
+  serverEnv: { TURN_URLS: 'turn:10.20.30.40:3478', TURN_SECRET: 'lab-secret', TURN_TTL_SECONDS: '600' },
+}, async ({ link, sender, receiver }) => {
+  const size = 1 * MB;
+  const code = (await sender.send([{ relPath: 't.bin', name: 't.bin', size, mime: 'application/octet-stream', file: fakeFile('t.bin', size, 21) }])).code;
+  assert.ok(await waitChannels(link), '夹具坏了：两端通道没建起来');
+  link.stats = [
+    { type: 'candidate-pair', selected: true, localCandidateId: 'l1', remoteCandidateId: 'r1' },
+    { type: 'local-candidate', id: 'l1', candidateType: 'relay' },
+    { type: 'remote-candidate', id: 'r1', candidateType: 'host' },
+  ];
+  link.connect();
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 8000 && !link.setConfigs.length) await sleep(100);
+  const cfg = link.setConfigs[0];
+  assert.ok(cfg, 'joined 之后没往 pc 上补 TURN 配置：发送方永远拿不到 relay 候选');
+  const turn = (cfg.iceServers || []).find((s) => String(s.urls).includes('turn:'));
+  assert.ok(turn, `补的配置里没有 TURN 服务器：${JSON.stringify(cfg.iceServers)}`);
+  assert.match(turn.username, /^\d+:[a-f0-9]{16}$/, '补的应当是短期凭证（用户名带过期时间戳）');
+  assert.ok(Number(turn.username.split(':')[0]) >= Math.floor(Date.now() / 1000), '过期时间必须在将来');
+  assert.strictEqual(sender.state.channel, 'turn_relay', '选中 relay 候选时要报 turn_relay，不能报成"直连"');
 }));
