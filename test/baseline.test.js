@@ -159,16 +159,28 @@ test('并发 finish：第二个请求 409 被拒，批次只能落一个，不�
     assert.strictEqual(r.status, 200);
   }
   // 两发同时进：合并是逐块删的流水线，第二个必须被挡在门外
+  const beforeFolders = (await jget(`${srv.base}/api/list`)).body.folders.length;
   const [a, b] = await Promise.all([
     jget(`${srv.base}/api/upload/finish`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId: key }) }),
     jget(`${srv.base}/api/upload/finish`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId: key }) }),
   ]);
   const statuses = [a.status, b.status].sort();
-  assert.deepStrictEqual(statuses, [200, 409], `一发成功一发 409，实际 ${statuses}`);
+  // 真正不许破的不变量是"只落一个目录、另一发被拒"，不是"第二发必须报哪一种拒"：
+  // 两发同时挤进来 ⇒ 第二发看见锁被占，409「正在合并」；
+  // 第一发整段做完了第二发才开始 ⇒ 批次已经被删，404「没有这个上传」。
+  // 两种都是正确答案，走哪条取决于调度 —— 把它钉成 [200,409] 就成了一条靠运气过的判据
+  // （整跑到 baseline 这一档时系统正忙，实测红过一次：实际 200,404）。
+  assert.strictEqual(statuses[0], 200, `必须恰好有一发成功，实际 ${statuses}`);
+  assert.ok([404, 409].includes(statuses[1]), `另一发必须被拒（404 已合并完 / 409 正在合并），实际 ${statuses}`);
   const folder = a.status === 200 ? a.body.folder : b.body.folder;
   // 批次只能落一个目录，且内容完整（两个 4096 的块拼起来）
   const listed = (await jget(`${srv.base}/api/list`)).body;
   assert.ok(listed.folders.some((f) => f.name === folder), '成功那发要真的把目录落进列表');
+  // 上面那句只说"有"，不说"只落了一个" —— 双合并最直接的形状就是多出一个目录。
+  // 按"前后差"量，不按目录名前缀猜：命名规则一改，按名字猜的判据就会永远数到 0 个。
+  const afterFolders = (await jget(`${srv.base}/api/list`)).body.folders.length;
+  assert.strictEqual(afterFolders, beforeFolders + 1,
+    `并发 finish 只能多出一个目录，实际从 ${beforeFolders} 涨到 ${afterFolders}`);
 });
 
 test('重启后未完成批次仍可续（只清写一半的 .tmp）', async () => {
