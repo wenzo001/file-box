@@ -787,14 +787,44 @@
       }
     }
 
-    // 保存：能流式写盘就流式写；否则交给调用方处理 Blob（浏览器下载会自己落临时文件）
+    // 保存分三条路，按"能不能不把整份文件攥在内存里"排序：
+    //   1) 调用方给了 streamToFile（FS Access 选到真实目录）→ 直接流式写盘；
+    //   2) 没有 FS Access 但有 OPFS（Chrome 86+/Safari 15.2+）→ 逐块写进 OPFS 暂存，
+    //      collected() 交回的是**磁盘支撑的 File**，浏览器下载时自己流式读，不在 JS 堆里攒整份；
+    //   3) 两样都没有 → 才退回"明文块攒进 blobs，最后 new Blob 一次"（移动端小文件尚可，
+    //      大文件会占住整份内存 —— 120MB 实测留着 120MB 明文，就是这条兜底）。
+    // 暂存目录是**明文**，所以有它自己的清理路径：dropSaved() + 每次新会话开工前 sweepSaved()。
+    const OUT_DIR = 'xfer-out';
+    async function outDir(create) {
+      try {
+        if (!global.navigator || !navigator.storage || !navigator.storage.getDirectory) return null;
+        const root = await navigator.storage.getDirectory();
+        return await root.getDirectoryHandle(OUT_DIR, { create: !!create });
+      } catch { return null; }
+    }
+    async function sweepSaved() {
+      const d = await outDir(false);
+      if (!d) return;
+      for await (const k of d.keys()) { try { await d.removeEntry(k, { recursive: true }); } catch { /* 还被人开着，下次再清 */ } }
+    }
+    async function dropSaved() {
+      savedHandles.clear();
+      await sweepSaved();
+    }
+    const savedHandles = new Map();
     async function saveAll(streamToFile) {
       if (!st.verified) throw new Error('还没通过完整性校验');
       patch({ phase: 'saving' });
+      await sweepSaved();          // 上一轮的明文暂存先清掉，再落这一轮的
       for (const f of layout.files) {
         const key = await fileKey(f.fileId);
         let w = null;
         if (streamToFile) w = await streamToFile(f);
+        else {
+          const d = await outDir(true);
+          const fh = d && await d.getFileHandle(String(f.fileId), { create: true });
+          if (fh) { savedHandles.set(f.relPath, fh); w = await fh.createWritable(); }
+        }
         for (let c = 0; c < f.chunks.length; c++) {
           const frame = await readStoredFrame(f.seqBase + c, f.name);
           const pt = new Uint8Array((await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame })).plaintext);
@@ -812,8 +842,10 @@
     async function collected() {
       const out = [];
       for (const f of layout.files) {
-        const parts = blobs[f.relPath] || [];
-        out.push({ name: f.name, relPath: f.relPath, size: f.size, blob: new Blob(parts) });
+        const fh = savedHandles.get(f.relPath);
+        // File 是 Blob 的子类，界面那侧 URL.createObjectURL 一行都不用改
+        const blob = fh ? await fh.getFile() : new Blob(blobs[f.relPath] || []);
+        out.push({ name: f.name, relPath: f.relPath, size: f.size, blob });
       }
       return out;
     }
@@ -1139,6 +1171,8 @@
       secret = parsed.secret;
       proof = await P.proofOf(parsed.sid, parsed.secret);
       st.code = P.formatCode(parsed.sid, parsed.secret);
+      // 上一轮可能留下过明文暂存（下载没走完就关了页）：进来先扫一遍再干活
+      await sweepSaved().catch(() => {});
       const rec = readLs('receiver')[parsed.sid];
       if (rec && rec.keys) { restoreKeys(rec); resumeMode = true; }
       const j = await net.join(parsed.sid, proof);
@@ -1173,6 +1207,7 @@
       saveAll,
       collected,
       blobs,
+      dropSaved,
       _test: {
         get sess() { return sess; },
         get acked() { return acked; },

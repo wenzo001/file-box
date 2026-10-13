@@ -948,6 +948,9 @@
           setTimeout(() => URL.revokeObjectURL(url), 4000);
           if (!single) await new Promise((r) => setTimeout(r, 500));
         }
+        // 引擎的明文暂存不能留着：下载触发之后留 30 秒余量再清。
+        // 还被浏览器读着的那一份会清不掉（异常已在引擎里吞掉），那就等下一次会话开工时再扫。
+        setTimeout(() => { if (receiver) receiver.dropSaved().catch(() => {}); }, 30000);
       }
       toast('已保存');
     } catch (err) {

@@ -35,6 +35,52 @@ function findChromium() {
   return null;
 }
 
+// ---------- J / K 两条判据抽成纯函数，好让它们在"这台机器挤不出浏览器"时也能自测 ----------
+// 抽出来的理由：真实变异跑要占两把浏览器，而机器上同时还有别的项目在跑 headless chromium；
+// 内存只剩 7GB 时那一跑会卡在传输等待里，卡住的判据等于没有判据。
+// 于是把"判据能不能红"交给合成读数，把"读数真长什么样"交给实跑，两件事分开证。
+
+/** J：兜底下载不许把整份文件攥在渲染进程里。读数坏了（-1）也算红 —— 探针哑了不许绿 */
+function gateJ(rep, MB) {
+  return Number.isFinite(rep.retainedPlaintextMB) && rep.retainedPlaintextMB >= 0
+    && rep.retainedPlaintextMB < MB * 0.5;
+}
+
+/** K：双向。暂存里确实落过几乎整份明文，dropSaved 之后必须一个条目都不留。
+ *  少一半读数（before 为 0）就是"从来没写进 OPFS"的坏实现 —— 只查 after 的话它会一起绿。 */
+function gateK(rep, MB) {
+  const b = rep.opfsBeforeDrop, a = rep.opfsLeftAfterDrop;
+  const ok = (x) => x && Number.isInteger(x.n) && Number.isFinite(x.mb);
+  return ok(b) && ok(a) && b.n >= 1 && b.mb >= MB * 0.9 && a.n === 0;
+}
+
+/** --self-test：给判据喂合成读数，要求"该绿的绿、该红的红"。返回是否全对 */
+function selfTest() {
+  const MB = 120;
+  const cases = [
+    // 健康：明文全在 OPFS，drop 之后清空
+    { want: [true, true], rep: { retainedPlaintextMB: 0, opfsBeforeDrop: { n: 1, mb: 120 }, opfsLeftAfterDrop: { n: 0, mb: 0 } } },
+    // 刀一：退回 blobs 兜底（OPFS 压根没落盘）—— 旧版只查 after===0 的 K 在这一刀下是**假绿**
+    { want: [false, false], rep: { retainedPlaintextMB: 120, opfsBeforeDrop: { n: 0, mb: 0 }, opfsLeftAfterDrop: { n: 0, mb: 0 } } },
+    // 刀二：落了盘但 dropSaved 没扫干净
+    { want: [true, false], rep: { retainedPlaintextMB: 0, opfsBeforeDrop: { n: 1, mb: 120 }, opfsLeftAfterDrop: { n: 1, mb: 120 } } },
+    // 刀三：只落了一半（写到一半就失败）
+    { want: [true, false], rep: { retainedPlaintextMB: 0, opfsBeforeDrop: { n: 1, mb: 40 }, opfsLeftAfterDrop: { n: 0, mb: 0 } } },
+    // 刀四：两个读数都取不到（探针哑了）
+    { want: [false, false], rep: { retainedPlaintextMB: -1, opfsBeforeDrop: '读不到：x', opfsLeftAfterDrop: '读不到：x' } },
+  ];
+  let bad = 0;
+  cases.forEach((c, i) => {
+    const got = [gateJ(c.rep, MB), gateK(c.rep, MB)];
+    const ok = got[0] === c.want[0] && got[1] === c.want[1];
+    if (!ok) bad += 1;
+    console.log(`${ok ? 'ok  ' : 'FAIL'} 用例${i} J=${got[0]}(要 ${c.want[0]}) K=${got[1]}(要 ${c.want[1]})`);
+  });
+  console.log(bad ? `SELF-TEST FAIL ${bad}` : `SELF-TEST PASS ${cases.length} 个用例，J/K 两向都能红`);
+  return bad === 0;
+}
+if (arg('self-test', '0') === '1') process.exit(selfTest() ? 0 : 1);
+
 /** 内容可复现且处处不同；顺手算出与浏览器无关的两条参照值：
  *  sha   —— 整文件 SHA-256（下载落盘后对得上就说明字节没变）
  *  chain —— 引擎那套"逐 128KiB 块哈希再串起来哈希"（发送端指纹 / 接收端校验都对得上） */
@@ -366,10 +412,18 @@ async function main() {
     }
 
     // ---------- 等收尾 ----------
+    mark('开始等两端收尾');
     const t1 = Date.now();
-    let last = {};
+    let last = {}, beat = 0;
     while (!finished && Date.now() - t1 < WAIT_MS) {
       last = (await readState(pb, 'receiver')) || {};
+      // 心跳：这一等最长 15 分钟，没有它的话"卡住"和"还在传"在输出上长得一模一样
+      // （2026-10-13 一次 24MB 跑就在此处静默卡满 10 分钟，机器上当时只剩 7GB 空闲内存）
+      if (beat++ % 10 === 0) {
+        console.log(`   … +${((Date.now() - t1) / 1000).toFixed(0)}s 接收 phase=${last.phase || '?'} `
+          + `stored=${last.stored || 0}/${last.frames || '?'} verified=${!!last.verified} `
+          + `chan=${last.channel || '?'} err=${last.error || '无'}`);
+      }
       if (last.verified || last.phase === 'failed') break;
       await sleep(1500);
     }
@@ -399,6 +453,7 @@ async function main() {
         setTimeout(() => reject(new Error('没等到下载')), 300000);
       });
       await pb.click('#recv-save');
+      mark('已点保存，等浏览器给出下载（最长 300s）');
       try { await got; rep.savedTo = dl; rep.savedSha256 = crypto.createHash('sha256').update(fs.readFileSync(dl)).digest('hex'); }
       catch (e) { crashNote = 'save: ' + e.message; }
       rep.savedSize = fs.existsSync(dl) ? fs.statSync(dl).size : 0;
@@ -407,6 +462,36 @@ async function main() {
     // 发送端指纹：引擎落在 localStorage 里的那份清单（sha256 是对磁盘文件逐块哈希链出来的），
     // 和 Node 自己算的参照值对上，才说明"浏览器读到的就是盘上那份"
     rep.senderChainSha = Array.isArray(rep.senderLs) && rep.senderLs[0] ? rep.senderLs[0].sha : '';
+
+    // 直接数"还留在渲染进程里的明文字节"。这比任何进程级读数都可归因 ——
+    // 按映像名汇总 RSS 会把用户自己开着的 Chrome 也算进来（同一实验室两次差 800MB），那不能当证据。
+    rep.retainedPlaintextMB = await pb.evaluate(() => {
+      const s = window.__s && window.__s[window.__s.length - 1];
+      const b = (s && s.blobs) || {};
+      return Math.round(Object.values(b).reduce((n, parts) => n + parts.reduce((m, x) => m + (x.length || 0), 0), 0) / 1048576);
+    }).catch(() => -1);
+
+    // 先数"暂存里确实有几个文件"，再清。少了前半句，K 就是空对空：
+    // 兜底路径压根没落盘时 before=after=0，两条判据照样齐绿（见记忆"对称性断言可以空对空绿"）。
+    const countOpfs = async () => pb.evaluate(async () => {
+      try {
+        const root = await navigator.storage.getDirectory();
+        const d = await root.getDirectoryHandle('xfer-out');
+        let n = 0, bytes = 0;
+        for await (const k of d.keys()) {
+          n += 1;
+          try { bytes += (await (await d.getFileHandle(k)).getFile()).size; } catch { /* 计数不为零就够 */ }
+        }
+        return { n, mb: Math.round(bytes / 1048576) };
+      } catch { return { n: 0, mb: 0 }; }
+    }).catch((e) => '读不到：' + e.message);
+    rep.opfsBeforeDrop = await countOpfs();
+
+    // 明文暂存必须能被清干净（dropSaved 之后 xfer-out 里一个条目都不该留）
+    rep.opfsLeftAfterDrop = await pb.evaluate(async () => {
+      const s = window.__s[window.__s.length - 1];
+      await s.dropSaved();
+    }).then(countOpfs).catch((e) => '读不到：' + e.message);
 
     await sampleMem();
     rep.peakHeap = { senderMB: Math.round(peak.A / 1048576), receiverMB: Math.round(peak.B / 1048576) };
@@ -461,6 +546,11 @@ async function main() {
         : (rep.sender ? rep.sender.sentFrames <= rep.frames + 1 : undefined),
       // 成功后不许留假警报：600MB 那一跑 verified=true 的同时 error 还挂着
       // "服务器上的这个会话已经过期了"（尾巴上的一次抖动，已经过去了）
+      // 无 FS Access 的下载兜底：留在渲染进程里的明文不该是整份文件
+      J_下载兜底不整文件进内存: DO_SAVE ? gateJ(rep, MB) : undefined,
+      // 双向：暂存里确实落过整份明文（before 的字节数对得上文件大小），清完之后必须一个条目都不留。
+      // 只写"after===0"的话，"从来没写进 OPFS"的坏实现也会一起绿。
+      K_明文暂存清得干净: DO_SAVE ? gateK(rep, MB) : undefined,
       I_成功之后不留报错: SCENARIO === 'expired' ? undefined
         : (last.verified ? last.error === '' : undefined),
       F_恢复类场景给出可操作结果: SCENARIO === 'expired'
