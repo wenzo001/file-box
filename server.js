@@ -66,6 +66,61 @@ function safeName(name) {
   return base === '.' || base === '..' || base === '' ? '' : base;
 }
 
+// ---- 目录闸门 ----
+// 本服务在 uploads 下只创建一种目录：commitStaging() 生成的「YYYYMMDD_HHmm」
+// （同一分钟挤第二个及以后是「YYYYMMDD_HHmm_序号」）。名字是这里唯一的身份来源，
+// 列表 / 下载 / 归档 / 删除 / 到期清理五个地方都按它认人，别处不许再造第二套。
+const FOLDER_NAME = /^\d{8}_\d{4}(_\d+)?$/;
+const isFolderName = (name) => FOLDER_NAME.test(String(name || ''));
+const realpathOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+const isWithin = (root, p) => p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+
+/**
+ * 把用户给的目录名解析成 uploads 内**真实**目录路径；不合法就返回 null。
+ * 三道都要过：名字是本服务创建的形状 → lstat 看它是真目录（不是软链接/junction）
+ * → realpath 仍在 uploads 真实路径之内。
+ * 为什么不能只做字符串前缀比较：resolve/join 只看字面，一个指向界外的链接就能让
+ * "看起来在界内"的名字把界外的内容列出来、打包走（实测 download/archive 都跟得出去）。
+ */
+function resolveFolder(name) {
+  if (!isFolderName(name)) return null;
+  const root = realpathOrNull(UPLOAD_DIR);
+  if (!root) return null;
+  const p = path.join(root, name);
+  try {
+    if (!fs.lstatSync(p).isDirectory()) return null;
+  } catch { return null; }
+  const real = realpathOrNull(p);
+  return real && isWithin(root, real) ? real : null;
+}
+
+/** 目录内的真实文件路径：同样拒链接——链接目录里放一个指出去的软链接也是读界外的口子 */
+function resolveFile(folderReal, name) {
+  const safe = safeName(name);
+  if (!folderReal || !safe) return null;
+  const p = path.join(folderReal, safe);
+  try {
+    if (!fs.lstatSync(p).isFile()) return null;
+  } catch { return null; }
+  const real = realpathOrNull(p);
+  return real && isWithin(folderReal, real) ? real : null;
+}
+
+/** 启动时把 uploads 里"看得见但服务不认"的条目说一声：闸门收紧后它们不再出现在列表里，
+ *  不吭声会被当成文件丢了 */
+function warnIgnored() {
+  let ignored = [];
+  try {
+    ignored = fs.readdirSync(UPLOAD_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !isFolderName(d.name))
+      .map((d) => d.name);
+  } catch { return; }
+  if (ignored.length) {
+    console.log(`[提示] ${UPLOAD_DIR} 下有 ${ignored.length} 个目录不是本服务创建的，已忽略（不列表、不下载、不删除）：${ignored.slice(0, 5).join(', ')}${ignored.length > 5 ? ' …' : ''}`);
+    console.log('[提示] 需要它们的内容请自己把它们移到别处；服务只会动自己按「日期_时间」命名建出来的目录');
+  }
+}
+
 // ---- 存储空间统计与过期清理 ----
 /** 递归统计目录占用字节数。用 lstat：软链接既不该计入用量，更不该跟着递归
  *  （一个指回上层的软链接就能让同步递归绕不完）。单个条目读不到也跳过：Windows 上
@@ -98,7 +153,7 @@ function cleanupExpired() {
   const now = Date.now();
   const removed = [];
   for (const d of fs.readdirSync(UPLOAD_DIR, { withFileTypes: true })) {
-    if (!d.isDirectory()) continue;
+    if (!d.isDirectory() || !isFolderName(d.name)) continue; // 链接与外来目录一律不动
     const t = folderTime(d.name);
     if (t !== null && now - t > RETENTION_MS) {
       fs.rmSync(path.join(UPLOAD_DIR, d.name), { recursive: true, force: true });
@@ -110,6 +165,7 @@ function cleanupExpired() {
   }
 }
 cleanupExpired();
+warnIgnored();
 setInterval(cleanupExpired, 6 * 60 * 60 * 1000).unref();
 
 // ---- 上传：分块 + 断点续传 ----
@@ -429,7 +485,7 @@ app.get('/api/list', (req, res) => {
   ensureUploadDir();
   const folders = fs
     .readdirSync(UPLOAD_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
+    .filter((d) => d.isDirectory() && isFolderName(d.name)) // 链接目录与外来目录一律不列（看得见却动不了的界面最容易骗人）
     .map((d) => {
       const dir = path.join(UPLOAD_DIR, d.name);
       const files = fs
@@ -453,45 +509,38 @@ app.get('/api/list', (req, res) => {
 });
 
 // ---- 删除整个目录（谨慎操作：前端有确认弹层） ----
+// 只删"本服务自己按日期_时间建出来的真实目录"：名字形状 + lstat 真目录 + realpath 仍在 uploads 内，
+// 三道一起过。少任何一道都会留下口子（字符串前缀比较挡不住指向界外的链接）。
 app.delete('/api/folder/:folder', (req, res) => {
-  const folder = safeName(req.params.folder);
-  if (!folder) return res.status(400).json({ error: '目录名无效' });
-  const dir = path.join(UPLOAD_DIR, folder);
-  if (dir.indexOf(UPLOAD_DIR + path.sep) !== 0) {
-    return res.status(400).json({ error: '目录名无效' });
+  if (!isFolderName(req.params.folder)) return res.status(400).json({ error: '目录名无效' });
+  const dir = resolveFolder(req.params.folder);
+  // 名字形状对但"不是本服务建的真目录"（链接、界外、已被清理、压根没有）统一按不存在回，
+  // 不给探测者区分"这里有链接"的反馈
+  if (!dir) return res.status(404).json({ error: '目录不存在' });
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    console.error('[删除] 失败', err.code, req.params.folder);
+    return res.status(500).json({ error: '删除失败' });
   }
-  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
-    return res.status(404).json({ error: '目录不存在' });
-  }
-  fs.rmSync(dir, { recursive: true, force: true });
   forgetUsage(); // 腾出的空间要立刻反映到上限判断上
   res.json({ ok: true });
 });
 
 // ---- 下载单个文件（密文，前端收到后自动解密） ----
 app.get('/api/download/:folder/:file', (req, res) => {
-  const folder = safeName(req.params.folder);
-  const file = safeName(req.params.file);
-  if (!folder || !file) return res.status(400).json({ error: '文件名无效' });
-  const fp = path.join(UPLOAD_DIR, folder, file);
-  if (fp.indexOf(path.join(UPLOAD_DIR, folder) + path.sep) !== 0) {
-    return res.status(400).json({ error: '文件名无效' });
-  }
-  if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) {
-    return res.status(404).json({ error: '文件不存在' });
-  }
-  res.download(fp, file);
+  const folderReal = resolveFolder(req.params.folder);
+  const fp = resolveFile(folderReal, req.params.file);
+  if (!fp) return res.status(404).json({ error: '文件不存在' }); // 不区分"名字不合法/不在界内/不存在"，不给探测者反馈
+  res.download(fp, path.basename(fp));
 });
 
 // ---- 归档下载：把整个目录的密文拼成一条流（纯聚合，不压缩） ----
 // 帧格式：[2B 名长][文件名 UTF-8][8B 数据长(大端)][数据]
 // manifest.enc 放在最前，客户端先解出真实文件名，再按序还原其余文件
 app.get('/api/archive/:folder', async (req, res) => {
-  const folder = safeName(req.params.folder);
-  const dir = path.join(UPLOAD_DIR, folder);
-  if (!folder || dir.indexOf(UPLOAD_DIR + path.sep) !== 0) {
-    return res.status(400).json({ error: '目录名无效' });
-  }
+  const dir = resolveFolder(req.params.folder);
+  if (!dir) return res.status(404).json({ error: '目录不存在' });
   let parts;
   try {
     parts = fs

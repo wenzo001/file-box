@@ -208,7 +208,9 @@ test('删除目录后列表与占用一起回落', async () => {
   const after = (await jget(`${srv.base}/api/list`)).body;
   assert.ok(!after.folders.some((f) => f.name === folder));
   assert.strictEqual(after.usage.used, before1.usage.used - before1.folders.find((f) => f.name === folder).size);
-  assert.strictEqual((await jget(`${srv.base}/api/folder/不存在的目录`, { method: 'DELETE' })).status, 404);
+  // 名字不是本服务的形状 → 400；形状对但目录不在 → 404（闸门收紧后两种答复都要明确，别一律 500）
+  assert.strictEqual((await jget(`${srv.base}/api/folder/不存在的目录`, { method: 'DELETE' })).status, 400);
+  assert.strictEqual((await jget(`${srv.base}/api/folder/20991231_2359`, { method: 'DELETE' })).status, 404);
 });
 
 test('静态页可取（前端回归的入口）', async () => {
