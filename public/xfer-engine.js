@@ -415,6 +415,8 @@
     let resumeMode = false;
     const acked = new Set();        // 接收端已落盘并上报过的块（发送端从服务器读到）
     const sentAt = new Map();       // 每帧最后一次发出去的时刻：慢确认不等于"没送到"，别立刻重发
+    let upRanges = [];              // 服务器记账"已经收到"的帧区间——这一份才是"送到没送到"的权威口径
+    const onServer = (n) => upRanges.some(([a, b]) => n >= a && n <= b);
     const stored = new Set();       // 接收端本地已落盘
     const late = [];                // 清单还没到时的迟到帧
     let running = false;
@@ -532,9 +534,12 @@
 
     function switchChannel(to, why) {
       if (st.channel === to) return;
-      if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
-      // 通道说明走 note：写进 error 会让整块状态（含"校验通过"）一直显示成报错色
+      // 先把状态落定，再关 rtc：rtc.close() 会当场回调 onconnectionstatechange('closed')，
+      // 那条回调走 degradeNow，看的是 st.channel —— 后落定的话它会把这次切换当成"还没降过级"
+      // 再降一遍，并且在密钥还没落地时就叫起 afterHandshake（于是把 pendingConfirm 提前验，
+      // 报一句 sess.kMeta 读不到，接收端就此卡在 retrying）。
       patch({ channel: to, note: why || st.note });
+      if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
     }
     let regraceTimer = null;
     /** 认定直连已失效：改走中转并把该跑的循环叫起来（幂等，重复调用不会重复降级） */
@@ -557,7 +562,9 @@
           while (paused) await sleep(150);
           while (cursor < st.frames && inflight.size < cfg.parallel) {
             const s = cursor++;
-            if (acked.has(s)) continue;
+            // 已经被确认、或者服务器手上已经有这一块的，都不用再发一遍
+            // （续传时这条最要紧：重启/刷新之后服务器账本里的 uploaded 就是"我已经有了"）
+            if (acked.has(s) || onServer(s)) continue;
             const slot = {};
             inflight.add(slot);
             slot.p = sendSeq(s)
@@ -573,10 +580,12 @@
           while (paused) await sleep(200);
           await sleep(500);
           await refreshAck();
-          // 只补"确实隔了一阵还没被确认"的帧：慢确认（对端在解密/落盘）不等于没送到，
-          // 每 500ms 就把整批未确认的再发一遍会把进度和带宽都白烧掉
+          // 只补两类帧：① 确实隔了一阵还没被确认、② 服务器手上根本没有这一块。
+          // 慢确认（对端在解密/落盘）不等于没送到 —— 以前只看"没确认"就整批重发，
+          // 600MB 实测把 4801 帧发成了 5594 次（多烧 133MB），收尾还撞上会话被回收报"写入分段失败"。
           const now = Date.now();
-          const due = missingForRetry(acked, st.frames).filter((n) => now - (sentAt.get(n) || 0) >= cfg.retryGapMs);
+          const due = missingForRetry(acked, st.frames).filter((n) =>
+            now - (sentAt.get(n) || 0) >= cfg.retryGapMs && !onServer(n));
           for (const s of due.slice(0, cfg.parallel)) {
             try { await sendSeq(s); } catch (err) { fail(err.message || err, true); }
           }
@@ -603,6 +612,7 @@
       try {
         const s = await net.state(st.sid);
         expand(s.acked).forEach((n) => acked.add(n));
+        upRanges = Array.isArray(s.uploaded) ? s.uploaded : [];
         st.uploaded = expand(s.uploaded).length;
         st.frames = s.frames;
         st.totalBytes = s.totalBytes;
@@ -816,7 +826,8 @@
     function afterHandshake() {
       // 对方的 confirm 可能比这一端的密钥还早到（重连时服务器会立刻补发历史），
       // 那时还验不了；先存着，握手一落地马上补验，不然"链路上没有别人"这个结论永远立不起来
-      if (pendingConfirm) {
+      // sess 还没派生出来时不能补验：confirmMac 要读 kConfirm/kMeta，读不到就是一句 TypeError
+      if (pendingConfirm && sess) {
         const b = pendingConfirm;
         pendingConfirm = null;
         onPeerConfirm(b).catch((e) => fail(e.message || e));
@@ -947,11 +958,17 @@
         patch({ channel: 'p2p_connecting' });
         const sdp = await rtc.offer();
         await net.signal(st.sid, 'offer', sdp).catch(() => {});
-        timers.push(setTimeout(() => {
-          if (rtc && !rtc.open) { switchChannel('server_relay', '直连建立超时，已改用服务器中转'); afterHandshake(); }
-        }, cfg.p2pTimeoutMs));
       }
       if (role === 'receiver' && rtc) patch({ channel: 'p2p_connecting' });
+      // 两端都要有这条超时：以前只有发送方超时改标，接收端界面能一路停在"正在尝试直连"，
+      // 而它其实全盘在从服务器拉密文；那条开不了的 pc 也一直悬着不关。
+      if (rtc) timers.push(setTimeout(() => {
+        if (!rtc || rtc.open) return;
+        switchChannel('server_relay', '直连建立超时，已改用服务器中转');
+        // 只有发送端需要这一叫把主循环起来；接收端的拉取另有排程，在这里多叫一次只会
+        // 在密钥还没落地时凭空报一个错
+        if (role === 'sender') afterHandshake();
+      }, cfg.p2pTimeoutMs));
     }
 
     function openStream() {
@@ -962,9 +979,14 @@
           if (name === 'joined') { patch({ phase: 'pairing' }); upgradeIceWithTurn().catch(() => {}); }
           else if (name === 'key') await onPeerKey(data.body);
           else if (name === 'confirm') await onPeerConfirm(data.body);
-          else if (name === 'offer') { const sdp = await rtc.takeOffer(data.body); await net.signal(st.sid, 'answer', sdp).catch(() => {}); }
-          else if (name === 'answer') await rtc.takeAnswer(data.body);
-          else if (name === 'ice') await rtc.ice(JSON.parse(data.body));
+          else if (name === 'offer' || name === 'answer' || name === 'ice') {
+            // 降级之后 rtc 已经关了：这些信令对本会话不再有意义，收下就算，
+            // 但绝不能拿着 null 去 takeOffer/takeAnswer —— 那会把一句 TypeError 顶到用户界面上
+            if (!rtc) return;
+            if (name === 'offer') { const sdp = await rtc.takeOffer(data.body); await net.signal(st.sid, 'answer', sdp).catch(() => {}); }
+            else if (name === 'answer') await rtc.takeAnswer(data.body);
+            else await rtc.ice(JSON.parse(data.body));
+          }
           else if (name === 'ack') { await refreshAck(); if (role === 'sender') pump(); }
           else if (name === 'done') { if (role === 'receiver') { await pullMissing(); if (stored.size === st.frames) await finishReceive(); } else patch({ phase: 'done' }); }
           else if (name === 'cancelled') { patch({ phase: 'cancelled', error: '对方取消了这次传输' }); close(); }

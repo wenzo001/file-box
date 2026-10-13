@@ -173,3 +173,106 @@ test('TURN：发送方建链时还没配对拿不到凭证，joined 之后必须
   assert.ok(Number(turn.username.split(':')[0]) >= Math.floor(Date.now() / 1000), '过期时间必须在将来');
   assert.strictEqual(sender.state.channel, 'turn_relay', '选中 relay 候选时要报 turn_relay，不能报成"直连"');
 }));
+
+// 下面两条由真浏览器实验室（test/lab/xfer-big-lab.js）报出来：那边两台 Chromium 谁都
+// 产不出候选，8 秒后各自降级，迟到的 answer 就把一句 TypeError 顶到了用户界面上，
+// 而接收端的通道标识一直停在"正在尝试点对点直连…"，实际全盘在走中转。
+test('降级之后迟到的 offer/answer/ice 只当没听见，不许变成抛给用户的报错', () => withLab({
+  slot: 77, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 800 },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 2 * MB;
+  // 故意不 link.connect()：两端都会超时降级，rtc 变成 null，此时对端补发的信令就是"迟到"
+  const code = (await sender.send([{ relPath: 'l.bin', name: 'l.bin', size, mime: 'application/octet-stream', file: fakeFile('l.bin', size, 13) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 8000 && sender.state.channel !== 'server_relay') await sleep(100);
+  assert.strictEqual(sender.state.channel, 'server_relay', '夹具坏了：发送端没降级，这条测不到迟到信令');
+
+  const parsed = env.P.parseCode(code);
+  const proof = await env.P.proofOf(parsed.sid, parsed.secret);
+  const senderRec = JSON.parse(env.stores.get('fb.xfer.sender') || '{}')[parsed.sid] || {};
+  assert.ok(senderRec.token, '夹具坏了：本地没存到发送方 token，投不出发送方向的迟到信令');
+  const late = [
+    ['answer', 'v=0 late-answer', { 'X-Xfer-Proof': proof }],   // 迟到的 answer 发给发送方
+    ['ice', '{"candidate":"late"}', { 'X-Xfer-Proof': proof }], // 迟到的 candidate 发给发送方
+    ['offer', 'v=0 late-offer', { 'X-Xfer-Sender': senderRec.token }], // 迟到的 offer 发给接收方
+  ];
+  for (const [kind, body, cred] of late) {
+    const r = await fetch(`${srv.base}/api/xfer/signal`, {
+      method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, cred),
+      body: JSON.stringify({ sid: parsed.sid, kind, body }),
+    });
+    assert.strictEqual(r.status, 200, `${kind} 信令本该被服务器收下：${r.status} ${JSON.stringify(await r.json().catch(() => ({})))}`);
+  }
+  await sleep(600);
+  assert.strictEqual(sender.state.error, '', `迟到的信令把错误抛给了用户：${sender.state.error}`);
+  assert.strictEqual(receiver.state.error, '', `接收端也被迟到信令报错：${receiver.state.error}`);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `收下迟到信令之后传输断了：phase=${st.phase} error=${st.error}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 13)));
+}));
+
+test('接收端也要在直连超时后如实改通道标识，不能让用户界面停在"正在尝试直连"', () => withLab({
+  slot: 78, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 800 },
+}, async ({ env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'c.bin', name: 'c.bin', size, mime: 'application/octet-stream', file: fakeFile('c.bin', size, 17) }])).code;
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `没传完：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(sender.state.channel, 'server_relay', '夹具坏了：发送端没降级');
+  assert.strictEqual(receiver.state.channel, 'server_relay',
+    `接收端全程在从中转拉数据，界面却还写着 ${receiver.state.channel}`);
+  assert.ok(env.counters.segGet > 0, '这条判据要建立在"接收端确实走了中转"之上');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 17)));
+}));
+
+// 降级这一步本身不许留下副作用：rtc.close() 会当场回调 state='closed'，那条回调又走一遍
+// 降级 → 在密钥还没落地时叫起 afterHandshake → 提前补验 confirm 就读到 null 的 kMeta。
+// 现场是"传输中途超时降级"，所以把超时压到 400ms、文件放大到 8MB，让降级必定落在飞行中。
+//
+// 诚实边界：switchChannel 的"先落状态再关 pc"次序 + afterHandshake 的 sess 复查这两处，
+// 单独变异任何一处（含两处一起变异，见 mutate-channel.js 的 switch-order / no-sess-guard /
+// degrade-reentrancy）这 9 条腿都不变红 —— 台架里 confirm 从来没有早于密钥到达过。
+// 那次现场只在全量并跑时出现过一次（接收端卡 retrying、报 kMeta），没能在这条腿上钉死；
+// 这条腿证的是"中途降级不留报错、不丢块"，那两处改动按预防性纵深登记，不算已被门禁覆盖。
+// 600MB 真浏览器实测暴露出来的：接收端确认落后时，发送端把"服务器已经收下但对方还没确认"
+// 的帧当成丢包又 PUT 了一遍 —— 4801 帧发了 5594 次、多烧 133MB 线上字节，
+// 还在收尾时撞上会话被回收，报出一句"写入分段失败"。
+test('服务器已经收下这一块，就不许再把它 PUT 第二遍（慢确认 ≠ 丢包）', () => withLab({
+  slot: 80, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, retryGapMs: 200 },
+}, async ({ env, sender, receiver }) => {
+  const size = 4 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  const code = (await sender.send([{ relPath: 'k.bin', name: 'k.bin', size, mime: 'application/octet-stream', file: fakeFile('k.bin', size, 31) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 30000 && sender.state.sentFrames < frames) await sleep(100);
+  assert.strictEqual(sender.state.sentFrames, frames, `夹具坏了：主循环没把每块正好发一遍（${sender.state.sentFrames}/${frames}）`);
+  const putAfterMainLoop = env.counters.segPut;
+  receiver.pause();                     // 对端不再确认（真机上等价于"正在解密/落盘"）
+  await sleep(2500);                    // 足够尾巴轮好几圈（retryGapMs=200）
+  receiver.resume();
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `恢复确认之后没传完：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(env.counters.segPut, putAfterMainLoop,
+    `等确认期间又被 PUT 了 ${env.counters.segPut - putAfterMainLoop} 帧 —— 服务器早就有了，这一遍纯属白烧`);
+  assert.strictEqual(sender.state.sentFrames, frames, `发送帧数 ${sender.state.sentFrames} ≠ 应有 ${frames}，重发没收敛`);
+  assert.strictEqual(sender.state.error, '', `尾巴期给用户留了报错：${sender.state.error}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 31)));
+}));
+
+test('传输中途降级：关 pc 的那一下不许把降级再触发一遍，也不许留下报错', () => withLab({
+  slot: 79, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 400 },
+}, async ({ sender, receiver }) => {
+  const size = 8 * MB;
+  const code = (await sender.send([{ relPath: 'm2.bin', name: 'm2.bin', size, mime: 'application/octet-stream', file: fakeFile('m2.bin', size, 23) }])).code;
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 60000);
+  assert.strictEqual(receiver.state.channel, 'server_relay', '接收端没在超时后改标');
+  assert.ok(st.verified, `中途降级把传输带崩了：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(receiver.state.error, '', `降级过程给用户留了报错：${receiver.state.error}`);
+  assert.strictEqual(sender.state.error, '', `发送端同样被报错：${sender.state.error}`);
+  assert.ok(sender.state.sentFrames > 0, '这条判据要建立在"降级确实发生在传输中途（已经有块发出去）"之上');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 23)));
+}));
