@@ -281,6 +281,8 @@ function metaProblem(files) {
   const seen = new Set();
   for (const f of files) {
     if (!f || typeof f.enc !== 'string' || !f.enc || safeName(f.enc) !== f.enc) return '文件名不合法';
+    const np = nameProblem(f.enc);
+    if (np) return `文件名不合法：${np}`;
     if (RESERVED_NAME.test(f.enc)) return `文件名被占用: ${f.enc}`;
     if (seen.has(f.enc)) return `文件名重复: ${f.enc}`;
     seen.add(f.enc);
@@ -294,6 +296,24 @@ function metaProblem(files) {
 
 /** 这批声明要占多少字节 */
 const declaredBytes = (files) => files.reduce((s, f) => s + f.chunks.reduce((a, b) => a + b, 0), 0);
+
+// ---- 文件名字符集 ----
+// 服务器跑在 Windows 还是 Linux 上，落盘的是同一个名字，所以只能收"两边都能安全落"的最严交集：
+// 这些形状在 init 放过，就会在 finish 的 rename/writeFile 上炸（炸的时候还带绝对路径出去），
+// 或者悄悄落到别处去（Windows 会把尾点、尾空格归一化掉）。
+const NAME_ILLEGAL = /[<>:"|?*\u0000-\u001f]/;            // 两侧保留字符与控制字符（分隔符由 safeName 先拒）
+const NAME_TAIL = /[. ]$/;                                 // Windows 归一化掉尾点/尾空格 → 校验的名字≠落盘的名字
+const NAME_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i; // Windows 设备名，带扩展名也算
+const NAME_MAX_BYTES = 200;                                // 单个路径分量留够余量（MAX_PATH 260）
+/** 这个名字能不能落盘？能返回 null，不能返回给用户看的原因 */
+function nameProblem(name) {
+  if (typeof name !== 'string' || !name || name !== name.trim()) return '文件名不能为空或首尾带空白';
+  if (NAME_ILLEGAL.test(name)) return '文件名含非法字符';
+  if (NAME_TAIL.test(name)) return '文件名不能以点或空格结尾';
+  if (NAME_DEVICE.test(name)) return '文件名是系统保留名';
+  if (Buffer.byteLength(name, 'utf8') > NAME_MAX_BYTES) return '文件名过长';
+  return null;
+}
 
 /** 把暂存目录搬进 uploads，名字用完成时刻；撞上同分钟的批次就追加序号 */
 function commitStaging(stagingDir) {
@@ -473,7 +493,9 @@ app.post('/api/upload/finish', (req, res) => {
       forgetUsage();
       done();
       try {
-        if (!res.headersSent) res.status(500).json({ error: `合并分块失败：${err.message}` });
+        // 详情（含绝对路径的 err.message）只进日志：这条响应是给浏览器看的，
+        // 匿名请求不该知道服务装在哪个目录（审计里 enc="a.enc:" 就把它骗出来过）
+        if (!res.headersSent) res.status(500).json({ error: '合并分块失败，请重新上传这一批' });
       } catch { /* 连接已经断了，没什么可做的 */ }
     }
   })().catch((err) => console.error('[上传] 收尾流程异常', err));
@@ -603,10 +625,13 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use((err, req, res, next) => {
   if (!err) return next();
   console.error(err);
+  // err.expose 是 express / body-parser 给"可以说给客户端的那类错"打的标（400 那一族）。
+  // 没这个标的（fs 抛的、我们自己 throw 的）一律换成固定话术：绝对路径与底层错误码不外说。
+  const tellable = err.expose ? (err.message || '请求处理失败') : null;
   const msg =
     err.type === 'entity.too.large' ? '请求体过大（单个分块超过上限）' :
-    err.message || '请求处理失败';
-  res.status(err.status || 400).json({ error: msg });
+    tellable || '请求处理失败';
+  res.status(err.expose ? (err.status || 400) : 500).json({ error: msg });
 });
 
 // ---- 双端口启动：HTTP 可直接用；HTTPS 更优（传输层加密 + 原生加密引擎） ----
