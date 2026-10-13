@@ -246,6 +246,34 @@ withEngines('文件指纹：与 node:crypto 的逐块 SHA-256 串联一致，改
   assert.notStrictEqual(fp2.digestChain, fp.digestChain);
 });
 
+test('加密清单必须带得回相对路径：不同子目录下的同名文件不能分不出谁是谁', async () => {
+  const sid8 = await P.sidTag('nnnn3333');
+  const key = nc.randomBytes(32);
+  const layout = P.planLayout([
+    { relPath: 'a/x.bin', name: 'x.bin', size: 10, mime: '' },
+    { relPath: 'b/x.bin', name: 'x.bin', size: 20, mime: '' },
+  ]);
+  const frame = await P.seal({ key, sid8, type: P.TYPE_META, fileId: 0xffffffff, chunkIdx: 0, plaintext: P.manifestBytes(layout) });
+  const back = P.readManifest((await P.open({ key, sid8, frame })).plaintext);
+  assert.deepStrictEqual(
+    back.files.map((f) => f.relPath), ['a/x.bin', 'b/x.bin'],
+    '清单丢了相对路径：接收端只剩 name 可归组，两个同名文件的块会被并成同一个 Blob（或后一个盖掉前一个）',
+  );
+  assert.deepStrictEqual(back.files.map((f) => f.size), [10, 20], '相对路径要跟着原来的顺序一起回来');
+});
+
+test('传输码分组：每组固定 4 位、段边界对齐，不许出现 "--" 和落单的尾巴', () => {
+  for (let i = 0; i < 300; i++) {
+    const sid = P.genSid();
+    const secret = P.genSecret();
+    const shown = P.formatCode(sid, secret);
+    assert.ok(!shown.includes('--'), `码里有连写的分隔符（分组跨了 sid/secret 边界）: ${shown}`);
+    assert.match(shown, /^[a-z1-9]{4}(-[a-z1-9]{4}){7}$/, `应当是 8 组、每组 4 位: ${shown}`);
+    assert.strictEqual(shown.split('-')[1], sid.slice(4, 8), 'sid 那 8 位要正好落在前两组里，边界不能骑在分隔符上');
+    assert.deepStrictEqual(P.parseCode(shown), { sid, secret }, '换了分组还得吃得回来');
+  }
+});
+
 test('加密清单：特殊字符文件名原样往返，明文里不含真实名也说明不了什么 —— 但它只在密钥对了才解得开', async () => {
   const sid8 = await P.sidTag('mmmm3333');
   const key = nc.randomBytes(32);

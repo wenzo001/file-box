@@ -70,7 +70,10 @@
   };
   const genSid = () => randChars(SID_LEN);
   const genSecret = () => randChars(SEC_LEN);
-  const formatCode = (sid, secret) => `${sid}-${secret}`.replace(/(.{4})(?=.)/g, '$1-');
+  const group4 = (s) => String(s).replace(/(.{4})(?=.)/g, '$1-');
+  // 两段**各自**分组再拼：对拼好的整串插分隔符会让分隔符跨在 sid/secret 边界上，
+  // 结果就是界面上那种 "5wts--wma" 与落单的 "-q" 尾巴（数起来像输错了码）
+  const formatCode = (sid, secret) => `${group4(sid)}-${group4(secret)}`;
   function parseCode(str) {
     const clean = String(str || '').toLowerCase().replace(/[^a-z1-9]/g, '');
     if (clean.length !== SID_LEN + SEC_LEN) return null;
@@ -259,7 +262,9 @@
 
   const manifestBytes = (layout) => te.encode(JSON.stringify({
     v: VER, plainBlock: PLAIN_BLOCK, totalBytes: layout.files.reduce((s, f) => s + f.size, 0),
-    files: layout.files.map((f) => ({ id: f.fileId, name: f.name, size: f.size, mime: f.mime, sha256: f.sha256, chunks: f.chunks })),
+    // relPath 必须进来：只有 name 的话，同一批里不同子目录下的同名文件在接收端是同一个东西
+    // （块会被并进同一个 Blob，或落盘时后一个直接盖掉前一个）
+    files: layout.files.map((f) => ({ id: f.fileId, name: f.name, relPath: f.relPath, size: f.size, mime: f.mime, sha256: f.sha256, chunks: f.chunks })),
   }));
   const readManifest = (u8) => JSON.parse(td.decode(u8));
 

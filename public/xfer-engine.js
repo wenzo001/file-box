@@ -465,7 +465,9 @@
       const frame = await frameFor(seqN);
       await shipFrame(seqN, frame);
       st.sentFrames++;
-      if (st.phase === 'waiting' || st.phase === 'paired') patch({ phase: 'transferring' });
+      // 'pairing' 也要放行：joined 事件会把状态打成 pairing，而 pump 就在这之后立刻起跑 ——
+      // 少这一档，整段传输期间发送端都挂着"正在配对"，进度在动、话却不对（真浏览器实测过）
+      if (['waiting', 'paired', 'pairing'].includes(st.phase)) patch({ phase: 'transferring' });
       emit();
     }
 
@@ -562,7 +564,7 @@
         return o;
       });
       layout = { files, totalFrames: seq, plainBlock: m.plainBlock };
-      st.files = files.map((f) => ({ fileId: f.fileId, name: f.name, size: f.size, seqBase: f.seqBase }));
+      st.files = files.map((f) => ({ fileId: f.fileId, name: f.name, relPath: f.relPath, size: f.size, seqBase: f.seqBase }));
       st.frames = seq;
       st.totalBytes = m.totalBytes;
       return files;
@@ -698,14 +700,16 @@
         if (w) await w.close();
       }
       patch({ phase: 'done', saved: true });
-      function yieldBlob(f, pt) { (blobs[f.name] = blobs[f.name] || []).push(pt); }
+      // 归组按 relPath 而不是 name：同一批里两个不同子目录下的同名文件，
+      // 按名字归组会把两块并成同一个 Blob（另一个则被覆盖）
+      function yieldBlob(f, pt) { (blobs[f.relPath] = blobs[f.relPath] || []).push(pt); }
     }
     const blobs = {};
     async function collected() {
       const out = [];
       for (const f of layout.files) {
-        const parts = blobs[f.name] || [];
-        out.push({ name: f.name, size: f.size, blob: new Blob(parts) });
+        const parts = blobs[f.relPath] || [];
+        out.push({ name: f.name, relPath: f.relPath, size: f.size, blob: new Blob(parts) });
       }
       return out;
     }

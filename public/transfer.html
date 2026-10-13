@@ -918,15 +918,21 @@
     toast('已取消');
   });
 
+  /** 按相对路径在所选目录下补齐子目录再拿文件句柄。
+   *  只按 name 落盘的话，一批里不同子目录下的同名文件会后一个盖掉前一个（且不报错）。 */
+  async function handleFor(dir, f) {
+    const segs = String(f.relPath || f.name || '').split(/[\\/]/).filter(Boolean);
+    let d = dir;
+    for (let i = 0; i < segs.length - 1; i++) d = await d.getDirectoryHandle(segs[i], { create: true });
+    return d.getFileHandle(segs[segs.length - 1], { create: true });
+  }
+
   $('#recv-save').addEventListener('click', async () => {
     if (!receiver || !receiver.state.verified) return;
     try {
       if (caps.fsAccess && window.showDirectoryPicker && receiver.state.files.length > 1) {
         const dir = await window.showDirectoryPicker({ mode: 'readwrite' });
-        await receiver.saveAll(async (f) => {
-          const fh = await dir.getFileHandle(f.name, { create: true });
-          return fh.createWritable();
-        });
+        await receiver.saveAll(async (f) => (await handleFor(dir, f)).createWritable());
       } else if (caps.fsAccess && window.showSaveFilePicker) {
         const fh = await window.showSaveFilePicker({ suggestedName: receiver.state.files[0].name });
         await receiver.saveAll(async () => fh.createWritable());
