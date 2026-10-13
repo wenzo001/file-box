@@ -1,0 +1,19 @@
+/* 进度长条（#blocks）：文件库上传页与无痕传输页共用的同一组件。
+   两页共用：配色、格子尺寸变量、动画。格子布局算法（layoutStrip）两页各自内联，
+   因为粒度不同 —— 上传页一格 = 一个上传块（约 4MiB），传输页封顶 600 格，
+   但几何参数（wMax/wMin/hMax/hMin/rows/budget）与这里是同一套。 */
+#blocks {
+  display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
+  margin-top: 14px; padding: 3px; border-radius: 7px;
+  background: var(--fill);
+  /* 格子大小由各页的 layoutStrip 按块数算：块多就缩小格子，绝不在长条里加滚动条 */
+  --blk-w: 9px; --blk-h: 12px;
+}
+#blocks .blk {
+  width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
+  transition: background .12s, opacity .12s;
+}
+#blocks .blk.done { background: var(--accent-fill); }
+#blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
+#blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); } /* 清单/账本那一块 */
+@keyframes blkPulse { 50% { opacity: .3; } }

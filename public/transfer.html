@@ -7,6 +7,7 @@
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000">
 <title>无痕传输 · 文件盒子</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%23007AFF'/><path d='M12 16V7M7.5 11.5L12 7l4.5 4.5' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="progress-strip.css">
 <style>
   /* 与文件库页面同一套 iOS 系统色 token，不另起一套设计 */
   :root {
@@ -218,20 +219,7 @@
   /* 降级（HTTP 入口：没有 WebCrypto 也没有直连）不是错误，用橙色而不是红色 —— 红色留给真出错 */
   .chan.deg .dot { background: var(--warn); }
 
-  /* 进度长条：与文件库页面 #blocks 同一组件、同一配色、同一动画 */
-  #blocks {
-    display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
-    margin-top: 14px; padding: 3px; border-radius: 7px; background: var(--fill);
-    --blk-w: 9px; --blk-h: 12px;
-  }
-  #blocks .blk {
-    width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
-    transition: background .12s, opacity .12s;
-  }
-  #blocks .blk.done { background: var(--accent-fill); }
-  #blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
-  #blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); }
-  @keyframes blkPulse { 50% { opacity: .3; } }
+  /* 进度长条：样式在 progress-strip.css（与文件库页面共用同一组件、同一配色、同一动画） */
 
   #send-status, #recv-status {
     font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
@@ -686,6 +674,12 @@
     lockForPhase(prefix, st);
   }
 
+  // HTTPS 入口的真实端口从 config 拿（HTTPS_PORT 可配置，写死 3443 会把用户指去打不开的地址）
+  let httpsPort = 0;
+  fetch('api/xfer/config').then((r) => r.json())
+    .then((c) => { httpsPort = Number(c.httpsPort) || 0; })
+    .catch(() => { /* 拿不到就不给具体地址，只说"用 HTTPS 入口" */ });
+
   // 一句话说清当前模式与限制，并给可执行的下一步（HTTP 入口那行不是死胡同）
   function paintMode(prefix, st) {
     const el = $(`${prefix}-mode`);
@@ -700,8 +694,12 @@
     if (st.channel === 'server_relay') parts.push({ txt: '现在是服务器密文中转：服务器只搬密文，看不到文件名和内容。', warn: false });
     else if (st.channel === 'p2p') parts.push({ txt: '现在是点对点直连：内容不经过服务器。', warn: false });
     else if (st.channel === 'p2p_connecting') parts.push({ txt: '正在尝试点对点直连；连不上会自动改走服务器中转。', warn: false });
-    // 不只是告诉用户"你降级了"，要给一个能做的动作
-    if (deg) parts.push({ txt: `要直连请改用 HTTPS 入口：https://${location.hostname}:3443`, warn: true });
+    // 不只是告诉用户"你降级了"，要给一个能做的动作；端口从服务端配置来，不写死
+    if (deg) {
+      parts.push({ txt: httpsPort
+        ? `要直连请改用 HTTPS 入口：https://${location.hostname}:${httpsPort}`
+        : '要直连请改用 HTTPS 入口（地址里的端口问部署这台服务的人）', warn: true });
+    }
     el.hidden = false;
     el.innerHTML = parts.map((p) => `<span class="mode-i${p.warn ? ' warn' : ''}">${p.txt}</span>`).join('');
   }

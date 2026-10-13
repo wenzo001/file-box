@@ -140,7 +140,7 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 | 方法与路径 | 作用 | 鉴权 | 备注 |
 |---|---|---|---|
 | `GET /config` | 返回 STUN/TURN 是否可用、TTL 等公共配置 | 无 | 不含密钥 |
-| `POST /create` | 建会话：`sid, proof, frames, totalBytes` | proof | 返回一次性 sender token（服务端只存其 SHA-256） |
+| `POST /create` | 建会话：`sid, proof, frames, totalBytes` | proof | 返回一次性 sender token（服务端只存其 SHA-256）。无凭证端点，受 `XFER_CREATE_LIMIT` 限速 |
 | `POST /join` | 接收方配对 | proof | 失败计数进限流 |
 | `GET /events` | SSE：`joined/key/confirm/offer/answer/ice/ack/done/cancelled` | sender token 或 proof | 断线后服务端补发最近一条同类信令 |
 | `POST /signal` | 转发一条信令 | 同上 | kind 白名单：offer/answer/ice/key/confirm/channel-ready/xfer-error |
@@ -148,7 +148,7 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 | `PUT /seg?sid&i` | 上传一帧密文 | sender token | 单帧上限 `XFER_MAX_SEG`，并发上限 `XFER_MAX_INFLIGHT` |
 | `GET /seg?sid&i` | 拉一帧密文 | proof | 幂等：同一 i 返回同一字节 |
 | `GET /state?sid` | 查 uploaded/acked/frames/totalBytes/expiresAt | 任一凭证 | 只回区间，不回内容 |
-| `POST /ack` | 接收方上报"已本地落盘"的块 | proof | 这是三档进度里最高的一档 |
+| `POST /ack` | 接收方上报"已本地落盘"的块 | proof | 这是三档进度里最高的一档。**语义是信任声明**：P2P 直连的块不过服务器，服务端无法验证，能约束的只有协议帧号空间 |
 | `POST /done` / `POST /cancel` | 结束会话 | 任一凭证 | 结束后再保留 `XFER_END_KEEP_MS`，然后连目录一起删 |
 | `GET /sessions` | 运维视图：状态与字节数 | 无（只含 sid/计数） | 不含文件名、密钥、凭证 |
 
@@ -173,12 +173,14 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 | `XFER_MAX_SEG` | 8 MiB | 单帧上限 |
 | `XFER_MAX_FRAMES` | 200000 | 单会话帧数上限（≈25 GB @128 KiB） |
 | `XFER_JOIN_FAIL_LIMIT` | 30 / 10 分钟 | 猜码代价，超了冻结该 IP |
+| `XFER_CREATE_LIMIT` | 10 / 10 分钟 | 无凭证 create 的限速：不给刷会话把别人的活跃会话挤掉的机会 |
 | `XFER_END_KEEP_MS` | 60000 | 完成后/取消后密文再留多久 |
 | `STUN_URLS` | 空 | 逗号分隔 |
 | `TURN_URLS` | 空 | 逗号分隔 |
 | `TURN_SECRET` | 空 | 短期凭证的 HMAC 根密钥；不配就不会用 TURN |
 | `TURN_USER` / `TURN_PASS` | 空 | 静态 TURN 账号（不推荐，优先用 `TURN_SECRET` 派生的短期口令） |
 | `TURN_TTL_SECONDS` | 3600 | 短期 TURN 口令有效期 |
+| `TRUST_PROXY` | 空（server.js） | 反代部署时设 `1`，`req.ip` 才是真实客户端地址；限流按 IP 记账，反代不设的话所有用户共享一个桶 |
 
 `ecosystem.config.js` 里给了 `TRANSFER_DIR` 与 `XFER_*` 的示例条目。
 
@@ -206,10 +208,11 @@ TURN 凭证是服务端按 coturn 的 REST API 口令方式现算的短期凭证
 
 ## 8 服务端存的到底是什么
 
-`TRANSFER_DIR/<sid>/`：`meta.json`（sid、proof 哈希、帧数、字节数、过期时间、状态、uploaded/acked 区间）、
+`TRANSFER_DIR/<sid>/`：`meta.json`（sid、proof 的 SHA-256、发送方令牌的 SHA-256、帧数、字节数、过期时间、状态）、
 `seg-<i>.bin`（一帧密文，文件名是序号，不含原名）。没有明文、没有密钥、没有真实文件名。
+配对凭证与发送方令牌都只落 SHA-256：能读到这个目录的人也拿不到可重放的凭证。
 权限随进程默认 umask，目录与 `uploads/` 逻辑隔离，正式列表/下载接口读不到它。
-重启时 `bootReclaim` 会把"写了一半的 .tmp"清掉、未过期会话保留、账本从磁盘重建。
+重启时 `bootReclaim` 会把"写了一半的 .tmp"清掉、未过期会话保留、账本从磁盘重建（bytes 按磁盘实况修正）。
 
 清理路径：完成 / 取消 / 过期 / 服务重启后的残留 tmp，都有对应代码路径；测试里逐条断言过目录真的消失。
 

@@ -608,6 +608,8 @@
       if (stored.size === st.frames && manifest) finishReceive();
     }
     async function flushAcks() {
+      // 注意：序号 0 是加密清单帧，但它在服务器的帧号空间**之内**（frames 含它），
+      // done 门按 acked.size === frames 对账 —— 把 0 过滤掉 done 就永远差一块。
       const list = [...ackBuf];
       ackBuf.clear();
       if (!list.length) return;
@@ -896,10 +898,16 @@
         const rec = resume.record;
         const parsed = P.parseCode(rec.code);
         if (!parsed) throw new Error('本地存的传输码读不回来了');
+        // 双向核对：少选一个文件，frame 布局就和原会话对不上，对端会永远等不到那几块 —— 必须拒绝
+        const saved = rec.files || [];
         for (const f of list) { // 清单先核完再哈希：不然白等一趟才发现对不上
-          const want = (rec.files || []).find((x) => x.relPath === f.relPath);
+          const want = saved.find((x) => x.relPath === f.relPath);
           if (!want) throw new Error(`这次的清单里没有「${f.name}」，不能续原会话`);
           if (want.size !== f.size) throw new Error(`「${f.name}」大小变了（${want.size} → ${f.size}），不能续原会话`);
+        }
+        if (list.length !== saved.length) {
+          const miss = saved.find((x) => !list.some((f) => f.relPath === x.relPath));
+          throw new Error(`原会话还有 ${saved.length - list.length} 个文件没选上（比如「${miss ? miss.name : '?'}」），要续传必须重新选齐同一批`);
         }
         st.sid = parsed.sid;
         secret = parsed.secret;

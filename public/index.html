@@ -10,6 +10,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>文件盒子</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='5' fill='%23007AFF'/><path d='M12 16V7M7.5 11.5L12 7l4.5 4.5' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="progress-strip.css">
 <style>
   /* ---------- iOS 系统颜色（Apple HIG） ---------- */
   :root {
@@ -147,23 +148,8 @@
   #file-list .rm svg { width: 15px; height: 15px; }
   #file-list .rm:active { opacity: .4; }
 
-  /* 上传进度：一块一块拼成的长条。每块 = 一个上传块（固定约 4MiB，最后一块是余数），
-     块数随文件大小变；块多了自动换行，超过 4 行才出现滚动，免得把按钮挤下去 */
-  #blocks {
-    display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
-    margin-top: 14px; padding: 3px; border-radius: 7px;
-    background: var(--fill);
-    /* 格子大小由 layoutStrip 按块数算：块多就缩小格子，绝不在长条里加滚动条（手机上要能一眼看全） */
-    --blk-w: 9px; --blk-h: 12px;
-  }
-  #blocks .blk {
-    width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
-    transition: background .12s, opacity .12s;
-  }
-  #blocks .blk.done { background: var(--accent-fill); }
-  #blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
-  #blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); } /* 清单那一块 */
-  @keyframes blkPulse { 50% { opacity: .3; } }
+  /* 上传进度：进度条本体样式在 progress-strip.css（与无痕传输页共用）；
+     这里只留状态行。每块 = 一个上传块（约 4MiB），格子大小由 layoutStrip 算 */
   #up-status {
     font-size: 13px; color: var(--text2); margin-top: 8px; text-align: center;
     font-variant-numeric: tabular-nums;
@@ -667,7 +653,7 @@ async function refreshBatch() {
   const version = selectionVersion;
   const key = batchIdentity(selected).key;
   const plan = planBatch(key, selected);
-  const r = await apiPost('/api/upload/init', {
+  const r = await apiPost('api/upload/init', {
     key,
     files: plan.layout.map(({ enc, chunks }) => ({ enc, chunks })),
   });
@@ -873,7 +859,7 @@ async function upload() {
     // 三次都没过才放弃（进度与清单保留，可手动续传）；明确被拒的（大小不符/超额/过期）不重试。
     // body 是 Blob：不可变、可反复读，所以重试直接复用同一个，不用重新加密
     const putChunk = async (fi, ci, body, crc) => {
-      const url = `/api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`;
+      const url = `api/upload/part?u=${uploadId}&f=${fi}&c=${ci}`;
       let lastErr = new Error('上传失败');
       for (let attempt = 1; attempt <= CHUNK_ATTEMPTS; attempt++) {
         let r = null, d = {};
@@ -936,7 +922,7 @@ async function upload() {
     }
 
     setStatus('正在合并…');
-    const out = await apiPost('/api/upload/finish', { uploadId });
+    const out = await apiPost('api/upload/finish', { uploadId });
     toast(`上传成功 · ${out.count} 个文件`);
     selected = [];
     batch = null;
@@ -997,7 +983,9 @@ const hotTag = (name) => (hotFolders.has(name) ? '<span class="tag hot">热乎</
 
 const folderHtml = (f) => `
       <div class="folder" data-name="${esc(f.name)}">
-        <div class="folder-head" onclick="toggleFolder(this.parentElement)">
+        <div class="folder-head" role="button" tabindex="0" aria-expanded="false"
+          onclick="toggleFolder(this.parentElement)"
+          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleFolder(this.parentElement);}">
           <span class="chev"><svg viewBox="0 0 8 13" fill="none" stroke="currentColor"
             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 1l5 5.5L2 12"/></svg></span>
           <div class="folder-main">
@@ -1076,7 +1064,7 @@ async function loadList(full = true) {
     $('#empty').style.display = 'none';
   }
   try {
-    const r = await fetch('/api/list');
+    const r = await fetch('api/list');
     const data = await r.json();
     // 存储用量（旧版后端可能无 usage 字段，兜底避免列表不渲染）
     const u = data.usage || { used: 0, limit: 1, limitGB: 10, retentionDays: 90 };
@@ -1123,18 +1111,20 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) refr
 // 展开/收起目录；首次展开时拉取加密清单，解密出真实文件名
 function toggleFolder(el) {
   el.classList.toggle('open');
+  const head = el.querySelector('.folder-head');
+  if (head) head.setAttribute('aria-expanded', String(el.classList.contains('open')));
   if (el.classList.contains('open')) fillBody(el);
 }
 async function fillBody(el) {
   const body = el.querySelector('.folder-body');
   if (body.dataset.filled) return;
-  body.dataset.filled = '1';
   const folder = el.dataset.name;
   const serverFiles = (lastList && lastList.folders.find((x) => x.name === folder) || { files: [] }).files;
   body.innerHTML = '<div class="file-row"><span class="name" style="color:var(--text2)">加载中…</span></div>';
   try {
     const hasMf = serverFiles.some((x) => x.name === 'manifest.enc');
     const m = hasMf ? await getManifest(folder) : null;
+    body.dataset.filled = '1'; // 全部成功才标"已填"，失败允许重试
     let rows;
     if (m && m.files) {
       // 加密目录：显示真实文件名，下载时解密
@@ -1150,29 +1140,37 @@ async function fillBody(el) {
         <div class="file-row">
           <span class="name" title="${esc(x.name)}">${esc(x.name)}</span>
           <span class="size">${fmtSize(x.size)}</span>
-          <a href="/api/download/${enc(folder)}/${enc(x.name)}">下载</a>
+          <a href="api/download/${enc(folder)}/${enc(x.name)}">下载</a>
         </div>`);
     }
     body.innerHTML = rows.join('') || '<div class="file-row"><span class="name" style="color:var(--text2)">空目录</span></div>';
   } catch (e) {
-    body.innerHTML = '';
+    // 拉清单失败 ≠ 旧数据：不能把密文名当可下载的文件展示，更不能把这次失败缓存住
+    delete body.dataset.filled;
+    body.innerHTML = `
+      <div class="file-row"><span class="name" style="color:var(--red-ink, var(--red))">${esc(e.message || '加载失败')}</span>
+      <a href="javascript:void(0)" class="dl" id="retry-body" style="flex-shrink:0">重试</a></div>`;
+    body.querySelector('#retry-body').addEventListener('click', () => { body.innerHTML = ''; fillBody(el); });
     toast(e.message || '加载失败');
   }
 }
-// 拉取并解密目录清单（真实文件名）
+// 拉取并解密目录清单（真实文件名）。
+// 404 = 旧数据真的没有清单（返回 null，走兼容展示）；其他失败 = 网络/解密出错（抛出，让用户重试）
 function getManifest(folder) {
   if (!manifestCache[folder]) {
-    keepManifest(folder, fetch(`/api/download/${enc(folder)}/manifest.enc`)
-      .then((r) => (r.ok ? r.arrayBuffer() : null))
-      .then(async (buf) => buf ? JSON.parse(td.decode(await FBCrypto.decryptBytes(new Uint8Array(buf)))) : null)
-      .catch(() => null));
+    keepManifest(folder, fetch(`api/download/${enc(folder)}/manifest.enc`)
+      .then(async (r) => {
+        if (r.status === 404) return null;
+        if (!r.ok) throw new Error(`清单拉取失败 (${r.status})`);
+        return JSON.parse(td.decode(await FBCrypto.decryptBytes(new Uint8Array(await r.arrayBuffer()))));
+      }));
   }
   return manifestCache[folder];
 }
 
 // ---------- 下载（自动解密） ----------
 async function fetchAndDecrypt(folder, encName) {
-  const r = await fetch(`/api/download/${enc(folder)}/${enc(encName)}`);
+  const r = await fetch(`api/download/${enc(folder)}/${enc(encName)}`);
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));
     throw new Error(d.error || '下载失败');
@@ -1419,7 +1417,7 @@ async function downZip(nameEnc, btn) {
   };
 
   try {
-    const r = await fetch(`/api/archive/${enc(folder)}`);
+    const r = await fetch(`api/archive/${enc(folder)}`);
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       throw new Error(d.error || '打包失败');
@@ -1550,7 +1548,7 @@ function delFolder(name) {
         class: 'sheet-del',
         onClick: async () => {
           try {
-            const r = await fetch(`/api/folder/${name}`, { method: 'DELETE' });
+            const r = await fetch(`api/folder/${name}`, { method: 'DELETE' });
             const d = await r.json().catch(() => ({}));
             if (!r.ok) throw new Error(d.error || '删除失败');
             delete manifestCache[folder];
