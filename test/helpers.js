@@ -27,12 +27,27 @@ async function startServer(extra = {}, dirOverride = null, slot = 0) {
   // 每个测试文件是独立进程，端口按 pid + slot 错开；真撞上就换个再来一次
   for (let attempt = 0; ; attempt++) {
     const PORT = 4600 + (process.pid % 300) + slot * 37 + attempt * 41;
+    // fetch（undici）有一份"禁用端口"名单（5002-5157、6665-6669 那几段），命中时**服务端能正常 bind，
+    // 客户端却直接抛 bad port** —— 于是同一条腿会因为当时算出来的端口而整轮变红，
+    // 看起来完全不像测试的问题（实测 downloadstats 那条"重启后计数还在"就这么红过一次）。
+    if (await portIsBlocked(PORT)) {
+      if (attempt >= 11) throw new Error(`端口一直撞在 fetch 的禁用名单上（最后试的是 ${PORT}）—— 夹具的取端口方式要改`);
+      continue;
+    }
     try {
       return await boot(dir, PORT, extra);
     } catch (err) {
       if (attempt >= 3 || !/EADDRINUSE/.test(err.message)) throw err;
     }
   }
+}
+
+/** 只问一件事：这个端口 undici 肯不肯拿去做 fetch。绑得住但客户端拒绝的端口必须提前绕开。
+ *  用模块加载时取到的原生 fetch —— 台架会把 globalThis.fetch 换成注入器，这里不该被它记账。 */
+const NATIVE_FETCH = globalThis.fetch.bind(globalThis);
+async function portIsBlocked(p) {
+  try { await NATIVE_FETCH(`http://127.0.0.1:${p}/`); return false; }
+  catch (err) { return /bad port/.test(String((err && err.cause && err.cause.message) || err)); }
 }
 
 async function boot(dir, PORT, extra) {

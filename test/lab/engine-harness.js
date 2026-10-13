@@ -12,6 +12,10 @@ const path = require('path');
 
 const PUB = path.join(__dirname, '..', '..', 'public');
 
+// Node 原生 fetch 在"任何一个台架装起来之前"取一次，全模块共用。
+// 台架会把 globalThis.fetch 换成自己的注入器，所以晚取的那个"原生"其实是别人的注入器（见 boot() 里的注释）。
+const REAL_FETCH = globalThis.fetch.bind(globalThis);
+
 /** 可控 DataChannel 桩：send 只涨缓冲，按 rate 匀速排空，跌回低水位发 bufferedamountlow */
 class FakeChannel {
   constructor(link, name) {
@@ -134,8 +138,18 @@ function boot({ link, base }) {
         try {
           if (msg.op === 'sha256') back({ hex: P.hex(await P.sha256(new Uint8Array(msg.bytes))) });
           // 注入"某个加密线程再也不回话"（真浏览器里对应 worker 被杀/卡死：postMessage 发出去了，
-          // onmessage 永远不会来）。这是 sendSeq 里第三个也会永久挂住的 await 点。
+          // onmessage 永远不会来）。这是 sendSeq 里第三个也会永久挂住的 await 点 —— **不可自愈**：
+          // 线程池那一格被永远占着，重投也排不到活的线程。
           else if (msg.op === 'seal' && counters.stuckSeal > 0) { counters.stuckSeal--; }
+          // 注入"回话很慢但最终会回" —— **可自愈**那一类：用来看引擎会不会自己接着跑完，
+          // 以及跑起来之后还挂不挂着旧的"卡住了"（假警报残留）
+          else if (msg.op === 'seal' && counters.slowSeal > 0) {
+            counters.slowSeal--;
+            setTimeout(() => {
+              P.seal({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), type: msg.type, fileId: msg.fileId, chunkIdx: msg.chunkIdx, plaintext: new Uint8Array(msg.plaintext) })
+                .then((frame) => back({ frame })).catch(() => {});
+            }, counters.slowSealMs || 1500);
+          }
           else if (msg.op === 'seal') back({ frame: await P.seal({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), type: msg.type, fileId: msg.fileId, chunkIdx: msg.chunkIdx, plaintext: new Uint8Array(msg.plaintext) }) });
           else if (msg.op === 'open') {
             const r = await P.open({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), frame: new Uint8Array(msg.frame) });
@@ -178,9 +192,15 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0 };
-  const nativeFetch = g.fetch;
-  defg('fetch', (url, opt = {}) => {
+  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0, slowSeal: 0, slowSealMs: 1500, doneLog: [] };
+  // 原生 fetch 只能在模块加载时取一次。以前写的是 `const nativeFetch = g.fetch` —— 而 g.fetch 在
+  // 第二个台架起来时**已经是上一个台架的注入器**了，于是注入是套着往下漏的：
+  // 89 号腿留的 refuseFinish=99 让 90 号腿每一次收尾都吃 409（单独跑 90 全绿，接在 89 后面必红）。
+  const nativeFetch = REAL_FETCH;
+  if (typeof nativeFetch === 'function' && nativeFetch.__xferLabStub) {
+    throw new Error('台架嵌套：转发目标不是 Node 原生 fetch，而是上一个台架的注入器');
+  }
+  const labFetch = (url, opt = {}) => {
     const u = String(url).startsWith('http') ? String(url) : base + '/' + String(url).replace(/^\//, '');
     const method = opt.method || 'GET';
     const pathname = new URL(u).pathname;
@@ -219,8 +239,21 @@ function boot({ link, base }) {
         }
       });
     }
+    // 收尾请求的真实下场要留痕：红的时候"被服务器拒了"和"被自己的超时掐了"是两条完全不同的根因，
+    // 只报一句 phase=retrying 会让下一个人从头猜（2GB 之后新增的那条"自己恢复了"就卡在这里）
+    if (pathname === '/api/xfer/done' && method === 'POST') {
+      return nativeFetch(u, opt).then(async (r) => {
+        let body = '';
+        try { body = (await r.clone().text()).slice(0, 80); } catch { /* 拿不到体就只报状态码 */ }
+        counters.doneLog.push(`http${r.status}${r.ok ? '' : ' ' + body}`);
+        return r;
+      },
+        (e) => { counters.doneLog.push(e && e.name === 'AbortError' ? 'aborted(超时掐掉)' : `err:${e && e.message}`); throw e; });
+    }
     return nativeFetch(u, opt);
-  });
+  };
+  labFetch.__xferLabStub = true;
+  defg('fetch', labFetch);
 
   for (const f of ['xfer-proto.js', 'xfer-engine.js']) delete require.cache[require.resolve(path.join(PUB, f))];
   require(path.join(PUB, 'xfer-proto.js'));

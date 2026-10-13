@@ -15,10 +15,18 @@ const FRAME = 131072;
 /** 一条用例的完整生命周期：起服务、装台架、跑 body、保证关掉两端会话再停服务 */
 async function withLab(opts, body) {
   const srv = await startServer(Object.assign({ XFER_CREATE_LIMIT: '1000' }, opts.serverEnv || {}), null, opts.slot);
-  const link = makeLink({ drainRate: opts.drainRate });
-  const env = boot({ link, base: srv.base });
-  const sender = env.E.Session({ role: 'sender', on() {}, config: opts.cfg });
-  const receiver = env.E.Session({ role: 'receiver', on() {}, config: opts.cfg });
+  let link, env, sender, receiver;
+  // 装台架这一步自己也会炸（engine-harness 里那条"台架嵌套"守卫就是）。那时监听已经开了，
+  // 不把服务关掉就往上抛，跑测进程永远等不到端口释放 —— 变异台就是这么挂了 6 分钟没出一行结论
+  try {
+    link = makeLink({ drainRate: opts.drainRate });
+    env = boot({ link, base: srv.base });
+    sender = env.E.Session({ role: 'sender', on() {}, config: opts.cfg });
+    receiver = env.E.Session({ role: 'receiver', on() {}, config: opts.cfg });
+  } catch (err) {
+    await srv.stop().catch(() => { /* 已经关了 */ });
+    throw err;
+  }
   try {
     return await body({ srv, link, env, sender, receiver });
   } finally {
@@ -529,4 +537,52 @@ test('没有任何一块有进展时，不许静默挂着：到点必须把"卡�
   assert.notStrictEqual(sender.state.phase, 'done', '一块都没进展却报"传输完成"');
   assert.notStrictEqual(receiver.state.verified, true, '发送端卡住了接收端却被判通过');
   assert.ok(/继续|重试/.test(sender.state.error), `报错要给出可操作动作，实际="${sender.state.error}"`);
+  // 报出来只是第一步。这一类（worker 再也不回话）其实**不可自愈**：线程池那一格被永远占着，
+  // 重投也排不到活的线程 —— 所以这里要钉的是"先自己试、试不通才交给人"，而不是"最后一定跑得完"。
+  // （能自愈的那一类在下面那条腿：慢但最终会回话。）
+  const t2 = Date.now();
+  let tried = false;
+  while (Date.now() - t2 < 40000) {
+    const e = sender.state.error || '';
+    if (/正在自己重试/.test(e)) tried = true;
+    if (/点"继续"/.test(e)) break;
+    await sleep(150);
+  }
+  assert.ok(tried, '一次都没试过自己恢复，直接把恢复动作丢给了用户');
+  assert.ok(/点"继续"/.test(sender.state.error),
+    `自己试过之后应当退到"给人工出口"，实际="${sender.state.error}"`);
+  assert.notStrictEqual(sender.state.phase, 'done', '一块都没进展却报"传输完成"');
+  assert.notStrictEqual(receiver.state.verified, true, '发送端卡住了接收端却被判通过');
+}));
+
+// 可自愈的那一类：慢但最终会回话。要钉两件事 —— 它要真的自己跑完，
+// 而且跑起来之后不许把上一轮的"卡住了"继续挂在脸上（假警报残留）。
+test('卡住之后自己恢复了：要跑完，并且不许留着旧的"卡住了"吓用户', () => withLab({
+  slot: 90, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, parallel: 4, stallMs: 700, netTimeoutMs: 400, retryGapMs: 300 },
+}, async ({ env, srv, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'r.bin', name: 'r.bin', size, mime: 'application/octet-stream', file: fakeFile('r.bin', size, 127) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12000 && !sender.state.sentFrames) await sleep(50);
+  assert.ok(sender.state.sentFrames > 0, `夹具坏了：一帧都没发出去（phase=${sender.state.phase}）`);
+  env.counters.slowSeal = 2; env.counters.slowSealMs = 2500;   // 两格线程慢 2.5 秒才回话：越过 stallMs，但最终会回来
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `慢线程之后没能跑完：接收端 phase=${st.phase} error=${st.error}`);
+  const t = Date.now();
+  // 轨迹：红的时候必须能一眼看出是"哪一档没过去"（收尾被 409 / 请求超时 / 又卡住一次），
+  // 只报一个 phase='retrying' 等于让下一个人从头猜
+  const trail = [];
+  let prev = '';
+  while (Date.now() - t < 20000 && sender.state.phase !== 'done') {
+    const s = sender.state;
+    const snap = `${s.phase}|${s.error}|sent=${s.sentFrames}/${s.frames} ack=${s.stored}`;
+    if (snap !== prev) { trail.push(`${Math.round((Date.now() - t) / 1000)}s ${snap}`); prev = snap; }
+    await sleep(100);
+  }
+  const where = `轨迹 ${trail.join(' → ') || '(一直没变过)'}；收尾请求的真实下场 ${env.counters.doneLog.join(',') || '(一次都没发)'}`
+    + `；本台架 refuse=${env.counters.refuseFinish} hang=${env.counters.hangFinish} 端口 ${srv.port} sid ${sender.state.sid}`;
+  assert.strictEqual(sender.state.phase, 'done', `没能收尾：${sender.state.phase}（${where}）`);
+  assert.strictEqual(sender.state.error, '',
+    `进度已经恢复，界面上还挂着"${sender.state.error}" —— 对着用户说假话（${where}）`);
 }));

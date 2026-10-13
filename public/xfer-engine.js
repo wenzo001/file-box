@@ -439,6 +439,10 @@
     const late = [];                // 清单还没到时的迟到帧
     let running = false;
     let paused = false;
+    // 卡住之后"自己再试几次"的预算。放在会话作用域而不是 pump() 里：
+    // 每次自愈都要重新叫起一个 pump()，若计数器跟着重置，就会变成 stallMs 一轮无限重试 —— 那是另一种无限等待
+    let stallTries = 0;
+    let beatSent = 0;   // 只有"真的又发出去过块"才把预算还回去；光换一个新的 pump() 不算进展
     let closed = false;
     let aborted = false;            // 用户主动取消（准备阶段也要能停）
     let api = null;
@@ -579,8 +583,8 @@
         // sendSeq 里除了网络还有别的会永远不回来的 await（比如某个加密线程被浏览器杀掉：
         // postMessage 发出去了、onmessage 再也不来），那种情况下并行槽被占满、
         // 进度不再动、界面也不报错 —— 2GB 实测撞到的就是这种"静默挂着"。
-        // 这里不假装能救活（救不活），只保证**不装死**：一段时间任何一块都没有进展，就把话说出来，
-        // 并且留在可以继续的档位上，而不是停在"传输中"永远等一个不会来的东西。
+        // 这里先试着自己恢复（下面 stalled() 那一段：退出去、隔一会儿重新叫起 pump），
+        // 试不通才把话说出来并留在"点继续"的档位上 —— 而不是停在"传输中"永远等一个不会来的东西。
         let beatKey = '', beatAt = Date.now();
         const stalled = () => {
           const now = Date.now();
@@ -588,7 +592,16 @@
           // 否则"按下暂停 → 过一分钟继续"会被报成卡住（假警报比沉默更糟）
           if (paused) { beatAt = now; return false; }
           const key = `${st.sentFrames}|${acked.size}|${cursor}`;
-          if (key !== beatKey) { beatKey = key; beatAt = now; return false; }
+          if (key !== beatKey) {
+            const hadStalled = st.phase === 'retrying' && /卡住/.test(st.error);
+            beatKey = key; beatAt = now;
+            // 自愈预算只在"真的又发出去过块"时才还：换个新 pump 重进不算进展。
+            // 否则线程池死格那种**不可自愈**的卡住会被无限重试下去 —— 正是要消灭的"无限等待"
+            if (st.sentFrames > beatSent) { beatSent = st.sentFrames; stallTries = 0; }
+            // 自己好了就不能再把"卡住了"挂在脸上：留着旧报错就是"进度在动、话却不对"
+            if (hadStalled) patch({ error: '', phase: 'transferring' });
+            return false;
+          }
           return now - beatAt > cfg.stallMs;
         };
         while (cursor < st.frames || inflight.size) {
@@ -608,7 +621,20 @@
           if (inflight.size) await Promise.race([...[...inflight].map((x) => x.p), sleep(300)]);
           await refreshAck();
           if (st.error && st.phase === 'retrying' && acked.size === st.frames) patch({ error: '', phase: 'transferring' });
-          if (stalled()) { fail(`传输卡住了：${Math.round(cfg.stallMs / 1000)} 秒没有任何一块有进展；点"继续"接着传`, true); return; }
+          if (stalled()) {
+            // 先自己再试两次，而不是把恢复交给人手：这一类卡住多数会自己过去（worker 被重启、
+            // 链路恢复）。必须"退出当前 pump 再重进"才有意义 —— 卡住的那些 promise 还挂在
+            // inflight 里，留在同一个循环里 continue 只是继续占满窗口。
+            const secs = Math.round(cfg.stallMs / 1000);
+            if (stallTries < 2) {
+              stallTries++;
+              fail(`传输卡住了：${secs} 秒没有任何一块有进展，正在自己重试（第 ${stallTries} 次）`, true);
+              setTimeout(() => { if (!closed && !aborted) pump(); }, Math.max(300, cfg.retryGapMs)).unref?.();
+            } else {
+              fail(`传输卡住了：${secs} 秒没有任何一块有进展；点"继续"接着传`, true);
+            }
+            return;
+          }
         }
         for (let guard = 0; guard < 1200 && acked.size < st.frames; guard++) {
           if (closed) return;

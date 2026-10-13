@@ -115,8 +115,19 @@ const KNIVES = {
   },
   // 刀十七：把"卡住看门狗"关掉 —— 加密线程不回话那一条腿必须回红（静默挂着，界面上什么也没有）
   'no-stall-watch': {
-    from: '          if (stalled()) { fail(',
-    to: '          if (false && stalled()) { fail(',
+    from: '          if (stalled()) {',
+    to: '          if (false && stalled()) {',
+  },
+  // 刀十八：只报不救 —— 卡住之后直接把恢复动作丢给用户。
+  //         「不许静默挂着」那条腿里"先试着自己恢复"那半句必须红（它钉的是 tried 这个读数）。
+  'no-self-heal': {
+    from: '            if (stallTries < 2) {',
+    to: '            if (false) {',
+  },
+  // 刀十九：恢复了却还把"卡住了"挂在脸上（假警报残留）—— 只该红"自己恢复了"那条腿
+  'stale-alarm': {
+    from: "            if (hadStalled) patch({ error: '', phase: 'transferring' });",
+    to: '            /* 不清旧报错 */',
   },
 };
 
