@@ -118,6 +118,13 @@ HTTP 入口（非安全上下文）没有 WebCrypto 时，走同一套接口的�
 | 安全上下文 + 有 WebRTC | 先试直连：trickle ICE 交换候选，`p2pTimeoutMs` 内没开成 DataChannel 就转服务器中转 |
 | HTTP 入口 / 没有 WebCrypto / 没有 RTCPeerConnection | 直接服务器中转（仍然全程应用层加密，只是慢一点、多一跳） |
 | 直连失败 / `disconnected` / `closed` | 关掉 rtc，转 `server_relay`，继续用同一批帧、同一套进度集合，不重发已确认的块 |
+| **DataChannel 缓冲满（背压）** | **不是降级理由**。`bufferedAmount` 越过 4MB 高水位就等，等它跌回 1MB 低水位（`bufferedamountlow` + 100ms 轮询双保险）再续发；连续 30 秒排不动才算链路失效并降级 |
+
+背压这一条单独说：以前"缓冲满了"和"通道没了"走的是同一个分支，于是健康的直连一旦被对端
+读取速度堵住，剩下的整份文件都会被"额外"PUT 进服务器中转区（界面还写着"直连"）。
+现在两者分开，并且发送端会记 `dcFrames` / `relayFrames`：一个字节都没走通道的情况下，
+通道标识会立刻如实改成 `server_relay`，不会停在"正在建立直连"。
+慢确认也不再被当成丢包 —— 同一帧两次重发之间至少隔 `retryGapMs`（5 秒）。
 | 配了 TURN 且拿到短期凭证 | ICE 候选里带 TURN；选中候选对是 relay 类型 → 报 `turn_relay`（UI 写明"不是直连"） |
 | TURN 拿不到 / 被防火墙挡 / 仍然不通 | 转服务器中转；三方都不行 → `retrying`/`failed`，给出可操作文案，不会无限等 |
 | 中转区写入失败、429 太忙 | 指数退避重试 5 次，再失败就把错误报给用户并且可以续传 |

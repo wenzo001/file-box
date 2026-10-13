@@ -22,6 +22,9 @@
     pollMs: 1500,
     ackEvery: 8,            // 攒几块再报一次确认，省请求
     dcBufferHigh: 4 * 1024 * 1024,
+    dcBufferLow: 1 * 1024 * 1024,   // 背压恢复的低水位：降到这里才继续发（配合 bufferedamountlow）
+    dcDrainTimeoutMs: 30000,        // 缓冲 30 秒还排不动 = 链路真的不行了，这时才允许降级
+    retryGapMs: 5000,               // 同一帧两次重发之间至少隔这么久：否则慢确认会被当成"没送到"反复重发
   };
 
   // ---------------- 加密线程池（主线程绝不碰 AES/SHA，否则手机端页面会冻） ----------------
@@ -259,6 +262,8 @@
     function bind(ch) {
       dc = ch;
       dc.binaryType = 'arraybuffer';
+      // 低水位要先设好：bufferedamountlow 只在"从上往下穿过阈值"时触发
+      try { dc.bufferedAmountLowThreshold = DEFAULTS.dcBufferLow; } catch { /* 老实现没这个属性就走轮询 */ }
       dc.onopen = () => { open = true; handlers.onState(pc.connectionState, true); };
       dc.onclose = () => { open = false; handlers.onState(pc.connectionState, false); };
       dc.onmessage = (ev) => handlers.onFrame(new Uint8Array(ev.data));
@@ -284,6 +289,38 @@
         if (dc.bufferedAmount > DEFAULTS.dcBufferHigh) return false;  // 背压：让上层等一会再发
         dc.send(bytes);
         return true;
+      },
+      get buffered() { return dc ? dc.bufferedAmount : Infinity; },
+      /**
+       * 等发送缓冲排空到低水位。返回：
+       *   'ready'   可以继续走通道发了
+       *   'closed'  通道/会话已经没了（别等）
+       *   'stalled' 等了 timeoutMs 还排不动 —— 这时才可以说"这条直连真的不干活"
+       * 事件 + 轮询双保险：bufferedamountlow 在部分实现上不会来，只等事件就是死等。
+       */
+      drainReady(timeoutMs, shouldStop) {
+        if (!api.open) return Promise.resolve('closed');
+        const low = dc.bufferedAmountLowThreshold || DEFAULTS.dcBufferLow;
+        if (dc.bufferedAmount <= low) return Promise.resolve('ready');
+        return new Promise((resolve) => {
+          let done = false;
+          const finish = (r) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer); clearInterval(probe);
+            dc.onbufferedamountlow = null;
+            resolve(r);
+          };
+          dc.onbufferedamountlow = () => finish('ready');
+          const timer = setTimeout(() => finish('stalled'), timeoutMs);
+          const probe = setInterval(() => {
+            if (shouldStop && shouldStop()) return finish('closed');
+            if (!api.open) return finish('closed');
+            if (dc.bufferedAmount <= low) finish('ready');
+          }, 100);
+          if (timer.unref) timer.unref();
+          if (probe.unref) probe.unref();
+        });
       },
       // 只有真的选中了 relay 候选才算"TURN 中继"，不能拿"配了 TURN"当直连成功
       async mode() {
@@ -350,7 +387,8 @@
     const net = makeApi(role, { get token() { return token; }, get proof() { return proof; } });
     const st = {
       role, phase: 'idle', channel: 'none', code: '', sid: '', frames: 0, totalBytes: 0,
-      sentFrames: 0, bytesOnWire: 0, uploaded: 0, stored: 0, speed: 0, eta: 0,
+      sentFrames: 0, bytesOnWire: 0, dcFrames: 0, relayFrames: 0,
+      uploaded: 0, stored: 0, speed: 0, eta: 0,
       safety: '', kex: '', engine: '', error: '', note: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
       fpDone: 0, fpTotal: 0,          // 准备阶段：已读/总字节，界面拿它画进度和预计耗时
       peerConfirmed: false,
@@ -373,6 +411,7 @@
     let pendingConfirm = null;      // 早于密钥到达的对方 confirm，握手完成后补验
     let resumeMode = false;
     const acked = new Set();        // 接收端已落盘并上报过的块（发送端从服务器读到）
+    const sentAt = new Map();       // 每帧最后一次发出去的时刻：慢确认不等于"没送到"，别立刻重发
     const stored = new Set();       // 接收端本地已落盘
     const late = [];                // 清单还没到时的迟到帧
     let running = false;
@@ -445,12 +484,28 @@
     }
 
     async function shipFrame(seqN, frame) {
-      if (rtc && rtc.open && rtc.send(frame)) { st.bytesOnWire += frame.length; return 'p2p'; }
+      // 缓冲满 ≠ 直连不可用。先等它排到低水位（带超时与取消），等不动才算链路失效。
+      // 以前这里直接掉到下面走中转：一条健康的直连一旦背压，整份文件就被"额外"PUT 进服务器
+      // （界面还写着"直连"），既浪费中转配额也自相矛盾。
+      // 迟滞：越过 4MB 高水位才等，等到跌回 1MB 低水位才续发。
+      // 拿低水位当"能不能发"的门槛会让高水位变成摆设（永远到不了那里），那是另一回事。
+      if (rtc && rtc.open && rtc.buffered > cfg.dcBufferHigh) {
+        const r = await rtc.drainReady(cfg.dcDrainTimeoutMs, () => closed || aborted);
+        if (r === 'stalled') switchChannel('server_relay', '直连长时间排不出数据，已改用服务器中转（只传密文）');
+      }
+      if (rtc && rtc.open && rtc.send(frame)) {
+        st.bytesOnWire += frame.length;
+        st.dcFrames++;
+        return 'p2p';
+      }
       for (let i = 0; i < 5; i++) {
         if (closed) return null;
         try {
           await net.putSeg(st.sid, seqN, frame);
           st.bytesOnWire += frame.length;
+          st.relayFrames++;
+          // 一个字节都没走通过道却把整包塞进了服务器 —— 通道标识就该说实话，不能停在"正在建立直连"
+          if (!st.dcFrames && st.channel !== 'server_relay') switchChannel('server_relay', st.note);
           return 'relay';
         } catch (err) {
           if (!err.retry) throw err;
@@ -464,6 +519,7 @@
       if (acked.has(seqN)) return;
       const frame = await frameFor(seqN);
       await shipFrame(seqN, frame);
+      sentAt.set(seqN, Date.now());
       st.sentFrames++;
       // 'pairing' 也要放行：joined 事件会把状态打成 pairing，而 pump 就在这之后立刻起跑 ——
       // 少这一档，整段传输期间发送端都挂着"正在配对"，进度在动、话却不对（真浏览器实测过）
@@ -507,7 +563,11 @@
           while (paused) await sleep(200);
           await sleep(500);
           await refreshAck();
-          for (const s of missingForRetry(acked, st.frames).slice(0, cfg.parallel)) {
+          // 只补"确实隔了一阵还没被确认"的帧：慢确认（对端在解密/落盘）不等于没送到，
+          // 每 500ms 就把整批未确认的再发一遍会把进度和带宽都白烧掉
+          const now = Date.now();
+          const due = missingForRetry(acked, st.frames).filter((n) => now - (sentAt.get(n) || 0) >= cfg.retryGapMs);
+          for (const s of due.slice(0, cfg.parallel)) {
             try { await sendSeq(s); } catch (err) { fail(err.message || err, true); }
           }
         }
