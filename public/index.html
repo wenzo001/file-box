@@ -198,8 +198,9 @@
   .folder-main { flex: 1; min-width: 0; padding-top: 2px; }
   .folder-time { font-size: 17px; font-weight: 500; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  .folder-meta { font-size: 13px; color: var(--text2); margin-top: 1px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 副标题宁可换行也不许裁掉：加了"下载 N 次"之后，320px 上被 ellipsis 吃掉的是末尾那张
+     "周三 · 2 周前"标签——那是静默丢信息，比多出一行高度糟糕得多 */
+  .folder-meta { font-size: 13px; color: var(--text2); margin-top: 1px; line-height: 1.35; }
   .tag { display: inline-block; font-size: 12px; font-weight: 500; color: var(--label-ink);
     background: var(--fill); border-radius: 5px; padding: 1px 7px; margin-left: 4px;
     vertical-align: 1px; -webkit-user-select: none; user-select: none; }
@@ -241,6 +242,8 @@
   .file-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
   .file-row .size { color: var(--text2); font-size: 13px; flex-shrink: 0; }
+  /* 下载次数与大小同一视觉层级（都是次要信息），数字用等宽避免"下载 9 次→10 次"时抖动 */
+  .file-row .dl-count { color: var(--text2); font-size: 13px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .file-row a {
     color: var(--accent); text-decoration: none; font-size: 15px; font-weight: 500;
     flex-shrink: 0; padding: 6px 4px; border-radius: 8px;
@@ -980,6 +983,21 @@ const isFresh = (name) => {
   return t !== null && Date.now() - t < HOT_MS;
 };
 const hotTag = (name) => (hotFolders.has(name) ? '<span class="tag hot">热乎</span>' : '');
+/** 下载次数：0 也说成一句话。留空会让人分不清"还没人取过"和"这版没做统计" */
+const dlText = (n) => (n > 0 ? `下载 ${n} 次` : '未下载');
+/** 就地 +1 某一行的下载次数：轮询 10 秒才回来，刚下完还写着"未下载"就是句假话 */
+function bumpDl(row) {
+  const c = row && row.querySelector('.dl-count');
+  if (!c) return;
+  const n = (Number(c.dataset.n) || 0) + 1;
+  c.dataset.n = String(n);
+  c.textContent = dlText(n);
+}
+/** 目录行副标题：folderHtml（整份渲染）与 patchFolder（轮询只改变化的两行）共用一份实现，
+ *  免得以后改了这里忘了那边，界面上同一行出现两种口径 */
+const folderMetaHtml = (f) =>
+  `${f.count} 个文件 · ${fmtSize(f.size)} · ${dlText(f.downloads)}`
+  + `<span class="tag">${esc(relTag(f.name))}</span>${hotTag(f.name)}`;
 
 const folderHtml = (f) => `
       <div class="folder" data-name="${esc(f.name)}">
@@ -990,7 +1008,7 @@ const folderHtml = (f) => `
             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 1l5 5.5L2 12"/></svg></span>
           <div class="folder-main">
             <div class="folder-time">${esc(fmtTime(f.name))}</div>
-            <div class="folder-meta">${f.count} 个文件 · ${fmtSize(f.size)}<span class="tag">${esc(relTag(f.name))}</span>${hotTag(f.name)}</div>
+            <div class="folder-meta">${folderMetaHtml(f)}</div>
           </div>
           <span class="acts" onclick="event.stopPropagation()">
             <button class="linkbtn" onclick="downZip('${enc(f.name)}', this)">打包下载</button>
@@ -1009,8 +1027,7 @@ const folderHtml = (f) => `
 /** 只改会变的那两行文字，不碰展开状态、也不碰正在打包的按钮文案 */
 function patchFolder(el, f) {
   el.querySelector('.folder-time').textContent = fmtTime(f.name);
-  el.querySelector('.folder-meta').innerHTML =
-    `${f.count} 个文件 · ${fmtSize(f.size)}<span class="tag">${esc(relTag(f.name))}</span>${hotTag(f.name)}`;
+  el.querySelector('.folder-meta').innerHTML = folderMetaHtml(f);
 }
 
 function applyList(data, full) {
@@ -1127,21 +1144,30 @@ async function fillBody(el) {
     body.dataset.filled = '1'; // 全部成功才标"已填"，失败允许重试
     let rows;
     if (m && m.files) {
-      // 加密目录：显示真实文件名，下载时解密
-      rows = m.files.map((f) => `
+      // 次数记在密文名上（服务器只见密文，这是端到端加密的既有边界），解密后按 enc 对回真实文件名
+      const dlByEnc = Object.fromEntries(serverFiles.map((x) => [x.name, x.downloads || 0]));
+      rows = m.files.map((f) => {
+        const n = Number(dlByEnc[f.enc]) || 0;
+        return `
         <div class="file-row">
           <span class="name" title="${esc(f.name)}">${esc(f.name)}</span>
+          <span class="dl-count" data-n="${n}">${dlText(n)}</span>
           <span class="size">${fmtSize(f.size)}</span>
           <a href="javascript:void(0)" class="dl" data-folder="${enc(folder)}" data-enc="${enc(f.enc)}" data-name="${esc(f.name)}" data-size="${f.size}">下载</a>
-        </div>`);
+        </div>`;
+      });
     } else {
       // 旧数据（未加密）：直接展示与下载
-      rows = serverFiles.filter((x) => x.name !== 'manifest.enc').map((x) => `
+      rows = serverFiles.filter((x) => x.name !== 'manifest.enc').map((x) => {
+        const n = Number(x.downloads) || 0;
+        return `
         <div class="file-row">
           <span class="name" title="${esc(x.name)}">${esc(x.name)}</span>
+          <span class="dl-count" data-n="${n}">${dlText(n)}</span>
           <span class="size">${fmtSize(x.size)}</span>
           <a href="api/download/${enc(folder)}/${enc(x.name)}">下载</a>
-        </div>`);
+        </div>`;
+      });
     }
     body.innerHTML = rows.join('') || '<div class="file-row"><span class="name" style="color:var(--text2)">空目录</span></div>';
   } catch (e) {
@@ -1200,6 +1226,8 @@ document.addEventListener('click', async (e) => {
       declared,
     );
     saveBlob(blob, name);
+    // 刚存完还写着"未下载"就是句假话，而轮询要 10 秒才回来：就地 +1
+    bumpDl(a.closest('.file-row'));
   } catch (err) {
     toast(err.message || '下载失败');
   } finally {

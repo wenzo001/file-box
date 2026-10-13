@@ -123,6 +123,57 @@ function warnIgnored() {
   }
 }
 
+// ---- 下载次数 ----
+// 账本刻意放在 uploads **之外**（默认取 uploads 的父目录下的 .stats/downloads.json）：
+// 放进去它就会被 /api/archive 当文件打包出去、被 /api/download 当文件吐出去、被 dirSize 算进用量，
+// 三处都得再排除一次；分家之后一处都不碰。
+const STATS_FILE = process.env.DOWNLOADS_FILE
+  ? path.resolve(process.env.DOWNLOADS_FILE)
+  : path.join(path.dirname(UPLOAD_DIR), '.stats', 'downloads.json');
+const STATS_FLUSH_MS = 2000;
+let flushTimer = null;
+
+/** 账本结构：{ "20260923_1430": { "f_xxx.enc": 3 } }。读不回来就当没有过（一次都没下载） */
+function loadDownloads() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch { return {}; }
+}
+const downloads = loadDownloads();
+
+function flushDownloads() {
+  flushTimer = null;
+  try {
+    fs.mkdirSync(path.dirname(STATS_FILE), { recursive: true });
+    const tmp = `${STATS_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(downloads));
+    fs.renameSync(tmp, STATS_FILE); // 写完才改名：崩了也不会留下半个账本
+  } catch (err) {
+    console.error('[统计] 下载次数落盘失败', err.code); // 记不上数不该影响下载本身
+  }
+}
+const scheduleFlush = () => {
+  if (flushTimer) return;
+  flushTimer = setTimeout(flushDownloads, STATS_FLUSH_MS);
+  if (flushTimer.unref) flushTimer.unref();
+};
+
+/** 记一次"真的开始往外吐字节"的下载。失败/被闸门挡下的调用方自己就不会走到这里 */
+function countDownload(folder, file) {
+  if (file === MANIFEST) return; // 前端每次展开目录都自动拉清单：计了就不是"被下载"而是"被点开"
+  const rec = downloads[folder] && typeof downloads[folder] === 'object' ? downloads[folder] : {};
+  rec[file] = (rec[file] || 0) + 1;
+  downloads[folder] = rec;
+  scheduleFlush();
+}
+/** 目录被删（手动或到期清理）后账本条目要跟着走：否则它一直占着一格，还可能被以后同名的目录继承 */
+function forgetDownloads(folder) {
+  if (!(folder in downloads)) return;
+  delete downloads[folder];
+  scheduleFlush();
+}
+
 // ---- 存储空间统计与过期清理 ----
 /** 递归统计目录占用字节数。用 lstat：软链接既不该计入用量，更不该跟着递归
  *  （一个指回上层的软链接就能让同步递归绕不完）。单个条目读不到也跳过：Windows 上
@@ -159,6 +210,7 @@ function cleanupExpired() {
     const t = folderTime(d.name);
     if (t !== null && now - t > RETENTION_MS) {
       fs.rmSync(path.join(UPLOAD_DIR, d.name), { recursive: true, force: true });
+      forgetDownloads(d.name);
       removed.push(d.name);
     }
   }
@@ -512,14 +564,18 @@ app.get('/api/list', (req, res) => {
     .filter((d) => d.isDirectory() && isFolderName(d.name)) // 链接目录与外来目录一律不列（看得见却动不了的界面最容易骗人）
     .map((d) => {
       const dir = path.join(UPLOAD_DIR, d.name);
+      const rec = downloads[d.name] || {};
       const files = fs
         .readdirSync(dir)
-        .map((f) => ({ name: f, size: fs.statSync(path.join(dir, f)).size }))
+        .map((f) => ({ name: f, size: fs.statSync(path.join(dir, f)).size, downloads: rec[f] || 0 }))
         .sort((a, b) => a.name.localeCompare(b.name));
       return {
         name: d.name,
         count: files.filter((f) => f.name !== MANIFEST).length,
         size: files.reduce((s, f) => s + f.size, 0),
+        // 目录级就按"界面上看得见的这些文件"求和：账本里若有已被移走的文件的残留计数，
+        // 不该让汇总和逐行数字对不上
+        downloads: files.reduce((s, f) => s + f.downloads, 0),
         files,
       };
     })
@@ -548,6 +604,7 @@ app.delete('/api/folder/:folder', (req, res) => {
     return res.status(500).json({ error: '删除失败' });
   }
   forgetUsage(); // 腾出的空间要立刻反映到上限判断上
+  forgetDownloads(path.basename(dir));
   res.json({ ok: true });
 });
 
@@ -556,6 +613,7 @@ app.get('/api/download/:folder/:file', (req, res) => {
   const folderReal = resolveFolder(req.params.folder);
   const fp = resolveFile(folderReal, req.params.file);
   if (!fp) return res.status(404).json({ error: '文件不存在' }); // 不区分"名字不合法/不在界内/不存在"，不给探测者反馈
+  countDownload(path.basename(folderReal), path.basename(fp)); // 走到这里才算是"开始吐字节"
   res.download(fp, path.basename(fp));
 });
 
@@ -575,6 +633,8 @@ app.get('/api/archive/:folder', async (req, res) => {
     return res.status(404).json({ error: '目录不存在' });
   }
   if (!parts.length) return res.status(404).json({ error: '目录为空' });
+  // 归档 = 整包被取走一次：每个文件各记一次（清单文件仍不记），目录级汇总就是它们的和
+  parts.forEach((p) => countDownload(path.basename(dir), p.name));
   parts.sort((a, b) =>
     a.name === MANIFEST ? -1 : b.name === MANIFEST ? 1 : a.name.localeCompare(b.name));
 

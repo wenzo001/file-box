@@ -21,6 +21,9 @@ dist/
 # 无痕传输的密文中转区（跑起来才生成，绝不能入库）
 .transfer/
 transfer/
+
+# 下载次数账本（在 uploads 之外，跑起来才生成）
+.stats/
 .DS_Store
 Thumbs.db
 
