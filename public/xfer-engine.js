@@ -779,7 +779,8 @@
           }
         }
         await flushAcks();
-        patch({ phase: 'ready', verified: true });
+        // 清掉尾巴上的一次性抖动报错：校验已经通过，界面上还挂着"会话已过期"就是假警报
+        patch({ phase: 'ready', verified: true, error: '' });
         writeLs('receiver', st.sid, Object.assign({}, readLs('receiver')[st.sid] || {}, { verified: true }));
       } catch (err) {
         fail(err.message || err);

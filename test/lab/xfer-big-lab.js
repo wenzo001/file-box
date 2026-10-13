@@ -95,6 +95,25 @@ function rssMb(pid) {
   } catch { return 0; }
 }
 
+/** 所有 chrome.exe（含渲染进程）的 RSS 合计。
+ *  Performance.getMetrics 的 JSHeapUsedSize 看不见 Blob/ArrayBuffer 的后备存储，
+ *  只报它会低估浏览器侧真实内存 —— 所以要另有一把尺子。
+ *  ⚠ 口径限制：这是按映像名汇总的，用户自己开着的 Chrome 也会被算进来（实测过：
+ *  同一个实验室跑两次，这台值差 800MB）。所以它只能当"上限参考"，
+ *  要论本实验室浏览器的净占用，看 peakHeap(JSHeapUsedSize) + navigator.storage.estimate()。 */
+function chromeRssMb() {
+  try {
+    const out = cp.execFileSync('tasklist', ['/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV', '/NH'], { encoding: 'latin1' });
+    let sum = 0;
+    for (const line of out.split(/\r?\n/)) {
+      const cols = line.trim().split('","');
+      if (cols.length < 5) continue;
+      sum += Number(String(cols[4]).replace(/[^\d]/g, '')) || 0;
+    }
+    return Math.round(sum / 1024);
+  } catch { return 0; }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 独立校验：不碰引擎的 finishReceive，也不走"整文件进内存"的下载兜底 ——
@@ -162,9 +181,13 @@ async function main() {
   const pageErrs = [];
   const peak = { A: 0, B: 0 };
   let srvRssPeak = 0;
+  let chromePeak = 0;
   let relayPeakMB = 0;
   let senderLsSha = '';
   let sampler = null, diskSampler = null;
+  const T_START = Date.now();
+  // 卡住的时候要知道卡在第几步：每一步往 stdout 落一行（报告是一次性打的，超时了就什么都能看到）
+  const mark = (s) => console.log(`# +${((Date.now() - T_START) / 1000).toFixed(0)}s ${s}`);
   let ctxA, ctxB, pa, pb;
 
   const newReceiverPage = async () => {
@@ -214,6 +237,7 @@ async function main() {
     peak.A = Math.max(peak.A, pick(m[0]));
     peak.B = Math.max(peak.B, pick(m[1]));
     srvRssPeak = Math.max(srvRssPeak, rssMb(srv.child.pid));
+    chromePeak = Math.max(chromePeak, chromeRssMb());
   };
   // 中转区的峰值要在传输途中量：收尾一 done，服务器 60 秒后就把整个会话清了
   const sampleDisk = async () => {
@@ -325,6 +349,7 @@ async function main() {
       const runSid = await pa.evaluate(() => window.__s[window.__s.length - 1].state.sid);
       await pb.close(); pb = null;
       // 不点"暂停"：小文件几秒钟就传完了，按钮按相位会被禁用，这里要的是"放着不管直到过期"
+      mark('expired: 等 TTL 过期');
       await sleep(Number(arg('expire-wait', 20000)));
       await newReceiverPage();
       cdpB = await ctxB.newCDPSession(pb);
@@ -334,6 +359,7 @@ async function main() {
       await sleep(3000);
       rep.expiredText = await pb.evaluate(() => document.querySelector('#toast').textContent.trim());
       rep.expiredState = await readState(pb);
+      mark('expired: 已重开接收页并尝试配对');
       rep.expiredSidDirGone = !fs.existsSync(path.join(dir, 'transfer', runSid));
       rep.senderAfterExpire = await readState(pa);
       finished = true;
@@ -385,6 +411,7 @@ async function main() {
     await sampleMem();
     rep.peakHeap = { senderMB: Math.round(peak.A / 1048576), receiverMB: Math.round(peak.B / 1048576) };
     rep.serverRssPeakMB = srvRssPeak;
+    rep.chromeRssPeakMB = chromePeak;
     rep.transferDirMB = Math.round(dirBytes(path.join(dir, 'transfer')) / 1048576);
     rep.relayPeakMB = Math.round(relayPeakMB);
     // done 之后服务器只留 END_KEEP 那么久；留够时间再验一次"真的清了"（本实验室把它是设成 10 秒）
@@ -432,13 +459,18 @@ async function main() {
       // 发送端发出的帧数不许超过帧数本身：每多一帧就是白烧一遍带宽
       H_没有重复发送: SCENARIO === 'expired' ? undefined
         : (rep.sender ? rep.sender.sentFrames <= rep.frames + 1 : undefined),
+      // 成功后不许留假警报：600MB 那一跑 verified=true 的同时 error 还挂着
+      // "服务器上的这个会话已经过期了"（尾巴上的一次抖动，已经过去了）
+      I_成功之后不留报错: SCENARIO === 'expired' ? undefined
+        : (last.verified ? last.error === '' : undefined),
       F_恢复类场景给出可操作结果: SCENARIO === 'expired'
-        ? /过期|作废|失效|重新/.test(rep.expiredText + JSON.stringify(rep.expiredState || {})) : undefined,
+        ? /过期|作废|失效|重新|无效|已结束/.test(rep.expiredText + JSON.stringify(rep.expiredState || {})) : undefined,
     };
     if (rep.sender) {
       rep.senderOnWireMB = +((rep.sender.bytesOnWire || 0) / 1048576).toFixed(1);
       rep.nonces = { dc: rep.sender.dcFrames, relay: rep.sender.relayFrames };
     }
+    mark('准备打印报告');
     console.log(JSON.stringify(rep, null, 1));
     const legKeys = Object.keys(rep.gates).filter((k) => rep.gates[k] !== undefined);
     const ok = legKeys.length > 0 && legKeys.every((k) => rep.gates[k]);
@@ -454,6 +486,7 @@ async function main() {
     console.log(JSON.stringify(rep, null, 1));
     throw e;
   } finally {
+    mark('finally: 收尾');
     if (sampler) clearInterval(sampler);
     if (diskSampler) clearInterval(diskSampler);
     // browser.close() 在这台机的 playwright-core / chromium 组合上会挂住不返回（实测），
