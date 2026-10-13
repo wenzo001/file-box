@@ -10,7 +10,9 @@ const app = express();
 // 反代部署时设 TRUST_PROXY=1（或 express 支持的 trust proxy 配置串），
 // req.ip 才是真实客户端地址 —— 限流按 IP 记账，不设的话反代后所有用户共享一个桶
 if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
-app.use(express.json({ limit: '2mb' })); // init/finish 这类小 JSON 请求体
+// JSON 请求体一律在各自路由上解析，不要在这里挂全局 express.json：
+// 全局那层会先把 body 解析掉并置 req._body，各路由再挂 express.json({limit}) 就会被跳过，
+// 于是无痕传输声明的 64KB/256KB 限额全是死代码（审计实测 192KB 照样进业务逻辑）。
 
 // ---- 配置（均可通过环境变量覆盖） ----
 const PORT = Number(process.env.PORT) || 3000;              // HTTP 端口（完整服务）
@@ -351,7 +353,7 @@ const forgetUsage = () => { usageCache.at = 0; }; // 提交/删除后立刻失�
 reclaimStagingOnBoot();
 
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
-app.post('/api/upload/init', (req, res) => {
+app.post('/api/upload/init', express.json({ limit: '2mb' }), (req, res) => {
   cleanupExpired();
   const { key, files } = req.body || {};
   if (typeof key !== 'string' || !/^[a-f0-9]{16,64}$/.test(key)) {
@@ -447,7 +449,7 @@ app.put('/api/upload/part', gateParts, express.raw({ type: 'application/octet-st
 // 第二个请求要么等待要么直接拒绝 —— 这里选"在拼的直接 409"，客户端重试会拿到 404/结果
 const assembling = new Set();
 
-app.post('/api/upload/finish', (req, res) => {
+app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
   const { uploadId } = req.body || {};
   const meta = isUploadId(uploadId) ? readMeta(uploadId) : null;
   if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
@@ -628,9 +630,10 @@ app.use((err, req, res, next) => {
   // err.expose 是 express / body-parser 给"可以说给客户端的那类错"打的标（400 那一族）。
   // 没这个标的（fs 抛的、我们自己 throw 的）一律换成固定话术：绝对路径与底层错误码不外说。
   const tellable = err.expose ? (err.message || '请求处理失败') : null;
-  const msg =
-    err.type === 'entity.too.large' ? '请求体过大（单个分块超过上限）' :
-    tellable || '请求处理失败';
+  // 超限文案分两类：分块走 octet-stream（上限是"单块多大"），其余是 JSON 请求体（各自路由的上限）
+  const msg = err.type === 'entity.too.large'
+    ? (req && req.is('application/octet-stream') ? `分块超过上限（单块最大 ${MAX_CHUNK / 1048576}MB）` : '请求体过大')
+    : tellable || '请求处理失败';
   res.status(err.expose ? (err.status || 400) : 500).json({ error: msg });
 });
 
