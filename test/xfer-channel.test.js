@@ -293,6 +293,60 @@ test('本地暂存有一块读不回来时，要回服务器补拉那一块继�
     '补拉那一帧之后装配必须逐字节正确');
 }));
 
+// 接收端刷新重连之后，服务器会给发送方再补一条 joined。发送方那时正在传输，
+// 这条事件不许把相位打回"正在配对"——600MB 之外的那轮 48MB 实测里，
+// 发送端就停在"正在配对、核对安全码"，而它 385 帧全都发完了。
+test('传输途中对端重新加入，不许把发送端相位打回"正在配对"', () => withLab({
+  slot: 83, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 4 * MB;
+  const code = (await sender.send([{ relPath: 'j.bin', name: 'j.bin', size, mime: 'application/octet-stream', file: fakeFile('j.bin', size, 61) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000 && !sender.state.sentFrames) await sleep(50);
+  assert.ok(sender.state.sentFrames > 0, `夹具坏了：发送端一帧都没开始发（phase=${sender.state.phase} error=${sender.state.error}）`);
+  const parsed = env.P.parseCode(code);
+  const proof = await env.P.proofOf(parsed.sid, parsed.secret);
+  const again = await fetch(`${srv.base}/api/xfer/join`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid: parsed.sid, proof }),
+  });
+  assert.strictEqual(again.status, 200, '对端重连本该被服务器收下');
+  await sleep(600);
+  assert.notStrictEqual(sender.state.phase, 'pairing', '一条 joined 把正在传输的发送端打回了"正在配对"');
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `重连之后传输断了：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(sender.state.phase, 'done', `发送端没收敛到 done（停在 ${sender.state.phase}），服务器密文就一直不会被清`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 61)));
+}));
+
+// 落盘确认丢一次就永远丢：接收端明明存好了，服务器的 acked 却少一批，
+// 发送端 done 门永远差这几块 —— 48MB 接收端刷新实测停在"对方已落盘确认 384/385"就是这个洞
+// （会话不收尾 → 服务器上的密文一直占着中转配额）。
+test('确认请求发不出去时必须重试，并且会话收尾后密文真的被清掉', () => withLab({
+  slot: 84, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 }, serverEnv: { XFER_END_KEEP_MS: '4000' },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 4 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  const code = (await sender.send([{ relPath: 'a.bin', name: 'a.bin', size, mime: 'application/octet-stream', file: fakeFile('a.bin', size, 71) }])).code;
+  await receiver.accept(code);
+  env.counters.failAck = 1;                     // 下一批确认正好丢掉
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `接收端没校验通过：phase=${st.phase} error=${st.error}`);
+  const t = Date.now();
+  while (Date.now() - t < 25000 && sender.state.phase !== 'done') await sleep(200);
+  assert.strictEqual(sender.state.phase, 'done',
+    `丢一次确认之后发送端停在 ${sender.state.phase}（已确认 ${sender.state.stored}/${frames} 块）`);
+  assert.ok((env.counters.byPath['POST /api/xfer/ack'] || 0) >= 2,
+    '这条判据要建立在"确认确实重发过"之上，不能只是碰巧收敛');
+  const sid = (await env.P.parseCode(code)).sid;
+  const segDir = path.join(srv.dir, 'transfer', sid);
+  const t2 = Date.now();
+  while (Date.now() - t2 < 15000 && fs.existsSync(segDir)) await sleep(300);
+  assert.ok(!fs.existsSync(segDir), 'done 之后中转密文必须被清掉，否则一次丢确认就等于长期占着配额');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 71)));
+}));
+
 test('服务器已经收下这一块，就不许再把它 PUT 第二遍（慢确认 ≠ 丢包）', () => withLab({
   slot: 80, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, retryGapMs: 200 },
 }, async ({ env, sender, receiver }) => {

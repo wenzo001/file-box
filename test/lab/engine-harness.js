@@ -175,7 +175,7 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, byPath: {} };
+  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0 };
   const nativeFetch = g.fetch;
   defg('fetch', (url, opt = {}) => {
     const u = String(url).startsWith('http') ? String(url) : base + '/' + String(url).replace(/^\//, '');
@@ -183,6 +183,11 @@ function boot({ link, base }) {
     const pathname = new URL(u).pathname;
     if (pathname === '/api/xfer/seg') { if (method === 'PUT') counters.segPut++; else counters.segGet++; }
     counters.byPath[method + ' ' + pathname] = (counters.byPath[method + ' ' + pathname] || 0) + 1;
+    // 注入一次"确认请求发不出去"：落盘确认丢一次就永久丢，是 done 门不收尾的根因
+    if (pathname === '/api/xfer/ack' && method === 'POST' && counters.failAck > 0) {
+      counters.failAck--;
+      return Promise.reject(new TypeError('fetch 失败（夹具注入）'));
+    }
     return nativeFetch(u, opt);
   });
 

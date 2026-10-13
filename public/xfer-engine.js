@@ -693,9 +693,16 @@
       // 注意：序号 0 是加密清单帧，但它在服务器的帧号空间**之内**（frames 含它），
       // done 门按 acked.size === frames 对账 —— 把 0 过滤掉 done 就永远差一块。
       const list = [...ackBuf];
-      ackBuf.clear();
       if (!list.length) return;
-      try { await net.ack(st.sid, list); } catch { /* 本地已经存好了，服务器记账晚一点不要紧 */ }
+      ackBuf.clear();
+      try { await net.ack(st.sid, list); }
+      catch {
+        // 发不出去就退回缓冲，等下一次确认或轮询再试。
+        // 以前是"清掉 + 吞掉异常"：一次网络抖动就把已经落盘的块永远不算确认，
+        // 发送端 done 门永远差这几块 —— 会话不收尾、服务器密文一直占着配额
+        // （48MB 接收端刷新实测：对方已落盘确认停在 384/385）。
+        for (const n of list) ackBuf.add(n);
+      }
     }
     let pulling = false;
     async function pullMissing() {
@@ -868,6 +875,15 @@
       try {
         for (const s of await Store.seqs(st.sid)) stored.add(s);
         st.stored = stored.size;
+        // 认领回来之后还要补一次确认：刷新前那些"已经落盘、但确认请求还没发出去"的块，
+        // 服务器一条都没记上；不补，发送端的 done 门就永远差这几块（48MB 刷新实测停在 384/385），
+        // 会话不收尾、服务器上的密文也一直占着配额。只补"服务器还不知道"的那些，不重发整本账。
+        try {
+          const sv = await net.state(st.sid);
+          const known = new Set(expand(sv.acked));
+          const owed = [...stored].filter((n) => !known.has(n));
+          if (owed.length) { for (const n of owed) ackBuf.add(n); await flushAcks(); }
+        } catch { /* 问不到服务器就留给下一轮轮询 */ }
         const mframe = new Uint8Array((await Store.get(st.sid, 0)) || []);
         if (mframe.length && !layout) {
           const r = await pool.open({ key: Array.from(sess.kMeta), sid8: Array.from(sess.sid8), frame: mframe });
@@ -992,7 +1008,12 @@
       const headers = role === 'sender' ? { 'X-Xfer-Sender': token } : { 'X-Xfer-Proof': proof };
       link = sse(url, headers, async (name, data) => {
         try {
-          if (name === 'joined') { patch({ phase: 'pairing' }); upgradeIceWithTurn().catch(() => {}); }
+          if (name === 'joined') {
+            // 只在"还没开跑"时才把相位改成配对中。对端刷新重连会让服务器再补一条 joined，
+            // 那时发送端明明在传（甚至已经传完），打回 pairing 就是把界面停在"正在配对、核对安全码"
+            if (st.phase === 'waiting' || st.phase === 'paired') patch({ phase: 'pairing' });
+            upgradeIceWithTurn().catch(() => {});
+          }
           else if (name === 'key') await onPeerKey(data.body);
           else if (name === 'confirm') await onPeerConfirm(data.body);
           else if (name === 'offer' || name === 'answer' || name === 'ice') {

@@ -93,6 +93,12 @@ const KNIVES = {
     from: '            const frame = await readStoredFrame(f.seqBase + c, f.name);',
     to: '            const frame = await readStoredFrame(f.seqBase + (f.chunks.length - 1 - c), f.name);',
   },
+  // 刀十四：把"确认发不出去就退回缓冲"还原成"清掉 + 吞异常" ——
+  //         「确认请求发不出去时必须重试」那条腿必须红（done 门不收尾、密文不释放）。
+  'ack-drop': {
+    from: '        for (const n of list) ackBuf.add(n);',
+    to: '        /* 吞掉 */',
+  },
 };
 
 const mode = process.argv[2];

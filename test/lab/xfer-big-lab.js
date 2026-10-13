@@ -324,8 +324,8 @@ async function main() {
     } else if (SCENARIO === 'expired') {
       const runSid = await pa.evaluate(() => window.__s[window.__s.length - 1].state.sid);
       await pb.close(); pb = null;
-      await pa.click('#send-pause');
-      await sleep(Number(arg('expire-wait', 16000)));
+      // 不点"暂停"：小文件几秒钟就传完了，按钮按相位会被禁用，这里要的是"放着不管直到过期"
+      await sleep(Number(arg('expire-wait', 20000)));
       await newReceiverPage();
       cdpB = await ctxB.newCDPSession(pb);
       await pb.click('#tab-recv');
