@@ -239,6 +239,60 @@ test('接收端也要在直连超时后如实改通道标识，不能让用户�
 // 600MB 真浏览器实测暴露出来的：接收端确认落后时，发送端把"服务器已经收下但对方还没确认"
 // 的帧当成丢包又 PUT 了一遍 —— 4801 帧发了 5594 次、多烧 133MB 线上字节，
 // 还在收尾时撞上会话被回收，报出一句"写入分段失败"。
+// 「分块重排」在协议层已经由 protocol.test.js 钉住（帧头里的 fileId/chunkIdx 进 AAD，
+// 把 46 块的密文贴到 45 块上必须失败）。这条补的是装配层：到达顺序被打乱时，
+// 接收端要按块号归位，而不是按"先到先存"排。
+test('帧乱序到达也要按块号归位：装配结果与到达顺序无关', () => withLab({
+  slot: 81, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 },
+}, async ({ srv, env, sender, receiver }) => {
+  const size = 2 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  const code = (await sender.send([{ relPath: 's.bin', name: 's.bin', size, mime: 'application/octet-stream', file: fakeFile('s.bin', size, 41) }])).code;
+  await receiver.accept(code);
+  receiver.pause();   // 先按住接收端：不然引擎自己按序拉完，我这一步就成了空跑
+  const parsed = env.P.parseCode(code);
+  const proof = await env.P.proofOf(parsed.sid, parsed.secret);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 30000 && sender.state.uploaded < frames) await sleep(100);
+  assert.strictEqual(sender.state.uploaded, frames, `夹具坏了：服务器还没收齐（${sender.state.uploaded}/${frames}）`);
+  // 先把清单喂进去（没有清单就没有布局），其余按"倒序 + 隔位"这种确定性的乱序喂
+  const order = [];
+  for (let i = frames - 1; i >= 1; i -= 2) order.push(i);
+  for (let i = frames - 2; i >= 1; i -= 2) order.push(i);
+  const get = async (i) => {
+    const r = await fetch(`${srv.base}/api/xfer/seg?sid=${parsed.sid}&i=${i}`, { headers: { 'X-Xfer-Proof': proof } });
+    assert.strictEqual(r.status, 200, `第 ${i} 帧取不到：${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+  };
+  await receiver._test.acceptFrame(await get(0));
+  for (const i of order) await receiver._test.acceptFrame(await get(i));
+
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `乱序喂完没通过校验：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(st.stored, frames, `本地该有 ${frames} 帧，实际 ${st.stored}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 41)),
+    '乱序到达若真按到达顺序装配，这里必然对不上');
+}));
+
+// 600MB 真浏览器实测的原始症状："接收完了，合成错误"（用户最初报的就是这个）。
+// 现场是 finishReceive 逐块重算时，某一块从 IndexedDB 读不回来（读事务抖 / 浏览器丢缓存），
+// 引擎把这一次可恢复的读失败当成"文件坏了"直接失败 —— 而那一帧服务器手上还在。
+test('本地暂存有一块读不回来时，要回服务器补拉那一块继续校验，而不是报"合成错误"', () => withLab({
+  slot: 82, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 },
+}, async ({ env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'v.bin', name: 'v.bin', size, mime: 'application/octet-stream', file: fakeFile('v.bin', size, 53) }])).code;
+  const parsed = env.P.parseCode(code);
+  env.idbDrop.add(`${parsed.sid}#7`);   // 只让这一帧"本地读不到"一次
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `本地有一帧读不回来就整个失败收场：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(st.error, '', `恢复过程给用户留了报错：${st.error}`);
+  assert.strictEqual(st.stored, Math.ceil(size / FRAME) + 1, '补拉回来之后本地该凑齐全部帧');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 53)),
+    '补拉那一帧之后装配必须逐字节正确');
+}));
+
 test('服务器已经收下这一块，就不许再把它 PUT 第二遍（慢确认 ≠ 丢包）', () => withLab({
   slot: 80, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, retryGapMs: 200 },
 }, async ({ env, sender, receiver }) => {

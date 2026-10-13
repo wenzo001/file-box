@@ -80,6 +80,19 @@ const KNIVES = {
     from: '            if (acked.has(s) || onServer(s)) continue;',
     to: '            if (acked.has(s)) continue;',
   },
+  // 刀十二：本地读不到那一帧时不再回服务器补拉 —— 「本地暂存读不到要能补回来」那条腿必须红
+  //         （这条就是用户最初报的"接收完了，合成错误"：大文件才踩得到）
+  'no-repull': {
+    from: '      try { got = await net.getSeg(st.sid, seqN); } catch {',
+    to: '      try { got = null; } catch {',
+  },
+  // 刀十三：乱序装配那条腿目前没有专属刀（它的风险已由 protocol.test.js 的"把 46 块密文
+  //         贴到 45 块上必须失败"那条钉住）。这里登记一个"读倒序"的近似刀，用来看那条腿
+  //         对"按位置取帧"到底敏不敏感 —— 跑出来若仍全绿，就说明它只是行为描述，别当门禁。
+  'reverse-read': {
+    from: '            const frame = await readStoredFrame(f.seqBase + c, f.name);',
+    to: '            const frame = await readStoredFrame(f.seqBase + (f.chunks.length - 1 - c), f.name);',
+  },
 };
 
 const mode = process.argv[2];

@@ -154,10 +154,20 @@ function boot({ link, base }) {
   defg('Worker', FakeWorker);
 
   const idb = new Map();
+  // 测试用：把这个集合里的 key 的"下一次读"变成读不到（模拟浏览器把这一帧从本地暂存里掉了、
+  // 或事务抖了一下）。一次性：读掉之后就恢复正常，避免把恢复逻辑拖进死循环。
+  const idbDrop = new Set();
   const tx = () => ({
     objectStore: () => ({
       put: (v, k) => { idb.set(k, v); },
-      get: (k) => { const rq = {}; setTimeout(() => { rq.result = idb.get(k); rq.onsuccess && rq.onsuccess(); }, 0); return rq; },
+      get: (k) => {
+        const rq = {};
+        setTimeout(() => {
+          if (idbDrop.has(k)) { idbDrop.delete(k); rq.result = undefined; } else rq.result = idb.get(k);
+          rq.onsuccess && rq.onsuccess();
+        }, 0);
+        return rq;
+      },
       getAllKeys: () => { const rq = {}; setTimeout(() => { rq.result = [...idb.keys()]; rq.onsuccess && rq.onsuccess(); }, 0); return rq; },
       delete: (k) => { idb.delete(k); },
     }),
@@ -179,24 +189,29 @@ function boot({ link, base }) {
   for (const f of ['xfer-proto.js', 'xfer-engine.js']) delete require.cache[require.resolve(path.join(PUB, f))];
   require(path.join(PUB, 'xfer-proto.js'));
   require(path.join(PUB, 'xfer-engine.js'));
-  return { P: g.XferProto, E: g.XferEngine, counters, idb, stores, link };
+  return { P: g.XferProto, E: g.XferEngine, counters, idb, idbDrop, stores, link };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** 字节内容由绝对位置决定，且**每 128KiB 一块都得不同**：
+ *  以前写的是 (seed + p) & 255，而 131072 = 512×256 —— 于是每一块的字节序列完全一样，
+ *  "乱序装配对不对"、"按位置取帧对不对"这类判据全都成了空对空绿（reverse-read 那把刀不下血暴露的）。
+ *  加一项 (p >> 17)：第 k 块整体偏移 k，131073 mod 256 = 1 → 相邻块必然不同。 */
+const byteAt = (seed, p) => (seed + p + (p >> 17)) & 255;
 /** 造一个内容可复算的文件（seed 决定字节，接收端能逐字节比对） */
 function fakeFile(name, size, seed) {
   const parts = [];
   for (let off = 0; off < size; off += 65536) {
     const n = Math.min(65536, size - off);
     const b = new Uint8Array(n);
-    for (let i = 0; i < n; i++) b[i] = (seed + off + i) & 255;
+    for (let i = 0; i < n; i++) b[i] = byteAt(seed, off + i);
     parts.push(b);
   }
   return new File(parts, name, { type: 'application/octet-stream' });
 }
 const expectBytes = (size, seed) => {
   const b = new Uint8Array(size);
-  for (let i = 0; i < size; i++) b[i] = (seed + i) & 255;
+  for (let i = 0; i < size; i++) b[i] = byteAt(seed, i);
   return b;
 };
 

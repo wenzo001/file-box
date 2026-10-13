@@ -733,6 +733,23 @@
         schedulePoll();
       }, cfg.pollMs);
     }
+    /** 读本地暂存的某一帧。读不回来时先回服务器补拉这一块，再落一遍盘：
+     *  浏览器可能把早先写入的帧从本地暂存里丢掉，读事务也可能只是抖一下 ——
+     *  这两种都不是"文件坏了"。直接报"合成错误"就是把一次可恢复的失败说成了不可恢复
+     *  （600MB 真浏览器实测：4801 帧全部收齐，重算时第 1799 块读空 → 整单失败）。 */
+    async function readStoredFrame(seqN, label) {
+      const first = await Store.get(st.sid, seqN);
+      if (first && first.length) return new Uint8Array(first);
+      stored.delete(seqN);          // 记账说它有、本地实际没有：先如实撤账，补回来再加回
+      st.stored = stored.size;
+      let got = null;
+      try { got = await net.getSeg(st.sid, seqN); } catch { /* 会话已不在服务器上，下面统一报出去 */ }
+      if (!got || !got.length) throw new Error(`「${label}」第 ${seqN} 块本地和服务器都读不到了，这一单收不齐：请让对方重发一次`);
+      await Store.put(st.sid, seqN, got);
+      stored.add(seqN);
+      st.stored = stored.size;
+      return new Uint8Array(got);
+    }
     async function finishReceive() {
       if (st.verified) return;
       patch({ phase: 'verifying' });
@@ -741,8 +758,7 @@
           const chain = [];
           let total = 0;
           for (let c = 0; c < f.chunks.length; c++) {
-            const frame = new Uint8Array(await Store.get(st.sid, f.seqBase + c));
-            if (!frame.length) throw new Error(`「${f.name}」第 ${c} 块本地读不到了`);
+            const frame = await readStoredFrame(f.seqBase + c, f.name);
             const key = await fileKey(f.fileId);
             const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
             const pt = new Uint8Array(r.plaintext);
@@ -772,7 +788,7 @@
         let w = null;
         if (streamToFile) w = await streamToFile(f);
         for (let c = 0; c < f.chunks.length; c++) {
-          const frame = new Uint8Array(await Store.get(st.sid, f.seqBase + c));
+          const frame = await readStoredFrame(f.seqBase + c, f.name);
           const pt = new Uint8Array((await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame })).plaintext);
           if (w) await w.write(pt);
           else yieldBlob(f, pt);
