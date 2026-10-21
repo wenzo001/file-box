@@ -19,21 +19,36 @@ self.onmessage = async (e) => {
     }
     if (m.op === 'fingerprint') {
       // 整件文件的逐块哈希放在这一条线程里跑完：主线程只收进度，2GB 也不该让它卡一下。
-      // File 可以直接结构化克隆进来，切片读也是异步的，不会把这边也堵死。
+      // 读盘按 8MiB 一批：以前每 128KiB 走一次 slice().arrayBuffer()，2GB 就是 16384 次异步往返，
+      // 一次 I/O 只摊到 128KiB 上 —— 用户看到的"解析哈希要执行一会儿"主要就是这笔开销。
+      // 逐块摘要与链的顺序完全不变（协议与接收端校验都依赖它），只是把 I/O 批量化。
+      //
+      // from/to：只算这一段（多个线程并行算同一份文件的不同段）。块的切法必须与整份一致 ——
+      // 切分点只落在 128KiB 的整数倍上，所以段内的块和整份里的块是同几块。
       const B = XferProto.PLAIN_BLOCK;
+      const READ = 8 * 1024 * 1024;
       const file = m.file;
+      const from = Number.isFinite(m.from) ? Math.max(0, m.from) : 0;
+      const to = Number.isFinite(m.to) ? Math.min(file.size, m.to) : file.size;
+      const span = Math.max(0, to - from);
       const chain = [];
       let sentAt = 0;
-      for (let off = 0; off < file.size; off += B) {
-        const bytes = new Uint8Array(await file.slice(off, Math.min(file.size, off + B)).arrayBuffer());
-        chain.push(await XferProto.sha256(bytes));
-        const p = Math.min(1, (off + B) / file.size);
+      const report = (doneBytes) => {
         const now = Date.now();
-        if (p >= 1 || now - sentAt > 80) { sentAt = now; self.postMessage({ id: m.id, progress: p, doneBytes: Math.min(file.size, off + B) }); }
+        if (doneBytes >= span || now - sentAt > 80) {
+          sentAt = now;
+          self.postMessage({ id: m.id, progress: span ? Math.min(1, doneBytes / span) : 1, doneBytes });
+        }
+      };
+      for (let off = from; off < to; off += READ) {
+        const chunk = new Uint8Array(await file.slice(off, Math.min(to, off + READ)).arrayBuffer());
+        for (let p = 0; p < chunk.length; p += B) {
+          chain.push(await XferProto.sha256(chunk.subarray(p, Math.min(chunk.length, p + B))));
+        }
+        report(Math.min(span, off + READ - from));
       }
-      if (!chain.length) chain.push(await XferProto.sha256(new Uint8Array(0)));
-      const total = await XferProto.sha256(XferProto.cat(...chain));
-      self.postMessage({ id: m.id, hex: XferProto.hex(total) });
+      // digests 交回主线程按段序拼接；整份一个线程时这仍然是同一条链
+      self.postMessage({ id: m.id, digests: chain });
       return;
     }
     if (m.op === 'seal') {

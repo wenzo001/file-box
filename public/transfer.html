@@ -433,13 +433,23 @@
     </div>
   </section>
 
+  <div class="sec">服务器残留核验<span class="sec-note">不需要密码，丢了本地记录也能查</span></div>
+  <div class="panel"><div class="pad">
+    <input type="text" class="code-in" id="res-in" placeholder="传输码，或前 8 位会话编号" autocomplete="off"
+      autocapitalize="off" spellcheck="false">
+    <button type="button" class="btn btn-ghost" id="res-go">查这一单在服务器上还剩什么</button>
+    <div class="subtle" id="res-out">服务器只会回「有没有、几段、多少字节、最晚什么时候清」——读不到内容，也删不掉东西。
+      要立刻清，请回到那个会话里点「取消并销毁」。这一栏就是给「本地记录已经没了、但我还是想知道服务器上有没有留」准备的。</div>
+  </div></div>
+
   <div class="sec">这页做不到什么</div>
   <div class="panel"><div class="pad">
     <div class="hint">
       · 服务器只搬运密文，看不到文件内容、文件名，也没有解密密钥。<br>
       · "无痕"指会话过期/取消后服务器逻辑删除密文；<b>不保证</b> SSD、快照、备份里查不到痕迹。<br>
       · 通过 HTTP（非安全上下文）打开时浏览器不给加密接口，直连不可用，会自动走服务器中转 —— 仍然全程密文，只是纯 JS 加密慢一些。想要直连请用 HTTPS 入口。<br>
-      · 双方都要在线；短暂断线会保留恢复状态，但过期时间一到旧码就废了。
+      · 双方都要在线；短暂断线会保留恢复状态，但过期时间一到旧码就废了。<br>
+      · 隐私模式 / 清过站点数据之后，本机那份记录会消失，<b>续传就做不到了</b> —— 但服务器上到底还剩什么，下面那一栏随时能核对。
     </div>
   </div></div>
 </div>
@@ -501,6 +511,19 @@
     server_relay: ['服务器密文中转', 'relay'],
   };
   const chanOf = (c) => CHAN[c] || CHAN.none;
+
+  // 「暂停」那个按钮在两个方向上共用一个勾子，但语义跟着相位变：
+  // 已经停住（paused / retrying / failed）时它必须是「继续」——
+  // 以前它一律显示「暂停」，用户在一单已经卡住的传输上点下去等于再停一次，
+  // 于是"点不动了、也重新发不了"就成了死结。
+  const STUCK = ['paused', 'retrying', 'failed'];
+  const pauseLabel = (st, verb) => (st.phase === 'paused' ? `继续${verb}`
+    : (st.phase === 'retrying' || st.phase === 'failed' ? '继续传输' : '暂停'));
+  const clock = (ts) => {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  };
 
   // 常量先集中放，界面到处要用
   const TERMINAL = ['cancelled', 'failed', 'done'];
@@ -584,6 +607,9 @@
     if (!caps.rtc) miss.push('没有 WebRTC → 不会尝试直连');
     if (!caps.idb) miss.push('没有 IndexedDB → 接收端断线恢复不可用');
     if (!caps.fsAccess) miss.push('没有流式写盘接口 → 保存大文件会占内存');
+    // 这条不是"功能缺失"，而是"大文件要留在前台"的提醒：没有 Web Locks 的浏览器
+    // 会冻结后台标签页，传输不动但也不会报错（用户会以为卡死了）
+    if (!caps.locks) miss.push('没有 Web Locks → 大文件别把标签页切到后台太久，浏览器可能冻结它');
     const el = $('#caps');
     if (!miss.length) { el.textContent = '本环境可以走点对点直连，加密由浏览器原生 WebCrypto 完成。'; el.className = 'note'; }
     else { el.innerHTML = '本环境限制：' + miss.map((m) => `· ${m}`).join('<br>'); el.className = 'warn'; }
@@ -658,10 +684,10 @@
       $('#recv-done-wrap').hidden = !ok;
       if (ok) renderFiles(st);
       const p = t('pause');
-      if (p) p.textContent = st.phase === 'paused' ? '继续接收' : '暂停';
+      if (p) p.textContent = pauseLabel(st, '接收');
     } else {
       const p = t('pause');
-      if (p) p.textContent = st.phase === 'paused' ? '继续发送' : '暂停';
+      if (p) p.textContent = pauseLabel(st, '发送');
       // 码未就绪：两行分享区长骨架。有了码就不是骨架了 —— 用户看到"真的码"才该去复制
       const skel = $('#send-code-skel'), skel2 = $('#send-link-skel');
       const on = !codeReady(st);
@@ -700,6 +726,23 @@
         ? `要直连请改用 HTTPS 入口：https://${location.hostname}:${httpsPort}`
         : '要直连请改用 HTTPS 入口（地址里的端口问部署这台服务的人）', warn: true });
     }
+    // 这一单比中转配额还大：直连不占中转区，所以不是拒绝 —— 但一旦只能走中转就会在配额处停。
+    // 以前客户端拿不到这个数，用户看到的就是"跑到一半忽然断了"。
+    if (st.overBudget && st.budget) {
+      parts.push({ txt: `这一单 ${fmt(st.totalBytes)} 比服务器中转区上限（${fmt(st.budget)}）还大。`
+        + '局域网直连不占中转区，所以不影响；万一只能走中转，会在配额处停下（把 XFER_LIMIT_GB 调大可以放宽）。', warn: true });
+    }
+    // 本机记录存不下来（隐私模式 / 配额满）：必须现在说，别让用户以为刷新之后还能接着传
+    if (st.persist === 'fail') {
+      parts.push({ txt: '本机存不下这次会话的记录（隐私模式或浏览器存储配额满）：页面一刷新/一关就续不上，'
+        + '也没法用本地凭据请服务器销毁。可以用下面的「服务器残留核验」自己核对服务器上还剩什么。', warn: true });
+    }
+    // 本机存储配额不够时提前说：接收端要把密文帧落到本机（续传全靠它），装不下就会在途中
+    // 报"本地写入被中止"，用户看到的是"传到一半自己断了"。隐私模式最容易撞上这一条。
+    if (st.quota && st.quota.need > st.quota.quota * 0.9) {
+      parts.push({ txt: `这台设备只给本页 ${fmt(st.quota.quota)} 存储，而这一单要落 ${fmt(st.quota.need)} 密文：`
+        + '很可能在途中报「本地写入被中止」。换一台设备收，或别用隐私模式/先清掉站点数据。', warn: true });
+    }
     el.hidden = false;
     el.innerHTML = parts.map((p) => `<span class="mode-i${p.warn ? ' warn' : ''}">${p.txt}</span>`).join('');
   }
@@ -708,13 +751,16 @@
   function lockForPhase(prefix, st) {
     const prep = !codeReady(st); // 码还没算出来：复制/暂停/重连都还没有意义
     const dead = TERMINAL.includes(st.phase);
+    // 只有"真的结束了"（完成/取消）才冻结这一排操作。failed 不能冻 ——
+    // 那一档最需要的正是「继续」，冻住它就等于把一单能救回来的传输锁死。
+    const frozen = st.phase === 'cancelled' || st.phase === 'done';
     const cp = $(`${prefix}-copy`), cpl = $(`${prefix}-copy-link`);
     if (cp) { cp.disabled = prep; cp.title = prep ? '传输码还在算，请稍等' : ''; }
     if (cpl) { cpl.disabled = prep; cpl.title = prep ? '传输码还在算，请稍等' : ''; }
     // 会话没建立之前暂停/重连没有对象；建立之后只有终态才停
     const ps = $(`${prefix}-pause`), rc = $(`${prefix}-recon`);
-    if (ps) ps.disabled = prep || dead;
-    if (rc) rc.disabled = prep || dead;
+    if (ps) ps.disabled = prep || frozen;
+    if (rc) rc.disabled = prep || frozen;
     // 接收端入口：活动会话期间禁止再点（点了会起第二个会话），输入框也锁住
     if (prefix === '#recv') {
       const go = $('#recv-go'), inp = $('#recv-in');
@@ -727,11 +773,16 @@
       const start = $('#start');
       if (start) start.disabled = dead ? picked.length === 0 : true;
     }
-    // 取消永远可用：准备期要能停下（文案改成"取消生成"），终态点了只是清理本地记录
+    // 取消永远可用：准备期要能停下（文案改成"取消生成"），终态点了只是清理本地记录。
+    // 中间那几档（重试中/出错/暂停）如实写成"放弃这一单并销毁"——
+    // 用户要分得清"再试一次"（继续传输）和"我不要了"（销毁），这两个不能长得一样。
     const cn = $(`${prefix}-cancel`);
     if (cn) {
       cn.disabled = false;
-      cn.textContent = prep ? '取消生成' : (dead ? '关闭' : (prefix === '#send' ? '取消并销毁' : '取消'));
+      if (prep) cn.textContent = '取消生成';
+      else if (frozen) cn.textContent = '关闭';
+      else if (STUCK.includes(st.phase)) cn.textContent = st.sid ? '放弃这一单并销毁' : '取消';
+      else cn.textContent = prefix === '#send' ? '取消并销毁' : '取消';
     }
   }
 
@@ -767,6 +818,25 @@
       lines.push(left > 0 ? `会话还剩 ${secs(left / 1000)}` : '会话已过期');
     }
     if (err) lines.push(st.error);
+    // 清理回执是用户点"取消/忘记"之后最想看到的一句话：服务器到底确认了没有
+    if (st.cleanup) {
+      lines.push(st.cleanup.confirmed
+        ? `服务器已确认清空：${st.cleanup.segments} 块 / ${fmt(st.cleanup.bytes)}`
+        : `服务器还没确认清空：${st.cleanup.error || '请稍后重试'}（本地凭据已保留）`);
+    }
+    // 没走直连时，把"为什么"直接摆出来：候选类型计数、是否 mDNS、选中的是哪一对、降级原因
+    if (st.diag && st.channel && st.channel !== 'p2p') {
+      const d = st.diag;
+      const cand = `host ${d.host || 0}${d.mdns ? `（mDNS ${d.mdns}）` : ''} / srflx ${d.srflx || 0} / relay ${d.relay || 0}`;
+      const chosen = d.chosen && (d.chosen.local || d.chosen.remote) ? ` · 选中 ${d.chosen.local || '?'}→${d.chosen.remote || '?'}` : '';
+      lines.push(`直连诊断：${cand}${chosen}${d.reason ? ` · ${d.reason}` : ''}`);
+      if (!d.stun && !d.relay && d.mdns) {
+        lines.push('服务端没有可用的 STUN；浏览器只给出了 mDNS 主机候选（.local），跨机器解析不了就只能走中转。'
+          + '同一个局域网想直连：让服务端的 STUN 起来（默认 udp 3478，防火墙放行），或配一个双方都够得着的 STUN_URLS。');
+      } else if (d.stun && !(d.srflx > 0) && d.gathering === 'complete') {
+        lines.push('有 STUN 但一个 srflx 候选都没拿到：多半是 udp 3478 出不去（防火墙/安全软件）。放行后两端才能拿到真实内网地址。');
+      }
+    }
     el.textContent = lines.filter(Boolean).join('\n');
     // 传输中的预计剩余时间单独一行：状态行本身已经很长，混在一起手机上会折成一坨
     if (!err && etaEl && (st.phase === 'transferring' || st.phase === 'paused' || st.phase === 'retrying') && st.speed > 0) {
@@ -864,10 +934,12 @@
     // 这里不再自己改 #start：由 paint→lockForPhase 按相位统一决定，避免和取消赛跑
   });
 
+  // 一颗按钮两种语义：停住的时候是「继续」，在跑的时候是「暂停」。
+  // 文案由 paint→lockForPhase 统一刷，这里不再自己改字，免得和状态回调抢。
   $('#send-pause').addEventListener('click', () => {
     if (!sender) return;
-    if (sender.state.phase === 'paused') { sender.resume(); $('#send-pause').textContent = '暂停'; }
-    else { sender.pause(); $('#send-pause').textContent = '继续发送'; }
+    if (STUCK.includes(sender.state.phase)) sender.resume();
+    else sender.pause();
   });
   $('#send-recon').addEventListener('click', () => { if (sender) { sender.refresh().catch(() => toast('重连没成功，稍后再试')); toast('正在重新连接…'); } });
   $('#send-cancel').addEventListener('click', async () => {
@@ -876,8 +948,13 @@
     // 这一下就是在说"别算了"，再弹一个确认框等于让用户为卡顿多等一次点击
     const preparing = !sender.state.sid;
     if (!preparing && !confirm('取消这次传输？服务器上的密文会被清掉，旧传输码作废。')) return;
-    await sender.cancel();
-    toast(preparing ? '已停止生成' : '已取消');
+    const r = await sender.cancel();
+    // 用户点"放弃"之后最想让知道的是"然后呢"：选好的文件还在，再点一次就换新码重发。
+    // 不说这一句的话，"放弃"读起来仍然像"这一单白干了"。
+    toast(preparing ? '已停止生成'
+      : (r.gone
+        ? `已放弃这一单 · 服务器已确认清空${r.removed && r.removed.segments ? `（${r.removed.segments} 块）` : ''}；选好的文件还在，点「生成传输码并开始加密」可重新发`
+        : `已取消，但服务器没确认清空：${r.error || '稍后再试'}。本地凭据已保留`));
   });
 
   // ---------------- 接收 ----------------
@@ -907,15 +984,16 @@
   }
   $('#recv-pause').addEventListener('click', () => {
     if (!receiver) return;
-    if (receiver.state.phase === 'paused') receiver.resume();
+    if (STUCK.includes(receiver.state.phase)) receiver.resume();
     else receiver.pause();
   });
   $('#recv-recon').addEventListener('click', () => { if (receiver) receiver.refresh().catch(() => toast('重连没成功')); });
   $('#recv-cancel').addEventListener('click', async () => {
     if (!receiver) return;
     if (!confirm('取消接收？本机已收的密文和服务器上的都会清掉。')) return;
-    await receiver.cancel();
-    toast('已取消');
+    const r = await receiver.cancel();
+    toast(r.gone ? '已取消 · 服务器已确认清空'
+      : `已取消，但服务器没确认清空：${r.error || '稍后再试'}。本地凭据已保留`);
   });
 
   /** 按相对路径在所选目录下补齐子目录再拿文件句柄。
@@ -1019,17 +1097,20 @@
       nm.textContent = it.code;
       m.appendChild(nm);
       const small = document.createElement('small');
-      small.textContent = `${fmt(it.totalBytes)} · 还有 ${secs(Math.max(0, it.expiresAt - Date.now()) / 1000)}`
-        + (it.verified ? ' · 已校验通过' : '') + (sending ? ' · 要重新选同一批文件' : '');
+      small.textContent = it.expired
+        ? `${fmt(it.totalBytes)} · 会话已过期（服务器按 TTL 自动清理，可点下面核验）`
+        : `${fmt(it.totalBytes)} · 还有 ${secs(Math.max(0, it.expiresAt - Date.now()) / 1000)}`
+          + (it.verified ? ' · 已校验通过' : '') + (sending ? ' · 要重新选同一批文件' : '');
       m.appendChild(small);
       const b = document.createElement('button');
       b.type = 'button'; b.className = 'linkbtn'; b.textContent = sending ? '续传' : '接着收';
+      b.hidden = it.expired;
       b.addEventListener('click', async () => {
         const live = window.XferEngine.liveOf(role);
         if (live) { toast(`这个方向上已经有一个会话在跑（${PHASE[live] || live}），先取消它`); return; }
         if (sending) {
           if (!picked.length) { toast('先在上面选好同一批文件，再点续传'); return; }
-          const rec = { record: Object.assign({}, it) };
+          const rec = { record: Object.assign({}, it.record) };
           sender = mount('sender');
           $('#send-live').hidden = false;
           try { await sender.send(picked.map((p) => Object.assign({}, p)), rec); toast('已接上原会话'); }
@@ -1040,12 +1121,63 @@
         }
       });
       const q = document.createElement('button');
-      q.type = 'button'; q.className = 'linkbtn'; q.textContent = '忘记';
-      q.addEventListener('click', () => { window.XferEngine.forget(role, it.sid); renderResume(); });
+      q.type = 'button'; q.className = 'linkbtn'; q.textContent = it.expired ? '核验并清除' : '忘记';
+      // "忘记"过去只删本机记录，服务器上的密文要等 TTL 才清 —— 用户以为已经销毁，其实还在。
+      // 现在先请服务器销毁并核对 404，拿到回执才删本地记录；拿不到就把记录留着再试。
+      q.addEventListener('click', async () => {
+        q.disabled = true; q.textContent = '正在确认…';
+        const r = await window.XferEngine.purgeSaved(role, it.sid).catch((err) => ({ gone: false, error: err.message || String(err) }));
+        if (r.gone) {
+          const segs = (r.removed && r.removed.segments) || 0;
+          const bytes = (r.removed && r.removed.bytes) || 0;
+          toast(segs ? `服务器已确认清空：${segs} 块 / ${fmt(bytes)}` : '服务器已确认：这一单没有留下密文');
+        } else {
+          // 销毁要用本地凭据。凭据没了（隐私模式、清过站点数据、换了机器）就销毁不了 ——
+          // 这时候至少把"服务器上还剩什么、最晚几点自己清"如实说出来，别让人对着一句"稍后再试"猜。
+          const res = await window.XferEngine.residue(it.sid).catch(() => null);
+          if (res && !res.exists && !res.segments) {
+            window.XferEngine.forget(role, it.sid);
+            toast('服务器上已确认没有这一单的东西了（本机记录已清）');
+          } else if (res) {
+            toast(`没能销毁：${r.error}。服务器上还剩 ${res.segments} 段 / ${fmt(res.bytes)}，最晚 ${clock(res.expiresAt)} 自动清空`);
+          } else {
+            toast(`还没清空：${r.error}。本地记录已保留，联网后再点一次`);
+          }
+        }
+        q.disabled = false; q.textContent = it.expired ? '核验并清除' : '忘记';
+        renderResume();
+      });
       row.append(m, b, q);
       box.appendChild(row);
     });
   }
+
+  // ---------------- 服务器残留核验 ----------------
+  // 为什么单独留这一栏：能销毁这一单的凭据只存在浏览器本地。隐私模式下关窗、清站点数据、
+  // 换台机器之后，用户手里一个字符都不剩 —— 但他仍然有权知道"服务器上到底还有没有我那 2GB"。
+  // 这个查询不需要凭据，服务器只回段数/字节/到期时间。
+  async function residueCheck() {
+    const raw = String($('#res-in').value || '').trim().toLowerCase();
+    const parsed = window.XferProto ? XferProto.parseCode(raw) : null;
+    const sid = parsed ? parsed.sid : raw.replace(/[^a-z1-9]/g, '').slice(0, 8);
+    const out = $('#res-out');
+    if (sid.length !== 8) { toast('请输入完整传输码，或 8 位会话编号'); return; }
+    out.textContent = '正在问服务器…';
+    try {
+      const r = await window.XferEngine.residue(sid);
+      if (!r.exists && !r.segments) {
+        out.textContent = `服务器上已经没有这一单的任何东西了：账本与密文目录都不存在（会话编号 ${sid}）。`;
+      } else {
+        out.textContent = `服务器上还有这一单：账本${r.exists ? '在' : '已删'} · 密文 ${r.segments} 段 / ${fmt(r.bytes)}`
+          + `${r.state ? ` · 状态 ${r.state}` : ''} · 最晚 ${clock(r.expiresAt)} 自动清空。`
+          + (r.segments ? '要立刻清，只能回到那个会话里点「取消并销毁」（销毁需要本地凭据）。' : '');
+      }
+    } catch (err) {
+      out.textContent = `没问到：${err.message || err}`;
+    }
+  }
+  $('#res-go').addEventListener('click', residueCheck);
+  $('#res-in').addEventListener('keydown', (e) => { if (e.key === 'Enter') residueCheck(); });
 
   routeFromUrl();
   addEventListener('resize', () => {

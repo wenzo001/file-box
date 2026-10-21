@@ -114,7 +114,18 @@ function boot({ link, base }) {
   const defg = (k, v) => { try { g[k] = v; } catch { Object.defineProperty(g, k, { value: v, writable: true, configurable: true }); } };
   // Node 18+ 自带 globalThis.crypto（WebCrypto）；它是只读访问器，别去赋值
   if (!g.crypto || !g.crypto.subtle) throw new Error('这台 Node 没有 WebCrypto，台架跑不了');
-  defg('navigator', { hardwareConcurrency: 4 });
+  // Web Locks 桩：只记录"谁去要了锁、什么模式"。真浏览器里"持有 Web Lock 的页面不会被冻结"，
+  // 这里能证的只有"引擎确实要了那把锁"；冻结本身只能真机验。
+  const lockCalls = [];
+  defg('navigator', {
+    hardwareConcurrency: 4,
+    locks: {
+      request(name, opts) {
+        lockCalls.push({ name, mode: opts && opts.mode });
+        return new Promise(() => {}); // 永不落地 = 锁一直被持有
+      },
+    },
+  });
   defg('isSecureContext', true);
   defg('location', { origin: base, pathname: '/transfer.html' });
   const stores = new Map();
@@ -155,13 +166,21 @@ function boot({ link, base }) {
             const r = await P.open({ key: new Uint8Array(msg.key), sid8: new Uint8Array(msg.sid8), frame: new Uint8Array(msg.frame) });
             back({ fileId: r.fileId, chunkIdx: r.chunkIdx, type: r.type, plainLen: r.plainLen, plaintext: r.plaintext });
           } else if (msg.op === 'fingerprint') {
-            const B = P.PLAIN_BLOCK; const f = msg.file; const chain = [];
-            for (let off = 0; off < f.size; off += B) {
-              chain.push(await P.sha256(new Uint8Array(await f.slice(off, Math.min(f.size, off + B)).arrayBuffer())));
-              back({ progress: Math.min(1, (off + B) / f.size), doneBytes: Math.min(f.size, off + B) });
+            counters.fingerprints++;
+            // 注入"指纹算得慢"：验证"码先给、指纹后台算"用的是这个窗口
+            if (counters.slowFingerprintMs) await new Promise((r) => setTimeout(r, counters.slowFingerprintMs));
+            // from/to：引擎会把大文件切成几段并行算。段内仍是逐 128KiB 出摘要、按序返回 ——
+            // 桩必须和真 worker 一样只算这一段，否则拼出来的链和单线程不一致。
+            const B = P.PLAIN_BLOCK; const f = msg.file;
+            const from = Number.isFinite(msg.from) ? Math.max(0, msg.from) : 0;
+            const to = Number.isFinite(msg.to) ? Math.min(f.size, msg.to) : f.size;
+            const span = Math.max(0, to - from);
+            const chain = [];
+            for (let off = from; off < to; off += B) {
+              chain.push(await P.sha256(new Uint8Array(await f.slice(off, Math.min(to, off + B)).arrayBuffer())));
+              back({ progress: span ? Math.min(1, (off + B - from) / span) : 1, doneBytes: Math.min(span, off + B - from) });
             }
-            if (!chain.length) chain.push(await P.sha256(new Uint8Array(0)));
-            back({ hex: P.hex(await P.sha256(P.cat(...chain))) });
+            back({ digests: chain });
           } else back({ error: '未知操作 ' + msg.op });
         } catch (err) { back({ error: (err && err.message) || '加密失败' }); }
       }, 0);
@@ -192,7 +211,7 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0, slowSeal: 0, slowSealMs: 1500, doneLog: [] };
+  const counters = { segPut: 0, segGet: 0, segGetInflight: 0, segGetPeak: 0, slowGetMs: 0, locks: lockCalls, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0, slowSeal: 0, slowSealMs: 1500, doneLog: [], fingerprints: 0, slowFingerprintMs: 0 };
   // 原生 fetch 只能在模块加载时取一次。以前写的是 `const nativeFetch = g.fetch` —— 而 g.fetch 在
   // 第二个台架起来时**已经是上一个台架的注入器**了，于是注入是套着往下漏的：
   // 89 号腿留的 refuseFinish=99 让 90 号腿每一次收尾都吃 409（单独跑 90 全绿，接在 89 后面必红）。
@@ -204,7 +223,16 @@ function boot({ link, base }) {
     const u = String(url).startsWith('http') ? String(url) : base + '/' + String(url).replace(/^\//, '');
     const method = opt.method || 'GET';
     const pathname = new URL(u).pathname;
-    if (pathname === '/api/xfer/seg') { if (method === 'PUT') counters.segPut++; else counters.segGet++; }
+    const isGetSeg = pathname === '/api/xfer/seg' && method !== 'PUT';
+    if (pathname === '/api/xfer/seg') {
+      if (method === 'PUT') counters.segPut++;
+      else {
+        counters.segGet++;
+        // 同时在飞的拉取数：串行实现（一帧一个来回）这里永远是 1
+        counters.segGetInflight++;
+        counters.segGetPeak = Math.max(counters.segGetPeak, counters.segGetInflight);
+      }
+    }
     counters.byPath[method + ' ' + pathname] = (counters.byPath[method + ' ' + pathname] || 0) + 1;
     // 注入一次"确认请求发不出去"：落盘确认丢一次就永久丢，是 done 门不收尾的根因
     if (pathname === '/api/xfer/ack' && method === 'POST' && counters.failAck > 0) {
@@ -250,7 +278,14 @@ function boot({ link, base }) {
       },
         (e) => { counters.doneLog.push(e && e.name === 'AbortError' ? 'aborted(超时掐掉)' : `err:${e && e.message}`); throw e; });
     }
-    return nativeFetch(u, opt);
+    // 给每一帧的往返加人为延时：用它能把"串行拉取"和"并发拉取"分开 ——
+    // 串行实现的吞吐被 RTT 死死压住（这正是真机上 4MB/s 的成因），并发实现不受影响。
+    const go = () => (isGetSeg && counters.slowGetMs
+      ? sleep(counters.slowGetMs).then(() => nativeFetch(u, opt))
+      : nativeFetch(u, opt));
+    return go().then(
+      (r) => { if (isGetSeg) counters.segGetInflight--; return r; },
+      (e) => { if (isGetSeg) counters.segGetInflight--; throw e; });
   };
   labFetch.__xferLabStub = true;
   defg('fetch', labFetch);

@@ -672,10 +672,23 @@ app.get('/api/archive/:folder', async (req, res) => {
 
 // ---- 无痕传输：一次性会话 + 密文中转（独立模块，与上面的文件库完全分开） ----
 const { createTransferApi } = require('./lib/transfer');
+const { createStunServer } = require('./lib/stun');
+// 内置 STUN：局域网直连的钥匙。原因是 Chrome 把 host 候选写成 mDNS 名（xxxx.local），
+// 跨机器解析不了就只能退到服务器中转（实测 4MB/s）。两端向这台服务器问一次自己的源地址，
+// 拿到的就是各自的内网 IP，可以直接互拨。STUN_PORT=0 可关掉（那就自己配 STUN_URLS）。
+const STUN_PORT = process.env.STUN_PORT === undefined || process.env.STUN_PORT === ''
+  ? 3478
+  : (Number(process.env.STUN_PORT) || 0);
+const stun = createStunServer({ port: STUN_PORT, log: (m) => console.log(m) });
+stun.start();
+
 const transferApi = createTransferApi({
   express,
   HTTPS_PORT,
   TRANSFER_DIR: process.env.TRANSFER_DIR ? path.resolve(process.env.TRANSFER_DIR) : path.join(__dirname, '.transfer'),
+  // 用每个请求自己的 Host 拼地址：两端都是经这台服务器打开页面的，这个地址它们一定够得着。
+  // 写死某个 IP 会在多网卡 / 多网段 / 反代后指错地方。
+  stunSelf: (host) => stun.urlFor(host),
 });
 transferApi.register(app);
 transferApi.bootReclaim();

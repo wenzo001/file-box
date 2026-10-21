@@ -28,7 +28,7 @@ async function withLab(opts, body) {
     throw err;
   }
   try {
-    return await body({ srv, link, env, sender, receiver });
+    return await body({ srv, link, env, sender, receiver, cfg: opts.cfg });
   } finally {
     for (const s of [sender, receiver]) { try { s.close(); } catch { /* 已经关了 */ } }
     await srv.stop();
@@ -585,4 +585,200 @@ test('卡住之后自己恢复了：要跑完，并且不许留着旧的"卡住�
   assert.strictEqual(sender.state.phase, 'done', `没能收尾：${sender.state.phase}（${where}）`);
   assert.strictEqual(sender.state.error, '',
     `进度已经恢复，界面上还挂着"${sender.state.error}" —— 对着用户说假话（${where}）`);
+}));
+
+// 取消/销毁过去只关本地会话、只发一句 cancel，服务器上的密文要等 END_KEEP_MS 才清，
+// 用户拿不到任何"已经清空了"的回执。这条钉的是：回执必须来自服务器，且拿到回执之后本地记录才许删。
+test('取消并销毁：拿到服务器"已清空"的回执之后，才删本地可续传记录', () => withLab({
+  slot: 91, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000, parallel: 2 },
+}, async ({ env, srv, sender, receiver }) => {
+  const size = 1 * MB;
+  const code = (await sender.send([{ relPath: 'c.bin', name: 'c.bin', size, mime: 'application/octet-stream', file: fakeFile('c.bin', size, 71) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000 && !sender.state.sentFrames) await sleep(50);
+  assert.ok(sender.state.sentFrames > 0, `夹具坏了：一帧都没发出去（phase=${sender.state.phase}）`);
+  const sid = sender.state.sid;
+  const dir = path.join(srv.dir, 'transfer', sid);
+  assert.ok(env.E.listSaved('sender').some((x) => x.sid === sid), '前置：本地得有可续传记录，否则"取消后删记录"是空判据');
+
+  const r = await sender.cancel();
+  assert.strictEqual(r.gone, true, `服务器没确认清空：${r.error || '(无错误信息)'}`);
+  assert.strictEqual(sender.state.cleanup.confirmed, true, '界面上必须能显示"已确认清空"');
+  assert.ok(!fs.existsSync(dir), '服务器目录必须已经不在（回执与磁盘一致）');
+  assert.ok(!env.E.listSaved('sender').some((x) => x.sid === sid), '确认清空之后本地记录必须删掉，否则用户还会看到续传入口');
+}));
+
+// 用户刷新页面之后，"再也不想传了"这条路也必须走得通：浏览器里只剩记录、会话对象没了。
+// 这条模拟的正是刷新后的状态：close() 掉活会话，只用本地记录去请服务器销毁并核对。
+test('刷新之后仍能确认清空：只用本地记录就能让服务器删干净', () => withLab({
+  slot: 92, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000, parallel: 2 },
+}, async ({ env, srv, sender, receiver }) => {
+  const size = 1 * MB;
+  const code = (await sender.send([{ relPath: 'r.bin', name: 'r.bin', size, mime: 'application/octet-stream', file: fakeFile('r.bin', size, 72) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000 && !sender.state.sentFrames) await sleep(50);
+  assert.ok(sender.state.sentFrames > 0, '夹具坏了：一帧都没发出去');
+  const sid = sender.state.sid;
+  await receiver.cancel().catch(() => {}); // 另一端先走开，模拟"两个标签页都重载了"
+  sender.close();                          // 活会话没了，只剩 localStorage 里的记录
+  const list = env.E.listSaved('sender');
+  assert.ok(list.some((x) => x.sid === sid), '前置：记录要还在（刷新后靠它）');
+
+  const r = await env.E.purgeSaved('sender', sid);
+  assert.strictEqual(r.gone, true, `刷新后没能确认清空：${r.error || '(无错误信息)'}`);
+  assert.ok(!fs.existsSync(path.join(srv.dir, 'transfer', sid)), '服务器目录必须已经不在');
+  assert.ok(!env.E.listSaved('sender').some((x) => x.sid === sid), '确认之后本地记录才许删除');
+}));
+
+// 用户点"续传"过去必失败：listSaved 只给展示字段，没有 keys，send() 直接报"密钥本地已经没了"。
+// 这条钉三件事：记录必须带 keys；文件没变时不许再算一遍指纹；接着传真的能跑到校验通过。
+test('发送端续传：刷新后能接上原会话，同一批文件不重算指纹', () => withLab({
+  slot: 93, drainRate: 2 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000, parallel: 2 },
+}, async ({ env, sender, receiver, cfg }) => {
+  const size = 3 * MB;
+  const list = [{ relPath: 'a.bin', name: 'a.bin', size, mime: 'application/octet-stream', file: fakeFile('a.bin', size, 91) }];
+  const code = (await sender.send(list)).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000 && sender.state.sentFrames < 4) await sleep(50);
+  assert.ok(sender.state.sentFrames >= 4, `前置：至少要先发出去几块（现在 ${sender.state.sentFrames}）`);
+  const it = env.E.listSaved('sender').find((x) => x.sid === sender.state.sid);
+  assert.ok(it && it.record && it.record.keys, '本地记录里必须带 keys，否则界面点"续传"永远是"密钥本地已经没了"');
+  const fpBefore = env.counters.fingerprints;
+
+  sender.close(); // 模拟刷新：活会话没了，只剩本地记录
+  const s2 = env.E.Session({ role: 'sender', on() {}, config: cfg });
+  try {
+    const r = await s2.send(list, { record: it.record });
+    assert.strictEqual(r.resumed, true, '必须走"接上原会话"这条路');
+    assert.strictEqual(env.counters.fingerprints, fpBefore, '文件没变时续传不许重算指纹（2GB 全靠这一条）');
+
+    const st = await waitVerified(receiver, 60000);
+    assert.ok(st.verified, `续传之后没跑完：phase=${st.phase} error=${st.error}`);
+  } finally {
+    // 测试自己开的会话要自己关：SSE 连接会把跑测进程吊住（判据先红时也必须关）
+    s2.close();
+  }
+}));
+
+// 2GB 的指纹要算很久。码不该等它：先给码、指纹后台算，清单帧发送前再等摘要。
+test('先给码后算指纹：码在指纹算完之前就能用，接收端照样收到完整清单', () => withLab({
+  slot: 94, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000 },
+}, async ({ env, sender, receiver }) => {
+  env.counters.slowFingerprintMs = 1500;
+  const size = 1 * MB;
+  const t0 = Date.now();
+  const { code } = await sender.send([{ relPath: 'h.bin', name: 'h.bin', size, mime: 'application/octet-stream', file: fakeFile('h.bin', size, 92) }]);
+  const elapsed = Date.now() - t0;
+  assert.ok(code, '码必须拿到');
+  assert.strictEqual(env.counters.fingerprints, 1, '指纹必须已经开始算，而不是压根没启动');
+  assert.ok(sender.state.fpDone < sender.state.fpTotal,
+    `send() 返回时指纹还没算完，才证明"码不等指纹"（fp=${sender.state.fpDone}/${sender.state.fpTotal}，用了 ${elapsed}ms）`);
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `指纹算完后应正常传完：phase=${st.phase} error=${st.error}`);
+}));
+
+// 过期/被销毁之后点续传：过去会挂在"连接中"无限重连。现在必须直说"已经结束、需要重发"。
+test('会话已过期时，续传要直说"服务器已清空、需要重发"，不许无限连接中', () => withLab({
+  slot: 95, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000, parallel: 2 },
+}, async ({ env, sender, receiver, cfg }) => {
+  const size = 1 * MB;
+  const list = [{ relPath: 'e.bin', name: 'e.bin', size, mime: 'application/octet-stream', file: fakeFile('e.bin', size, 93) }];
+  const code = (await sender.send(list)).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000 && sender.state.sentFrames < 2) await sleep(50);
+  const it = env.E.listSaved('sender').find((x) => x.sid === sender.state.sid);
+  assert.ok(it, '前置：本地要有记录');
+  sender.close();
+  const gone = await env.E.purgeSaved('sender', it.sid);
+  assert.strictEqual(gone.gone, true, '前置：先把服务器这一单清掉');
+
+  const s2 = env.E.Session({ role: 'sender', on() {}, config: cfg });
+  try {
+    await assert.rejects(() => s2.send(list, { record: it.record }), /已经结束（过期或已被清空）[^]*重发/,
+      '过期后的续传必须给出一条可操作的话，而不是一个永远转的连接中');
+  } finally { s2.close(); }
+}));
+
+// 会话续期必须真的在跑：页面开着（含后台节流）时，2GB 不该因为"30 分钟没动"作废
+test('会话续期：传输期间客户端会定时 keep，并把新的过期时间反映到状态里', () => withLab({
+  slot: 96, drainRate: 2 * MB, cfg: { p2pTimeoutMs: 600, netTimeoutMs: 4000, keepMs: 300 },
+}, async ({ env, sender, receiver }) => {
+  const size = 2 * MB;
+  const code = (await sender.send([{ relPath: 'k.bin', name: 'k.bin', size, mime: 'application/octet-stream', file: fakeFile('k.bin', size, 94) }])).code;
+  await receiver.accept(code);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 15000 && (env.counters.byPath['POST /api/xfer/keep'] || 0) < 2) await sleep(100);
+  const n = env.counters.byPath['POST /api/xfer/keep'] || 0;
+  assert.ok(n >= 2, `续期请求没发出来（只发了 ${n} 次）——后台标签页省电节流时，这就是会话被判过期的原因`);
+  assert.ok(sender.state.expiresAt > t0, '状态里的过期时间要被续期推后');
+  await waitVerified(receiver, 30000);
+}));
+
+// ---------------------------------------------------------------------------
+// 下面三条是 2GB 现场的直接对症：慢、断、以及"标签页不在前台就停"。
+// ---------------------------------------------------------------------------
+
+// 4MB/s 的根因不是带宽也不是加密，而是**接收端一帧一个来回**：128KiB/次、上一帧回来才发下一帧。
+// 这里给每一帧的往返加 120ms 延时，把"串行"与"并发"的差别放大到可判定的程度。
+test('接收端拉中转必须并发：一帧一个来回会把吞吐钉在 RTT 上（4MB/s 的根因）', () => withLab({
+  slot: 97, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 300, netTimeoutMs: 20000 },
+}, async ({ env, sender, receiver }) => {
+  env.counters.slowGetMs = 120;
+  const size = 8 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  const code = (await sender.send([{ relPath: 'p.bin', name: 'p.bin', size, mime: 'application/octet-stream', file: fakeFile('p.bin', size, 61) }])).code;
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 90000);
+  assert.ok(st.verified, `没传完：phase=${st.phase} error=${st.error}`);
+  assert.strictEqual(sender.state.channel, 'server_relay', '夹具坏了：这条腿要的是纯中转');
+  assert.ok(env.counters.segGetPeak >= 4,
+    `同时在飞的拉取最多只有 ${env.counters.segGetPeak} 个（共 ${frames} 帧、${env.counters.segGet} 次 GET）：`
+    + '并发取回来的块按序号落盘，顺序不该成为串行的理由');
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 61)),
+    '并发取回之后装配结果必须不变');
+}));
+
+// "8 秒没建起直连"曾经等于"整场都走中转"：超时那一下直接把 pc close 了。
+// 但 ICE 重选、防火墙提示、STUN 慢一点都会让直连晚到 —— 晚到也该用上。
+test('直连超时先走中转，但直连晚到时必须切回 p2p（不许提前把 pc 掐死）', () => withLab({
+  slot: 98, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 400 },
+}, async ({ link, env, sender, receiver }) => {
+  const size = 4 * MB;
+  const code = (await sender.send([{ relPath: 'l.bin', name: 'l.bin', size, mime: 'application/octet-stream', file: fakeFile('l.bin', size, 62) }])).code;
+  await receiver.accept(code);
+  await sleep(900); // 让 400ms 的直连超时先发生
+  assert.strictEqual(sender.state.channel, 'server_relay', '夹具坏了：超时之后应当已经改标中转');
+  assert.notStrictEqual(link.aCh.readyState, 'closed',
+    'pc 在超时那一下就被关掉了：晚到的直连再也没有机会接上（这就是"局域网还走中转"的一半成因）');
+
+  link.connect(); // 直连"晚到"
+  const t0 = Date.now();
+  while (Date.now() - t0 < 8000 && sender.state.channel !== 'p2p') await sleep(50);
+  assert.strictEqual(sender.state.channel, 'p2p',
+    `直连后来真的开了，通道标识却还停在 ${sender.state.channel}（界面上就是"明明同一局域网还在中转"）`);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `切回直连后没传完：phase=${st.phase} error=${st.error}`);
+  assert.deepStrictEqual(Buffer.from(await collectedBytes(receiver)), Buffer.from(expectBytes(size, 62)),
+    '中途切换通道不许丢块或错位');
+}));
+
+// Chrome 的 Page Lifecycle 会冻结后台标签页：定时器停、SSE 不读、pump 不动，
+// 60 秒后看门狗就把这一单判成"卡住了"—— 用户说的"标签页没在最前面就断了"正是这一档。
+// 持有一把 Web Lock 是官方给的豁免条件，所以引擎一开会话就必须去要它。
+test('会话开始必须持一把 Web Lock：否则后台标签页会被冻结，传输静默停摆', () => withLab({
+  slot: 99, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 },
+}, async ({ env, sender, receiver }) => {
+  const size = 1 * MB;
+  const code = (await sender.send([{ relPath: 'w.bin', name: 'w.bin', size, mime: 'application/octet-stream', file: fakeFile('w.bin', size, 63) }])).code;
+  const locks = env.counters.locks;
+  assert.ok(locks.some((l) => l.name.includes(sender.state.sid) && l.mode === 'exclusive'),
+    `没有向浏览器要"别冻结我"的那把锁：${JSON.stringify(locks)}`);
+  await receiver.accept(code);
+  const st = await waitVerified(receiver, 60000);
+  assert.ok(st.verified, `没传完：phase=${st.phase} error=${st.error}`);
 }));

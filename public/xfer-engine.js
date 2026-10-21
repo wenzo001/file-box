@@ -18,8 +18,14 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const DEFAULTS = {
     parallel: 6,            // 同时在飞的帧：6 × 128KiB ≈ 0.8MB，内存有上界
-    p2pTimeoutMs: 8000,     // 直连建链的耐心，到点走中转，不让用户干等
-    pollMs: 1500,
+    // 接收端一次并发拉几帧。以前是 for..of + await：一帧一个来回，128KiB/次，
+    // 中转路径实测被压在 4MB/s 上下 —— 局域网里这是几十倍的浪费。
+    pullParallel: 8,
+    p2pTimeoutMs: 8000,     // 直连建链的耐心，到点先走中转（但**不掐死**那条 pc，见 switchChannel）
+    lateRtcMs: 120000,      // 已改走中转之后，直连最多再在后台等这么久；一旦 open 就切回直连
+    keepMs: 5 * 60 * 1000,  // 会话续期的心跳：页面开着（含后台节流）就别让 2GB 因为"没动"过期
+    pollMs: 1500,           // 空转时的轮询间隔（有块子在流进来时退到 40ms，见 schedulePoll）
+    pollFastMs: 40,
     ackEvery: 8,            // 攒几块再报一次确认，省请求
     dcBufferHigh: 4 * 1024 * 1024,
     dcBufferLow: 1 * 1024 * 1024,   // 背压恢复的低水位：降到这里才继续发（配合 bufferedamountlow）
@@ -86,6 +92,9 @@
       seal: (o) => call('seal', o, [o.plaintext.buffer]),
       open: (o) => call('open', o, [o.frame.buffer.slice(0)]),
       fingerprint: (file, onProgress) => call('fingerprint', { file }, null, onProgress),
+      // 只算 [from, to) 这一段：多个线程并行读同一份文件的不同段，2GB 的准备时间约除以线程数。
+      // 返回的是**块摘要的有序数组**（不是段摘要），主线程按段序拼起来再链哈希 —— 与单线程逐字节一致。
+      fingerprintRange: (file, from, to, onProgress) => call('fingerprint', { file, from, to }, null, onProgress),
       close() {
         // 线程被 terminate 掉之后不会再回信：排队中和在跑的活都要给个出口，
         // 否则"准备阶段就取消"会让 send() 的 await 永远悬着，界面卡在进度上
@@ -213,6 +222,18 @@
       finish: (sid, kind) => timed(`api/xfer/${kind}`, {
         method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid }),
       }).then((r) => r.ok),
+      // 立即销毁并自证。返回 { ok, gone, removed:{segments,bytes} }；gone 才是"可以删本地记录"的前提
+      purge: (sid) => timed('api/xfer/purge', {
+        method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid }),
+      }).then(json),
+      // 只读状态码：用来二次核对"会话真的不在了"，而不是只信 purge 的自我声明
+      stateStatus: (sid) => timed(`api/xfer/state?${qs({ sid })}`, { headers: hdr({}) }).then((r) => r.status),
+      // 残留核验：**不需要凭证**。用户在隐私模式里丢了本地记录、或者换了台机器时，
+      // 这是他唯一能"自己核对"服务器上还有没有那 2GB 密文的路（服务端只回段数/字节/到期时间）。
+      residue: (sid) => timed(`api/xfer/residue?${qs({ sid })}`, { headers: hdr({}) }).then(json),
+      keep: (sid) => timed('api/xfer/keep', {
+        method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ sid }),
+      }).then(json),
     };
   }
 
@@ -275,7 +296,20 @@
     let open = false;
     const early = [];
     let remoteSet = false;
-    pc.onicecandidate = (e) => { if (e.candidate) handlers.onIce(e.candidate.toJSON()); };
+    // 直连诊断：用户问"同一个局域网为什么还走服务器中转"，界面必须答得出来。
+    // host 且地址是 .local 的是 Chrome 的 mDNS 混淆候选 —— 跨机器解析不了就只能里转。
+    const diag = { host: 0, srflx: 0, prflx: 0, relay: 0, mdns: 0, gathering: 'new', lastError: '' };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) { diag.gathering = 'complete'; handlers.onDiag && handlers.onDiag(diag); return; }
+      const c = e.candidate.toJSON();
+      const t = c.type || 'host';
+      diag[t] = (diag[t] || 0) + 1;
+      if (t === 'host' && /\.local$/i.test(String(c.address || ''))) diag.mdns++;
+      handlers.onIce(c);
+      handlers.onDiag && handlers.onDiag(diag);
+    };
+    pc.onicegatheringstatechange = () => { if (pc.iceGatheringState) diag.gathering = pc.iceGatheringState; };
+    pc.onicecandidateerror = (e) => { diag.lastError = `${e && e.url || ''} ${e && e.errorText || ''}`.trim().slice(0, 120); };
     pc.onconnectionstatechange = () => handlers.onState(pc.connectionState, open);
     pc.ondatachannel = (e) => bind(e.channel);
     function bind(ch) {
@@ -349,16 +383,22 @@
           st.forEach((r) => { if (r.type === 'candidate-pair' && (r.selected || r.nominated)) pair = r; });
           if (!pair) return 'p2p';
           let relay = false;
+          const chosen = { local: '', remote: '' };
           st.forEach((r) => {
             if (r.type !== 'local-candidate' && r.type !== 'remote-candidate') return;
+            if (pair.localCandidateId === r.id) chosen.local = r.candidateType || '';
+            if (pair.remoteCandidateId === r.id) chosen.remote = r.candidateType || '';
             if (pair.localCandidateId === r.id || pair.remoteCandidateId === r.id) {
               if (r.candidateType === 'relay') relay = true;
             }
           });
+          diag.chosen = chosen;
           return relay ? 'turn_relay' : 'p2p';
         } catch { return open ? 'p2p' : 'none'; }
       },
       close() { try { dc && dc.close(); } catch { /* noop */ } try { pc.close(); } catch { /* noop */ } },
+      // 给界面看的直连诊断：候选按类型计数、是不是 mDNS、选中的 pair 两侧类型
+      diag: () => Object.assign({}, diag, { chosen: diag.chosen && Object.assign({}, diag.chosen) }),
       // 配对之后才拿到 TURN 凭证时，用它把 relay 服务器补进 ICE（不需要重建 pc）
       setConfig(c) { try { pc.setConfiguration(c); return true; } catch { return false; } },
     };
@@ -411,8 +451,21 @@
       sentFrames: 0, bytesOnWire: 0, dcFrames: 0, relayFrames: 0,
       uploaded: 0, stored: 0, speed: 0, eta: 0,
       safety: '', kex: '', engine: '', error: '', note: '', expiresAt: 0, files: [], verified: false, saved: false, resumable: false,
+      // 本机记录到底存下来了没有：''=还不知道，'ok'/'fail'。fail 意味着刷新/关页之后就再也
+      // 续不上、也没法用本地凭据请服务器销毁（隐私模式、存储配额满、站点数据被清都会这样）——
+      // 这件事必须告诉用户，而不是让他以为"下次还能接着传"。
+      persist: '',
+      // 这一单比中转配额还大：直连不占中转，所以不是拒绝，但一旦只能走中转就会在配额处停下
+      overBudget: false, budget: 0,
+      // 本机存储配额 vs 这一单要落的密文量（接收端才有）：配额不够时提前说，别传到 60% 才 QuotaExceeded
+      quota: null,
       fpDone: 0, fpTotal: 0,          // 准备阶段：已读/总字节，界面拿它画进度和预计耗时
       peerConfirmed: false,
+      // 服务端清空的回执：只有 confirmed 才是"服务器已确认没有这一单的密文"。
+      // 用户点了"忘记"却拿不到回执时，本地记录必须留着 —— 否则连"再确认一次"的凭据都没了
+      cleanup: null,
+      // 直连诊断（候选类型计数 / mDNS / 选中的 pair / 没走直连的原因）
+      diag: null,
     };
     let pool = null;
     let secret = '';
@@ -421,6 +474,8 @@
     let layout = null;
     let selFiles = [];              // 发送端：{relPath,name,size,mime,file}
     let byRel = new Map();
+    let hashP = null;               // 指纹在后台算：码先给用户，清单发送前才等它
+    let hashErr = null;
     let sess = null;                // 会话密钥
     let manifest = null;
     let link = null;
@@ -448,6 +503,36 @@
     let api = null;
     const ackBuf = new Set();
     let ackTimer = null;
+    let keepT = null;
+    /** 页面开着就给会话续期：后台标签页的定时器会被节流，但不会完全停（冻结/丢弃另说），
+     *  所以 5 分钟一次足够把"30 分钟没动就作废"挡在门外；整单仍有服务端硬上限。 */
+    function armKeep() {
+      if (keepT || !st.sid) return;
+      holdAgainstFreeze();
+      keepT = setInterval(() => {
+        if (closed || aborted || !st.sid) return;
+        if (['done', 'cancelled', 'failed', 'idle'].includes(st.phase)) return;
+        net.keep(st.sid).then((r) => { if (r && r.expiresAt) patch({ expiresAt: r.expiresAt }); }).catch(() => {});
+      }, Math.max(200, cfg.keepMs || 300000));
+      if (keepT.unref) keepT.unref();
+    }
+    // 让浏览器**不要冻结**这个标签页。定时器节流（1 秒 / 1 分钟一跳）可以忍 —— 传输会慢但还在走；
+    // 冻结是另一回事：整个 JS 停下，SSE 读不到、pump 不动，60 秒后看门狗就把这一单判成"卡住了"。
+    // 用户嘴里"标签页没在最前面，任务就断了"就是这一档，而且**跟无痕无关**，前台标签之外都算后台。
+    // Chrome 的 Page Lifecycle 写明"持有 Web Lock 的页面不会被冻结"，所以这里持一把永不释放的锁，
+    // 关页时浏览器自己回收。没有 Web Locks 的浏览器（Firefox/Safari）照旧 —— 那一档只节流，不冻结。
+    let lockRelease = null;
+    let lockHeld = false;
+    function holdAgainstFreeze() {
+      if (lockHeld) return;
+      const locks = global.navigator && navigator.locks;
+      if (!locks || typeof locks.request !== 'function') return;
+      lockHeld = true;
+      const held = new Promise((resolve) => { lockRelease = resolve; });
+      try {
+        locks.request(`filebox-xfer|${st.sid}|${role}`, { mode: 'exclusive' }, () => held).catch(() => { lockHeld = false; });
+      } catch { lockHeld = false; }
+    }
     const timers = [];
     let sample = { t: 0, bytes: 0 };
 
@@ -466,13 +551,18 @@
       const sha = new Map();
       let done = 0;
       patch({ fpTotal: total, fpDone: 0 });
+      // 先出码的那条路里 phase 已经是 waiting（码已经能给用户看了）：这里顺手把"还要准备多久"说出来，
+      // 否则界面上只有一个码，用户不知道背后还在读 2GB
+      const upd = (n) => patch(st.phase === 'fingerprinting'
+        ? { fpDone: n }
+        : { fpDone: n, note: `正在准备文件指纹 ${Math.round((n / total) * 100)}%（可以先把码发给对方）` });
       try {
         for (const f of files) {
           const base = done;
-          const r = await fingerprintFile(pool, f.file, (p, bytes) => patch({ fpDone: Math.min(total, base + bytes) }));
+          const r = await fingerprintFile(pool, f.file, (p, bytes) => upd(Math.min(total, base + bytes)));
           sha.set(f.relPath, r.fileSha256);
           done = Math.min(total, base + f.size);
-          patch({ fpDone: done });
+          upd(done);
         }
       } catch (err) {
         if (aborted) return null;
@@ -491,6 +581,11 @@
     // ---------- 帧的产出与消费 ----------
     async function frameFor(seqN) {
       if (seqN === 0) {
+        // 清单里带的是逐件 SHA-256：对方要靠它验完整份内容。码可以先给，但这一帧必须等真摘要，
+        // 否则早期版本会把 undefined 写进清单，接收端验到一半才报"内容不符"
+        if (hashP) await hashP;
+        if (hashErr) throw hashErr;
+        if (aborted || closed) return null;
         const bytes = P.manifestBytes(layout);
         return new Uint8Array((await pool.seal({
           key: Array.from(sess.kMeta), sid8: Array.from(sess.sid8), type: P.TYPE_META,
@@ -531,8 +626,9 @@
           await net.putSeg(st.sid, seqN, frame);
           st.bytesOnWire += frame.length;
           st.relayFrames++;
-          // 一个字节都没走通过道却把整包塞进了服务器 —— 通道标识就该说实话，不能停在"正在建立直连"
-          if (!st.dcFrames && st.channel !== 'server_relay') switchChannel('server_relay', st.note);
+          // 一个字节都没走通过道却把整包塞进了服务器 —— 通道标识就该说实话，不能停在"正在建立直连"。
+          // 但**不掐死**那条 pc：此刻没开只是因为还没握完手，开了就自动切回直连（keepRtc）。
+          if (!st.dcFrames && st.channel !== 'server_relay') switchChannel('server_relay', st.note, { keepRtc: true });
           return 'relay';
         } catch (err) {
           if (!err.retry) throw err;
@@ -545,6 +641,7 @@
     async function sendSeq(seqN) {
       if (acked.has(seqN)) return;
       const frame = await frameFor(seqN);
+      if (!frame || closed || aborted) return;
       await shipFrame(seqN, frame);
       sentAt.set(seqN, Date.now());
       st.sentFrames++;
@@ -554,21 +651,50 @@
       emit();
     }
 
-    function switchChannel(to, why) {
+    /**
+     * @param {{keepRtc?: boolean}} [opts]
+     *   keepRtc：改走中转，但**先留着那条 pc**。8 秒没建起直连不等于永远建不起来
+     *   （ICE 重选、防火墙提示、STUN 响应慢、对端刚切网都会晚到）。以前一律 close()，
+     *   于是一次性的建链慢就把整场传输钉死在 4MB/s 的中转上。留着它，一旦 open 就切回直连。
+     */
+    function switchChannel(to, why, opts) {
       if (st.channel === to) return;
       // 先把状态落定，再关 rtc：rtc.close() 会当场回调 onconnectionstatechange('closed')，
       // 那条回调走 degradeNow，看的是 st.channel —— 后落定的话它会把这次切换当成"还没降过级"
       // 再降一遍，并且在密钥还没落地时就叫起 afterHandshake（于是把 pendingConfirm 提前验，
       // 报一句 sess.kMeta 读不到，接收端就此卡在 retrying）。
       patch({ channel: to, note: why || st.note });
-      if (to === 'server_relay' && rtc) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
+      if (to === 'server_relay' && rtc) {
+        if (opts && opts.keepRtc) {
+          if (!lateRtcT) {
+            lateRtcT = setTimeout(() => {
+              lateRtcT = null;
+              if (rtc && !rtc.open) { try { rtc.close(); } catch { /* noop */ } rtc = null; }
+            }, cfg.lateRtcMs);
+            if (lateRtcT.unref) lateRtcT.unref();
+          }
+        } else {
+          try { rtc.close(); } catch { /* noop */ }
+          rtc = null;
+        }
+      }
     }
+    let lateRtcT = null;
     let regraceTimer = null;
     /** 认定直连已失效：改走中转并把该跑的循环叫起来（幂等，重复调用不会重复降级） */
     function degradeNow(why) {
       if (st.channel === 'server_relay') return;
+      patch({ diag: collectDiag(null, `直连中断（${why}）`) });
       switchChannel('server_relay', `直连中断（${why}），已改用服务器中转（只传密文）`);
       afterHandshake();
+    }
+    function collectDiag(d, reason) {
+      const base = d || (rtc && rtc.diag ? rtc.diag() : {});
+      return Object.assign(
+        { stun: iceServers.filter((s) => /^stuns?:/i.test(String(s.urls))).length, turn: turnApplied },
+        base,
+        reason ? { reason } : {},
+      );
     }
 
     // ---------- 发送端主循环（并行窗口 + 只补没确认的块） ----------
@@ -779,40 +905,73 @@
       }
     }
     let pulling = false;
+    let pullHadWork = false;   // 上一轮真的取到了块 → 下一轮几乎不用等，立刻再问
     async function pullMissing() {
       // 轮询和握手可能同时叫它；两边一起拉会把同几块下一遍（块本身幂等，但白占带宽和内存）
       if (pulling) return true;
       pulling = true;
+      let got = 0;
       try {
         const s = await net.state(st.sid);
-        const up = new Set(expand(s.uploaded));
-        st.uploaded = up.size;
-        for (const q of up) {
-          if (closed || stored.has(q)) continue;
-          const got = await net.getSeg(st.sid, q);
-          if (got) await acceptFrame(got);
+        expand(s.acked).forEach((n) => acked.add(n));
+        st.frames = s.frames;
+        st.totalBytes = s.totalBytes;
+        const up = expand(s.uploaded);
+        st.uploaded = up.length;
+        // 0 号帧是加密清单：必须先落地，否则后面那些块排不进布局（acceptFrame 会报"不属于任何清单文件"）
+        if (up.length && up[0] === 0 && !stored.has(0)) {
+          const m = await net.getSeg(st.sid, 0);
+          if (m) { await acceptFrame(m); got++; }
+        }
+        const need = up.filter((q) => !stored.has(q));
+        if (need.length) {
+          // 以前是 for..of + await：一帧一个来回、128KiB/次。局域网里这就是 4MB/s 的上限 ——
+          // 瓶颈不在带宽也不在加密，而在"同一时刻只有一个请求在飞"。
+          let cursor = 0;
+          const errs = [];
+          const worker = async () => {
+            while (cursor < need.length) {
+              // 暂停要能立刻停住：8 路并发如果只在轮次之间检查，按了暂停还会再拉一整批
+              if (closed || aborted || paused) return;
+              const q = need[cursor++];
+              if (stored.has(q)) continue;
+              let frame = null;
+              try { frame = await net.getSeg(st.sid, q); }
+              catch (e) { if (e.status !== 404) errs.push(e); return; }
+              if (!frame || stored.has(q)) continue;
+              try { await acceptFrame(frame); got++; }
+              catch (e) { errs.push(e); return; }
+            }
+          };
+          const width = Math.max(1, Math.min(cfg.pullParallel || 8, need.length));
+          await Promise.all(Array.from({ length: width }, worker));
+          if (errs.length) throw errs[0];
         }
         if (st.error && st.phase === 'retrying') patch({ error: '', phase: 'transferring' });
       } catch (err) {
+        pullHadWork = false;
         if (err.status === 404) { patch({ phase: 'waiting', error: '服务器上的这个会话已经过期了' }); return false; }
         patch({ error: err.message || '网络不稳，正在重试', phase: 'retrying' });
       } finally {
         pulling = false;
       }
+      pullHadWork = got > 0;
       emit();
       return true;
     }
     // 接收端要主动追问：服务器中转时发送方是一块一块上传的，配对那一刻拉到的只是当时有的。
     // 不轮询就会永远停在"刚配对时的那几块"上，两边互相等，直到超时。
+    // 间隔是自适应的：取到过块就几乎不歇（否则每个来回后面白等 1.5 秒，占空比被压到 40% 以下），
+    // 空转则退到 pollMs —— 既不空烧请求，也不给吞吐设天花板。
     let pollT = null;
     function schedulePoll() {
       if (pollT || closed || role !== 'receiver') return;
       pollT = setTimeout(async () => {
         pollT = null;
         if (closed || st.verified) return;
-        if (!paused && handshakeDone) { await refreshAck(); await pullMissing(); }
+        if (!paused && handshakeDone) await pullMissing();
         schedulePoll();
-      }, cfg.pollMs);
+      }, pullHadWork ? (cfg.pollFastMs || 40) : cfg.pollMs);
     }
     /** 读本地暂存的某一帧。读不回来时先回服务器补拉这一块，再落一遍盘：
      *  浏览器可能把早先写入的帧从本地暂存里丢掉，读事务也可能只是抖一下 ——
@@ -1013,19 +1172,52 @@
       patch({ peerConfirmed: true, error: '' });
       if (role === 'receiver' && !layout) pullMissing();
     }
+    /** 清单里每个文件的续传指纹：尺寸 + 修改时间 + 摘要。mtime 用来判断"还是不是上次那一份"，
+     *  对得上就沿用摘要，2GB 不必为了续传再把整份读一遍。 */
+    function fileRecs() {
+      return layout ? layout.files.map((f) => {
+        const src = byRel.get(f.relPath);
+        return { relPath: f.relPath, name: f.name, size: f.size, sha256: f.sha256, mtime: (src && src.file && src.file.lastModified) || 0 };
+      }) : [];
+    }
+    function refreshSavedFiles() {
+      const rec = readLs(role)[st.sid];
+      if (!rec) return;
+      rec.files = fileRecs();
+      writeLs(role, st.sid, rec);
+    }
+    /** 码已经给出去之后再算：算完把摘要补进 layout（清单必须带真摘要），并刷新本地记录 */
+    function startHashing() {
+      hashErr = null;
+      hashP = fingerprintAll(selFiles).then((sha) => {
+        if (!sha) return null;
+        layout.files.forEach((lf) => { lf.sha256 = sha.get(lf.relPath); });
+        refreshSavedFiles();
+        if (st.note && /准备文件指纹/.test(st.note)) patch({ note: '' });
+        return sha;
+      }).catch(async (err) => {
+        hashErr = err;
+        if (closed || aborted) return null;
+        await net.purge(st.sid).catch(() => {}); // 会话已建：算不出来就把账本和密文一起收掉，别留一单孤儿
+        writeLs(role, st.sid, null);
+        fail(`准备文件指纹失败：${err.message || err}`);
+        return null;
+      });
+      hashP.catch(() => { /* frameFor 会把它抛给用户，这里只防未处理 rejection */ });
+      return hashP;
+    }
     function cacheKeys() {
       const rec = {
         code: P.formatCode(st.sid, secret), expiresAt: st.expiresAt, frames: st.frames, totalBytes: st.totalBytes,
         safety: sess.safety, kex: sess.kex,
         keys: { kRec: P.hex(sess.kRec), kMeta: P.hex(sess.kMeta), kConfirm: P.hex(sess.kConfirm), sid8: P.hex(sess.sid8) },
       };
-      if (role === 'sender') {
-        rec.token = token;
-        rec.files = layout ? layout.files.map((f) => ({ relPath: f.relPath, name: f.name, size: f.size, sha256: f.sha256 })) : [];
-      } else {
-        rec.files = layout ? layout.files.map((f) => ({ relPath: f.relPath, name: f.name, size: f.size, sha256: f.sha256 })) : [];
-      }
+      if (role === 'sender') rec.token = token;
+      rec.files = fileRecs();
       st.resumable = writeLs(role, st.sid, rec);
+      // 存不下来就说出来。隐私模式/配额满时这里会失败，而用户看到的上一版什么都没有 ——
+      // 他以为能接着传，刷新之后才知道不能，那时也没了销毁的凭据。
+      st.persist = st.resumable ? 'ok' : 'fail';
     }
     function restoreKeys(rec) {
       sess = {
@@ -1070,12 +1262,16 @@
       }
       rtc = p2p(iceServers, {
         onIce: (json) => { net.signal(st.sid, 'ice', JSON.stringify(json)).catch(() => {}); },
+        onDiag: (d) => patch({ diag: collectDiag(d) }),
         onFrame: (frame) => { if (role === 'receiver') acceptFrame(frame).catch((e) => fail(e.message || e)); },
         onState: async (state, open) => {
           if (open) {
             if (regraceTimer) { clearTimeout(regraceTimer); regraceTimer = null; } // 自己回来了，之前的"要降级"作废
-            const mode = await rtc.mode();
+            // 已经关掉的 pc 不该走到这里；真走到（对端重新拉起通道）也只是没有它可用，
+            // 不能拿 null 去调 mode() 把一句 TypeError 顶上用户界面
+            const mode = rtc ? await rtc.mode() : 'server_relay';
             switchChannel(mode); // 直连/TURN 各自的说明由界面 CHAN 文案给，不重复塞一句
+            patch({ diag: collectDiag(null) });
             afterHandshake();
           } else if (state === 'failed' || state === 'closed') {
             degradeNow(state);
@@ -1103,7 +1299,10 @@
       // 而它其实全盘在从服务器拉密文；那条开不了的 pc 也一直悬着不关。
       if (rtc) timers.push(setTimeout(() => {
         if (!rtc || rtc.open) return;
-        switchChannel('server_relay', '直连建立超时，已改用服务器中转');
+        // keepRtc：先走中转把进度推起来，但直连仍在后台继续试。它一旦 open，
+        // onState 里会把通道如实改回 p2p —— 而不是"第一秒没建好就整场 4MB/s"。
+        switchChannel('server_relay', '直连建立超时，已先用服务器中转（直连仍在后台尝试）', { keepRtc: true });
+        patch({ diag: collectDiag(null, `直连建立超时（${Math.round(cfg.p2pTimeoutMs / 1000)} 秒内没建起来）`) });
         // 只有发送端需要这一叫把主循环起来；接收端的拉取另有排程，在这里多叫一次只会
         // 在密钥还没落地时凭空报一个错
         if (role === 'sender') afterHandshake();
@@ -1146,12 +1345,16 @@
       closed = true;
       if (liveSession[role] === api) liveSession[role] = null;
       if (regraceTimer) { clearTimeout(regraceTimer); regraceTimer = null; }
+      if (lateRtcT) { clearTimeout(lateRtcT); lateRtcT = null; }
+      // 放掉那把防冻结的锁：会话结束了就不该再拦着浏览器回收这个页面
+      if (lockRelease) { lockRelease(); lockRelease = null; lockHeld = false; }
       timers.forEach(clearTimeout);
       timers.length = 0;
       if (link) link.close();
       if (rtc) rtc.close();
       if (pollT) { clearTimeout(pollT); pollT = null; }
       if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
+      if (keepT) { clearInterval(keepT); keepT = null; }
       pool && pool.close();
     }
 
@@ -1187,20 +1390,46 @@
         layout = P.planLayout(list);
         st.frames = layout.totalFrames;
         st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
-        patch({ phase: 'fingerprinting', code: st.code, resumable: true });
-        const sha = await fingerprintAll(list);
-        if (!sha) return { code: st.code, cancelled: true };
-        if (aborted) return { code: st.code, cancelled: true };
-        for (const lf of layout.files) {
-          lf.sha256 = sha.get(lf.relPath);
-          const want = (rec.files || []).find((x) => x.relPath === lf.relPath);
-          if (want && want.sha256 && lf.sha256 !== want.sha256) throw new Error(`「${lf.name}」内容已经变了，不能续原会话：请重新发一次`);
+        // 文件没变（尺寸 + 修改时间 + 上次摘要都在）就沿用上次的摘要：
+        // 续传不该为了同一份 2GB 再把盘读一遍（用户点的"接着传"要立刻动起来）
+        const savedByRel = new Map((rec.files || []).map((x) => [x.relPath, x]));
+        const reusable = list.every((f) => {
+          const w = savedByRel.get(f.relPath);
+          return !!(w && w.sha256 && w.size === f.size && w.mtime && f.file && f.file.lastModified === w.mtime);
+        });
+        if (reusable) {
+          layout.files.forEach((lf) => { lf.sha256 = savedByRel.get(lf.relPath).sha256; });
+          patch({ phase: 'fingerprinting', code: st.code, resumable: true, fpTotal: st.totalBytes, fpDone: st.totalBytes, note: '沿用上次的校验值（文件没变），不重算' });
+        } else {
+          patch({ phase: 'fingerprinting', code: st.code, resumable: true });
+          const sha = await fingerprintAll(list);
+          if (!sha) return { code: st.code, cancelled: true };
+          if (aborted) return { code: st.code, cancelled: true };
+          for (const lf of layout.files) {
+            lf.sha256 = sha.get(lf.relPath);
+            const want = (rec.files || []).find((x) => x.relPath === lf.relPath);
+            if (want && want.sha256 && lf.sha256 !== want.sha256) throw new Error(`「${lf.name}」内容已经变了，不能续原会话：请重新发一次`);
+          }
         }
         await ensureKeys();
+        // 先问一句服务器：这一单还在不在。不在就别装模作样地"连接中"——
+        // 用户要的是"已经没了、需要重发"，而不是盯着一个永远不会动的进度条（过期后 SSE 只会无限重连）
+        try {
+          const sv = await net.state(st.sid);
+          st.frames = sv.frames;
+          st.totalBytes = sv.totalBytes;
+          st.expiresAt = sv.expiresAt;
+        } catch (err) {
+          if (err.status === 404 || err.status === 410) {
+            throw new Error('这一单在服务器上已经结束（过期或已被清空），需要重新发一次。刚才的校验值还留在本地，重发时不用重算');
+          }
+          throw err;
+        }
         await setupChannel(); // 同 fresh 分支：rtc 先于事件流
         openStream();
         await exchangeKeys();
         cacheKeys();
+        armKeep();
         await resumeHandshake();
         return { code: st.code, resumed: true };
       }
@@ -1211,22 +1440,25 @@
       layout = P.planLayout(selFiles);
       st.frames = layout.totalFrames;
       st.totalBytes = layout.files.reduce((s, f) => s + f.size, 0);
-      patch({ phase: 'fingerprinting' });
-      const sha = await fingerprintAll(selFiles);
-      if (!sha) return { code: '', cancelled: true };
-      // 用户可能在指纹刚算完、还没来得及建会话的那一瞬间点了"取消生成"。
-      // 少了这一检查，取消之后照样会 net.create 出一个会话，界面上就是"取消了还在等对方"。
-      if (aborted) return { code: '', cancelled: true };
-      layout.files.forEach((lf) => { lf.sha256 = sha.get(lf.relPath); });
       secret = P.genSecret();
       st.sid = P.genSid();
       proof = await P.proofOf(st.sid, secret);
       st.code = P.formatCode(st.sid, secret);
+      // 先把码建出来给用户：2GB 的指纹要算一阵，不能让"把码发给对方"这一步排在它后面空等。
+      // 指纹在后台并行算；清单帧（frameFor(0)）发送前才等它，所以不会把半个清单发出去。
       const created = await net.create(st.sid, proof, layout.totalFrames, st.totalBytes);
       token = created.token;
       st.expiresAt = created.expiresAt;
-      if (aborted) { await net.finish(st.sid, 'cancel').catch(() => {}); return { code: '', cancelled: true }; }
+      // 预算如实带回界面：走直连一个字节都不进中转区，所以只在"最终只能中转"时才真的卡住。
+      // 以前这里一声不响，用户看到的就是"跑到 2GB 忽然断了"。
+      patch({ overBudget: !!created.overBudget, budget: Number(created.limitBytes) || 0 });
+      if (aborted) {
+        await net.purge(st.sid).catch(() => {});
+        return { code: '', cancelled: true };
+      }
       patch({ phase: 'waiting', code: st.code });
+      startHashing();
+      armKeep();
       await ensureKeys();
       await setupChannel(); // 同上：rtc 必须先于事件流存在
       openStream();
@@ -1234,6 +1466,18 @@
       // 不在这里 cacheKeys：会话密钥要等对方公钥到了才派生得出来（onPeerKey 里落盘），
       // 提前写会把 null 密钥存进本地记录，刷新后"看着能续"其实什么都解不开
       return { code: st.code, frames: st.frames };
+    }
+
+    /** 接收端要把密文帧落到本机（断点续传全指望它）。浏览器给的存储配额比这一单还小时，
+     *  传到一半必定 QuotaExceeded —— 隐私模式尤其明显。问一句 `storage.estimate()` 就能提前说，
+     *  比让它在 60% 处停住强。问不到（旧浏览器/被策略拦）就什么都不说，不猜。 */
+    function quotaHint(need) {
+      try {
+        if (!global.navigator || !navigator.storage || !navigator.storage.estimate) return;
+        navigator.storage.estimate().then((est) => {
+          if (est && est.quota) patch({ quota: { need, quota: est.quota } });
+        }).catch(() => {});
+      } catch { /* 没有这个接口就不提 */ }
     }
 
     async function accept(codeText) {
@@ -1249,12 +1493,20 @@
       await sweepSaved().catch(() => {});
       const rec = readLs('receiver')[parsed.sid];
       if (rec && rec.keys) { restoreKeys(rec); resumeMode = true; }
-      const j = await net.join(parsed.sid, proof);
+      let j;
+      try {
+        j = await net.join(parsed.sid, proof);
+      } catch (err) {
+        if (err.status === 404 || err.status === 410) throw new Error('这一单在服务器上已经结束（过期或已被清空），请让对方重新发一次');
+        throw err;
+      }
       if (aborted) return { frames: j.frames, totalBytes: j.totalBytes, cancelled: true };
       st.frames = j.frames;
       st.totalBytes = j.totalBytes;
       st.expiresAt = j.expiresAt;
       patch({ phase: 'pairing', code: st.code, resumable: resumeMode });
+      quotaHint(j.totalBytes);
+      armKeep();
       if (!resumeMode) writeLs('receiver', parsed.sid, { code: st.code, expiresAt: j.expiresAt });
       await ensureKeys();
       await setupChannel(); // rtc 先就位，再开流收补发的 offer/ice/key
@@ -1269,14 +1521,39 @@
       send,
       accept,
       pause() { paused = true; patch({ phase: 'paused' }); },
-      resume() { paused = false; patch({ phase: 'transferring' }); if (role === 'sender') pump(); else pullMissing(); },
+      /**
+       * 「继续」——也从"卡住了 / 出错了"这一档回到传输。
+       * 以前只有一个 pause()/resume() 对：界面在 retrying 上把按钮写成"暂停"，
+       * 点一下反而把一单正在重试的传输停住，用户以为坏了（这也是"没法重新发"的一部分体感）。
+       * 现在这一档的按钮就叫「继续」，走的就是这里：清掉旧报错、重新起循环。
+       */
+      resume() {
+        paused = false;
+        patch({ phase: handshakeDone ? 'transferring' : 'pairing', error: '' });
+        if (role === 'sender') { pump(); refreshAck(); }
+        else { pullMissing(); schedulePoll(); }
+      },
       async cancel() {
         aborted = true;
-        close(); // 先关：准备阶段还没有会话号可通知服务器，但读文件的线程必须立刻停下来
-        patch({ phase: 'cancelled' }); // 状态先落到界面，别让用户等着网络往返
-        if (st.sid) await net.finish(st.sid, 'cancel').catch(() => {});
+        const sid = st.sid;
+        // 准备阶段还没有会话号：这一下只是"别算了"，没有密文可清，如实标成已确认 0 字节
+        const r = sid
+          ? await net.purge(sid).catch((err) => ({ ok: false, gone: false, error: err.message || String(err) }))
+          : { ok: true, gone: true, removed: { segments: 0, bytes: 0 } };
+        close(); // 先关：读文件的线程必须立刻停下来
+        if (sid && r.gone) { writeLs(role, sid, null); st.resumable = false; } // 服务器确认清空了，本地凭据才删
+        patch({
+          phase: 'cancelled',
+          cleanup: {
+            confirmed: !!r.gone,
+            segments: (r.removed && r.removed.segments) || 0,
+            bytes: (r.removed && r.removed.bytes) || 0,
+            error: r.gone ? '' : (r.error || '服务器没有确认清空'),
+          },
+        });
+        return r;
       },
-      async refresh() { await refreshAck(); if (role === 'receiver') await pullMissing(); },
+      async refresh() { if (st.sid) await net.keep(st.sid).catch(() => {}); await refreshAck(); if (role === 'receiver') await pullMissing(); },
       close,
       saveAll,
       collected,
@@ -1291,10 +1568,48 @@
     };
   }
 
+  /** 按序拼接若干个定长摘要再哈希。分 4096 个一批拼接：20 万块时一次性展开进
+   *  `P.cat(...chain)` 会直接 RangeError（参数个数上限），那是"大文件算指纹必崩"的隐患。 */
+  function catChunked(list, size = 4096) {
+    if (!list.length) return new Uint8Array(0);
+    const parts = [];
+    for (let i = 0; i < list.length; i += size) parts.push(P.cat(...list.slice(i, i + size)));
+    return parts.length === 1 ? parts[0] : P.cat(...parts);
+  }
+
   // 文件指纹：整件文件的逐块 SHA-256 → 链摘要 → 再哈希。算在工作线程里，主线程只收进度。
+  //
+  // 单文件按线程数切段并行：切点只落在 128KiB 的整数倍上，所以段内的块与整份的块是同一批，
+  // 拼回来的链与单线程逐字节相同（`test/fingerprint.test.js` 对的是同一条参考实现）。
+  // 以前是一条线程从头读到尾 —— 2GB 要几十秒，而"码已经给出去了、进度条却卡在指纹上"正是
+  // 用户体感最差的那一段（配置里 4 条加密线程，3 条一直闲着）。
   async function fingerprintFile(pool, file, onProgress) {
-    const r = await pool.fingerprint(file, onProgress);
-    return { fileSha256: r.hex, size: file.size };
+    const B = P.PLAIN_BLOCK;
+    const blocks = Math.max(1, Math.ceil(file.size / B));
+    // 小文件不值得切：一个线程 16MiB 只要几十毫秒，切段反而多出调度与拼装。
+    const parts = file.size < 16 * 1024 * 1024 ? 1 : Math.max(1, Math.min(pool.size, blocks));
+    const per = Math.ceil(blocks / parts);
+    const ranges = [];
+    for (let i = 0; i < parts; i++) {
+      const a = i * per;
+      const b = Math.min(blocks, (i + 1) * per);
+      if (a >= b) break;
+      ranges.push({ from: a * B, to: Math.min(file.size, b * B) });
+    }
+    const got = new Array(ranges.length).fill(0);
+    const report = () => {
+      if (!onProgress) return;
+      const sum = got.reduce((x, y) => x + y, 0);
+      onProgress(file.size ? Math.min(1, sum / file.size) : 1, sum);
+    };
+    const res = await Promise.all(ranges.map((r, i) => pool.fingerprintRange(file, r.from, r.to, (p, bytes) => {
+      got[i] = Math.max(0, Math.min(r.to - r.from, Number(bytes) || 0));
+      report();
+    })));
+    const chain = [];
+    for (const r of res) for (const d of ((r && r.digests) || [])) chain.push(d);
+    if (!chain.length) chain.push(await P.sha256(new Uint8Array(0))); // 空文件也有"一块"
+    return { fileSha256: P.hex(await P.sha256(catChunked(chain))), size: file.size };
   }
 
   global.XferEngine = {
@@ -1307,10 +1622,62 @@
       const all = readLs(role);
       const now = Date.now();
       return Object.entries(all)
-        .map(([sid, rec]) => ({ sid, code: rec.code, expiresAt: rec.expiresAt, frames: rec.frames, totalBytes: rec.totalBytes, verified: !!rec.verified, token: rec.token }))
-        .filter((x) => x.expiresAt > now);
+        .map(([sid, rec]) => ({
+          sid, code: rec.code, expiresAt: rec.expiresAt, frames: rec.frames, totalBytes: rec.totalBytes,
+          verified: !!rec.verified, token: rec.token, files: rec.files || [],
+          // 续传必须拿到完整记录（含 keys）：以前这里只给出展示字段，界面点"续传"时
+          // send() 看到 record.keys 不存在，直接报"密钥本地已经没了" —— 发送端续传从来没成功过
+          record: rec,
+          // 过期的不再隐藏：用户需要能对"我传过的那一单"再核一次服务器，而不是让记录凭空消失
+          expired: !(rec.expiresAt > now),
+        }))
+        .sort((a, b) => (b.expiresAt || 0) - (a.expiresAt || 0));
+    },
+    /**
+     * 让服务器立即销毁这一单，并核对两件事：它回了 gone，且再查状态是 404/410。
+     * 只有两件都成立才删本地记录；否则返回 gone:false，本地凭据留着等用户再点一次。
+     */
+    async purgeSaved(role, sid) {
+      const rec = readLs(role)[sid];
+      if (!rec) return { gone: true, removed: { segments: 0, bytes: 0 }, already: true };
+      let cred;
+      if (role === 'sender') {
+        if (!rec.token) return { gone: false, error: '本地记录里没有发送方凭证，没法请服务器销毁（可在服务器端按过期回收）' };
+        cred = { token: rec.token };
+      } else {
+        const parsed = P.parseCode(rec.code || '');
+        if (!parsed) return { gone: false, error: '本地记录里没有可用的传输码，没法请服务器销毁（可在服务器端按过期回收）' };
+        cred = { proof: await P.proofOf(parsed.sid, parsed.secret) };
+      }
+      const api = makeApi(role, cred, () => DEFAULTS);
+      let j;
+      try {
+        j = await api.purge(sid);
+      } catch (err) {
+        // 销毁请求本身失败时，用只读状态码分辨"其实已经没了"和"真的没清"
+        const code = await api.stateStatus(sid).catch(() => 0);
+        if (code === 404 || code === 410) { writeLs(role, sid, null); return { gone: true, removed: { segments: 0, bytes: 0 }, already: true }; }
+        return { gone: false, error: err.message || String(err) };
+      }
+      if (!j || !j.gone) return { gone: false, removed: (j && j.removed) || null, error: '服务器说还没清干净' };
+      const code = await api.stateStatus(sid).catch(() => 0);
+      if (code !== 404 && code !== 410) return { gone: false, removed: j.removed, error: `服务器仍能查到这一单（HTTP ${code || '?'}）` };
+      writeLs(role, sid, null);
+      return { gone: true, removed: j.removed || { segments: 0, bytes: 0 } };
     },
     forget(role, sid) { writeLs(role, sid, null); },
+    /**
+     * 只读残留核验，**不需要任何凭据**（本地记录没了也能问）。
+     * 返回 { exists, segments, bytes, state, expiresAt }。
+     * 为什么要有它：能销毁这一单的 token/proof 只存在浏览器本地，隐私模式、清站点数据、
+     * 换台机器都会让它消失 —— 那时用户除了"相信 30 分钟后会清"，本来没有任何可核对的话。
+     */
+    async residue(sid) {
+      const r = await fetch(`api/xfer/residue?sid=${encodeURIComponent(String(sid))}`, { cache: 'no-store' });
+      const b = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(b.error || `查询失败 (${r.status})`);
+      return b;
+    },
     // 界面用它兜底"一个角色只允许一个会话"；界面自己也要在开局前拦一次
     liveOf(role) { const s = liveSession[role]; return s && isLive(s) ? s.state.phase : ''; },
     warmUp,
@@ -1323,6 +1690,9 @@
         idb: typeof indexedDB !== 'undefined',
         workers: typeof Worker === 'function',
         sse: typeof EventSource === 'function',
+        // 有没有 Web Locks：有则能阻止浏览器冻结后台标签页（Chrome/Edge），
+        // 没有（Firefox/Safari）就只有定时器节流 —— 传输会变慢但不会断
+        locks: !!(global.navigator && navigator.locks && typeof navigator.locks.request === 'function'),
       };
     },
   };

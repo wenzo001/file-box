@@ -58,6 +58,9 @@ async function boot(dir, PORT, extra) {
     STAGING_DIR: path.join(dir, 'uploading'),
     TRANSFER_DIR: path.join(dir, 'transfer'),
     STORAGE_LIMIT_GB: '1',
+    // 每个测试进程都去抢同一个 UDP 3478 没有意义（也没法并行跑）。默认关掉内置 STUN，
+    // 只有 stun / 配置相关的腿自己显式指定端口。
+    STUN_PORT: '0',
     NODE_NO_WARNINGS: '1',
   }, extra);
   const child = cp.spawn('node', ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
