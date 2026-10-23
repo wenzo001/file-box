@@ -1,19 +1,28 @@
-/* 进度长条（#blocks）：文件库上传页与无痕传输页共用的同一组件。
+/* 进度长条（#blocks / #r-blocks）：文件库上传页与无痕传输页共用的同一组件。
    两页共用：配色、格子尺寸变量、动画。格子布局算法（layoutStrip）两页各自内联，
    因为粒度不同 —— 上传页一格 = 一个上传块（约 4MiB），传输页封顶 600 格，
-   但几何参数（wMax/wMin/hMax/hMin/rows/budget）与这里是同一套。 */
-#blocks {
+   但几何参数（wMax/wMin/hMax/hMin/rows/budget）与这里是同一套。
+
+   为什么选择器是列表：#blocks 是文件库页与无痕传输的发送端，#r-blocks 是接收端。
+   以前只写了 #blocks —— 接收端那条 div#r-blocks 一条样式都没有：
+   没有 flex、没有格子尺寸、没有配色，600 个 div.blk 全是零尺寸空盒子。
+   现象就是"接收的时候那块进度条一动不动"，其实它从第一帧起就没画出来过。 */
+#blocks, #r-blocks {
   display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px;
   margin-top: 14px; padding: 3px; border-radius: 7px;
   background: var(--fill);
   /* 格子大小由各页的 layoutStrip 按块数算：块多就缩小格子，绝不在长条里加滚动条 */
   --blk-w: 9px; --blk-h: 12px;
 }
-#blocks .blk {
+#blocks .blk, #r-blocks .blk {
   width: var(--blk-w); height: var(--blk-h); border-radius: 2px; background: var(--card);
   transition: background .12s, opacity .12s;
 }
-#blocks .blk.done { background: var(--accent-fill); }
-#blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
-#blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); } /* 清单/账本那一块 */
+#blocks .blk.done, #r-blocks .blk.done { background: var(--accent-fill); }
+#blocks .blk.active, #r-blocks .blk.active { background: var(--accent); animation: blkPulse 1s ease-in-out infinite; }
+#blocks .blk.meta, #r-blocks .blk.meta { box-shadow: inset 0 0 0 1px var(--sep); } /* 清单/账本那一块 */
+/* 校验阶段的"第二遍扫描"：块已经全到齐了，这一遍是在逐块解密并重算哈希。
+   用绿色从左往右覆写，用户才看得出"它在干活"，而不是"卡在 100% 不动"。
+   红色不用：这不是出错。 */
+#blocks .blk.vfy, #r-blocks .blk.vfy { background: var(--ok); }
 @keyframes blkPulse { 50% { opacity: .3; } }

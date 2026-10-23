@@ -211,7 +211,7 @@ function boot({ link, base }) {
   });
   defg('indexedDB', { open: () => { const req = {}; setTimeout(() => { req.result = { transaction: () => tx() }; req.onsuccess && req.onsuccess(); }, 0); return req; } });
 
-  const counters = { segPut: 0, segGet: 0, segGetInflight: 0, segGetPeak: 0, slowGetMs: 0, locks: lockCalls, byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0, slowSeal: 0, slowSealMs: 1500, doneLog: [], fingerprints: 0, slowFingerprintMs: 0 };
+  const counters = { segPut: 0, segGet: 0, segGetInflight: 0, segGetPeak: 0, slowGetMs: 0, locks: lockCalls, errs: [], byPath: {}, failAck: 0, hangPut: 0, hangFinish: 0, refuseFinish: 0, stuckSeal: 0, slowSeal: 0, slowSealMs: 1500, doneLog: [], fingerprints: 0, slowFingerprintMs: 0 };
   // 原生 fetch 只能在模块加载时取一次。以前写的是 `const nativeFetch = g.fetch` —— 而 g.fetch 在
   // 第二个台架起来时**已经是上一个台架的注入器**了，于是注入是套着往下漏的：
   // 89 号腿留的 refuseFinish=99 让 90 号腿每一次收尾都吃 409（单独跑 90 全绿，接在 89 后面必红）。
@@ -284,7 +284,15 @@ function boot({ link, base }) {
       ? sleep(counters.slowGetMs).then(() => nativeFetch(u, opt))
       : nativeFetch(u, opt));
     return go().then(
-      (r) => { if (isGetSeg) counters.segGetInflight--; return r; },
+      (r) => {
+        if (isGetSeg) counters.segGetInflight--;
+        // 4xx 留痕：台架里的判据失败时，"哪一路接口回了什么"比一句 assert 有用得多。
+        // 尤其是 404 —— 我们的每个 API 都带 JSON body，**没有 body 的 404 说明请求根本没进业务路由**。
+        if (r.status >= 400) {
+          counters.errs.push(`${method} ${pathname} → ${r.status} ${r.headers.get('content-type') || ''}`);
+        }
+        return r;
+      },
       (e) => { if (isGetSeg) counters.segGetInflight--; throw e; });
   };
   labFetch.__xferLabStub = true;

@@ -178,7 +178,13 @@
     const qs = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
     const json = async (r) => {
       const b = await r.json().catch(() => ({}));
-      if (!r.ok) { const e = new Error(b.error || `请求失败 (${r.status})`); e.status = r.status; throw e; }
+      if (!r.ok) {
+        // 带上接口路径：一条光秃秃的 "请求失败 (404)" 没法判断是会话过期、路由写错还是代理挡了。
+        // 服务端给了 error 文案就用它的（那些文案本来就是说给用户看的）。
+        const e = new Error(b.error || `请求失败 (${r.status})${r.__xferUrl ? ` · ${r.__xferUrl}` : ''}`);
+        e.status = r.status;
+        throw e;
+      }
       return b;
     };
     // 每个请求都带超时。理由不是"慢一点不好看"：socket 死了但连接没断时 fetch **既不 resolve 也不 reject**，
@@ -192,7 +198,8 @@
       return fetch(url, Object.assign({}, opt, { signal: ac.signal })).catch((err) => {
         if (err && err.name === 'AbortError') throw Object.assign(new Error(`请求超时（${ms}ms 没回来）`), { retry: true });
         throw err;
-      }).finally(() => clearTimeout(t));
+      }).then((r) => { r.__xferUrl = String(url).split('?')[0]; return r; }) // 出错时能说清是哪一路接口
+        .finally(() => clearTimeout(t));
     };
     return {
       config: async () => json(await timed('api/xfer/config')),
@@ -460,6 +467,10 @@
       // 本机存储配额 vs 这一单要落的密文量（接收端才有）：配额不够时提前说，别传到 60% 才 QuotaExceeded
       quota: null,
       fpDone: 0, fpTotal: 0,          // 准备阶段：已读/总字节，界面拿它画进度和预计耗时
+      // 校验 / 写盘阶段的帧进度。2.5GB 这两个阶段各要几十秒到几分钟，
+      // 没有这两个数界面上就只能挂一句静态文案 —— 用户会以为卡死了。
+      verifyDone: 0, verifyTotal: 0,
+      saveDone: 0, saveTotal: 0,
       peerConfirmed: false,
       // 服务端清空的回执：只有 confirmed 才是"服务器已确认没有这一单的密文"。
       // 用户点了"忘记"却拿不到回执时，本地记录必须留着 —— 否则连"再确认一次"的凭据都没了
@@ -955,6 +966,13 @@
       } finally {
         pulling = false;
       }
+      // 已经从服务器拉到过块，却一个字节都没走通过道 —— 标识就该如实改成中转。
+      // 发送端早就有这条规矩，接收端一直没有：短传输会在整段时间里显示"正在尝试点对点直连"，
+      // 而它每一块都是从服务器拉下来的（冒烟实测：长条走到 100% 时还写着"正在建直连"）。
+      // keepRtc：直连还在后台试，开了就切回去。
+      if (got > 0 && !(rtc && rtc.open) && st.channel !== 'server_relay') {
+        switchChannel('server_relay', '正在走服务器中转（直连仍在后台尝试）', { keepRtc: true });
+      }
       pullHadWork = got > 0;
       emit();
       return true;
@@ -990,33 +1008,60 @@
       st.stored = stored.size;
       return new Uint8Array(got);
     }
+    // 校验/写盘都要把每一块重新解一遍。以前是 for 里 await，一帧一个来回 ——
+    // 2.5GB 两万帧，光调度就够几十秒到几分钟，而界面这段时间**一个字都不变**
+    // （用户的原话："卡了很久，最后才弹出保存按钮"）。现在按批并发开帧，
+    // 每批推一次 verifyDone，界面上的百分比才是活的。
+    const VERIFY_BATCH = 8;
+    // 校验要跑几十秒到几分钟。`persist()` 在"最后一块到达"之后还可能再进来一次（重复帧幂等），
+    // 以前校验很快所以撞不上；现在必须挡住，否则会同时跑两条复核循环（CPU 翻倍、百分比乱跳）。
+    let verifying = false;
     async function finishReceive() {
-      if (st.verified) return;
-      patch({ phase: 'verifying' });
+      if (st.verified || verifying) return;
+      verifying = true;
+      // 0 号帧是加密清单：它在 acceptFrame 里已经开过一次，复核/写盘都不再走它。
+      // 所以这里的"总块数"要减掉它，否则进度永远差一块、停在 98%。
+      const dataFrames = Math.max(1, layout.totalFrames - 1);
+      patch({ phase: 'verifying', verifyDone: 0, verifyTotal: dataFrames });
       try {
+        let done = 0;
         for (const f of layout.files) {
-          const chain = [];
+          const key = await fileKey(f.fileId);
+          const digests = new Array(f.chunks.length);
           let total = 0;
-          for (let c = 0; c < f.chunks.length; c++) {
-            const frame = await readStoredFrame(f.seqBase + c, f.name);
-            const key = await fileKey(f.fileId);
-            const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
-            const pt = new Uint8Array(r.plaintext);
-            if (pt.length !== f.chunks[c]) throw new Error(`「${f.name}」第 ${c} 块长度不对`);
-            chain.push(await P.sha256(pt));
-            total += pt.length;
+          for (let c = 0; c < f.chunks.length; c += VERIFY_BATCH) {
+            const upto = Math.min(f.chunks.length, c + VERIFY_BATCH);
+            const batch = [];
+            for (let k = c; k < upto; k++) batch.push(k);
+            const parts = await Promise.all(batch.map(async (k) => {
+              const frame = await readStoredFrame(f.seqBase + k, f.name);
+              const r = await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame });
+              const pt = new Uint8Array(r.plaintext);
+              if (pt.length !== f.chunks[k]) throw new Error(`「${f.name}」第 ${k} 块长度不对`);
+              return pt;
+            }));
+            // 哈希必须按块序算（链），所以"并发只并发解密，摘要仍然顺序算"
+            for (let i = 0; i < parts.length; i++) {
+              digests[c + i] = await P.sha256(parts[i]);
+              total += parts[i].length;
+              done++;
+            }
+            patch({ verifyDone: done });
           }
           if (total !== f.size) throw new Error(`「${f.name}」总长度不对`);
-          if (f.sha256 && P.hex(await P.sha256(P.cat(...chain))) !== f.sha256) {
+          if (f.sha256 && P.hex(await P.sha256(catChunked(digests))) !== f.sha256) {
             throw new Error(`「${f.name}」内容校验失败，可能被人动过`);
           }
         }
         await flushAcks();
         // 清掉尾巴上的一次性抖动报错：校验已经通过，界面上还挂着"会话已过期"就是假警报
-        patch({ phase: 'ready', verified: true, error: '' });
+        patch({ phase: 'ready', verified: true, error: '', verifyDone: st.verifyTotal });
         writeLs('receiver', st.sid, Object.assign({}, readLs('receiver')[st.sid] || {}, { verified: true }));
       } catch (err) {
         fail(err.message || err);
+      } finally {
+        // 只有"没验成"才允许重来：验过了就锁死，别让后来的重复帧再跑一遍
+        if (!st.verified) verifying = false;
       }
     }
 
@@ -1047,8 +1092,9 @@
     const savedHandles = new Map();
     async function saveAll(streamToFile) {
       if (!st.verified) throw new Error('还没通过完整性校验');
-      patch({ phase: 'saving' });
+      patch({ phase: 'saving', saveDone: 0, saveTotal: Math.max(1, layout.totalFrames - 1) });
       await sweepSaved();          // 上一轮的明文暂存先清掉，再落这一轮的
+      let done = 0;
       for (const f of layout.files) {
         const key = await fileKey(f.fileId);
         let w = null;
@@ -1058,15 +1104,24 @@
           const fh = d && await d.getFileHandle(String(f.fileId), { create: true });
           if (fh) { savedHandles.set(f.relPath, fh); w = await fh.createWritable(); }
         }
-        for (let c = 0; c < f.chunks.length; c++) {
-          const frame = await readStoredFrame(f.seqBase + c, f.name);
-          const pt = new Uint8Array((await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame })).plaintext);
-          if (w) await w.write(pt);
-          else yieldBlob(f, pt);
+        for (let c = 0; c < f.chunks.length; c += VERIFY_BATCH) {
+          const upto = Math.min(f.chunks.length, c + VERIFY_BATCH);
+          // 解密并发、写盘有序：写是流水（顺序不能乱），解是纯计算（可以并行）。
+          // 以前整条链路串着走，2.5GB 的"保存"要几分钟且界面停在"正在解密写盘"一句话上。
+          const parts = await Promise.all(Array.from({ length: upto - c }, (_, i) => (async () => {
+            const frame = await readStoredFrame(f.seqBase + c + i, f.name);
+            return new Uint8Array((await pool.open({ key: Array.from(key), sid8: Array.from(sess.sid8), frame })).plaintext);
+          })()));
+          for (const pt of parts) {
+            if (w) await w.write(pt);
+            else yieldBlob(f, pt);
+            done++;
+          }
+          patch({ saveDone: done });
         }
         if (w) await w.close();
       }
-      patch({ phase: 'done', saved: true });
+      patch({ phase: 'done', saved: true, saveDone: st.saveTotal });
       // 归组按 relPath 而不是 name：同一批里两个不同子目录下的同名文件，
       // 按名字归组会把两块并成同一个 Blob（另一个则被覆盖）
       function yieldBlob(f, pt) { (blobs[f.relPath] = blobs[f.relPath] || []).push(pt); }
@@ -1233,13 +1288,17 @@
 
     // ---------- 通道 ----------
     let turnApplied = false;
+    // 服务端到底配没配 TURN。不记住它的话，upgradeIceWithTurn 会对着一个
+    // 明确说了"没配"的服务器再问一次，拿到 503 —— 浏览器控制台就多一条红字，
+    // 读起来像传输出错了（实际什么都没发生）。
+    let turnPossible = false;
     /**
      * 发送方的 rtc 必须先于事件流建好（否则会漏掉对方的 offer），可那一刻会话还没配对，
      * /turn 会 409 —— 于是发送方永远拿不到 relay 候选，TURN 形同虚设。
      * 收到 joined 之后补取一次，并用 setConfiguration 把 relay 服务器加进正在进行的 ICE。
      */
     async function upgradeIceWithTurn() {
-      if (turnApplied || !rtc) return;
+      if (turnApplied || !rtc || !turnPossible) return;
       const t = await net.turn(st.sid).catch(() => null);
       if (!t || !t.urls || !t.urls.length) return; // 服务器没配 TURN 就是没有，不是错误
       turnApplied = true;
@@ -1253,6 +1312,7 @@
       const caps = global.XferEngine.capabilities();
       if (!c || !caps.rtc || !caps.subtle) { switchChannel('server_relay', caps.secure ? '' : '当前是 HTTP 入口，直连不可用，走服务器中转（仍然只传密文）'); return; }
       iceServers = (c.stun || []).map((u) => ({ urls: u }));
+      turnPossible = !!c.turnConfigured;
       if (c.turnConfigured) {
         const t = await net.turn(st.sid).catch(() => null);
         if (t && t.urls && t.urls.length) {

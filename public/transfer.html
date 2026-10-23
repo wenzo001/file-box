@@ -215,8 +215,12 @@
   .chan .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); flex-shrink: 0; }
   .chan.live .dot { background: var(--ok); }
   .chan.relay .dot { background: var(--accent-fill); }
+  .chan.turn .dot { background: #7C4DFF; }
+  .chan.wait .dot { background: var(--warn); animation: chipPulse 1.1s ease-in-out infinite; }
   .chan.warn .dot { background: var(--red); }
-  /* 降级（HTTP 入口：没有 WebCrypto 也没有直连）不是错误，用橙色而不是红色 —— 红色留给真出错 */
+  /* 降级（HTTP 入口：没有 WebCrypto 也没有直连）不是错误，用橙色而不是红色 —— 红色留给真出错。
+     注意它只作用于"还没有更具体的通道信息"时；一旦通道已知（中转/直连），
+     圆点颜色要留给通道本身，降级由模式区那颗 chip 说 —— 两种信息不该抢同一个颜色。 */
   .chan.deg .dot { background: var(--warn); }
 
   /* 进度长条：样式在 progress-strip.css（与文件库页面共用同一组件、同一配色、同一动画） */
@@ -259,6 +263,33 @@
   }
   .modes .mode-i.warn { background: rgba(255,149,0,.14); color: #8A5A00; }
   @media (prefers-color-scheme: dark) { .modes .mode-i.warn { color: #FFB340; } }
+
+  /* 模式标签：通道 / 加密层 / 引擎 / 是否降级，一眼分清"现在走的是哪条路"。
+     颜色语义与圆点一致：绿=直连、蓝=本服务器中转、紫=TURN 中转、橙=降级、灰黄=正在建。 */
+  .modes .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .modes .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; line-height: 1; padding: 6px 9px; border-radius: 999px;
+    background: var(--fill); color: var(--label-ink); white-space: nowrap;
+  }
+  .modes .chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--text3); }
+  .modes .chip.p2p { background: rgba(52,199,89,.16); color: #1B6B33; }
+  .modes .chip.p2p::before { background: var(--ok); }
+  .modes .chip.relay { background: rgba(0,113,227,.13); color: #0B4A8F; }
+  .modes .chip.relay::before { background: var(--accent-fill); }
+  .modes .chip.turn { background: rgba(124,77,255,.15); color: #452B93; }
+  .modes .chip.turn::before { background: #7C4DFF; }
+  .modes .chip.connecting::before { background: var(--warn); animation: chipPulse 1.1s ease-in-out infinite; }
+  .modes .chip.deg { background: rgba(255,149,0,.16); color: #8A5A00; }
+  .modes .chip.deg::before { background: var(--warn); }
+  @keyframes chipPulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+  @media (prefers-reduced-motion: reduce) { .modes .chip.connecting::before, .chan.wait .dot { animation: none; } }
+  @media (prefers-color-scheme: dark) {
+    .modes .chip.p2p { background: rgba(48,209,88,.18); color: #7CE39A; }
+    .modes .chip.relay { background: rgba(10,132,255,.18); color: #7FB8FF; }
+    .modes .chip.turn { background: rgba(148,108,255,.2); color: #C0A8FF; }
+    .modes .chip.deg { background: rgba(255,159,10,.18); color: #FFC46B; }
+  }
 
   .subtle { font-size: 12px; color: var(--text3-ink); margin-top: 8px; line-height: 1.5; }
 
@@ -418,7 +449,7 @@
       </div>
 
       <div id="recv-done-wrap" hidden>
-        <div class="sec">校验通过的文件<span class="sec-note">名字是密文里解出来的，之前不给服务器看</span></div>
+        <div class="sec"><span id="recv-done-sec">校验通过的文件</span><span class="sec-note">名字是密文里解出来的，之前不给服务器看</span></div>
         <div class="panel"><div class="pad">
           <div id="recv-files"></div>
           <button type="button" class="btn btn-primary" id="recv-save">保存到这设备</button>
@@ -505,9 +536,9 @@
     cancelled: '已取消，服务器上的密文正在清理', failed: '出错了',
   };
   const CHAN = {
-    none: ['还没连接', ''], p2p_connecting: ['正在尝试点对点直连…', ''],
+    none: ['还没连接', ''], p2p_connecting: ['正在尝试点对点直连…', 'wait'],
     p2p: ['点对点直连（不经过服务器）', 'live'],
-    turn_relay: ['TURN 中继（不是直连）', 'relay'],
+    turn_relay: ['TURN 中继（不是直连）', 'turn'],
     server_relay: ['服务器密文中转', 'relay'],
   };
   const chanOf = (c) => CHAN[c] || CHAN.none;
@@ -584,17 +615,22 @@
     box.style.setProperty('--blk-w', w + 'px');
     box.style.setProperty('--blk-h', h + 'px');
   }
-  /** done/total 只单调往前：通道切换时 counters 是同一批 Set，不会倒退也不会重复计 */
-  function paintStrip(box, frames, done) {
+  /** done/total 只单调往前：通道切换时 counters 是同一批 Set，不会倒退也不会重复计。
+   *  @param {number} [vdone] 校验阶段已复核的帧数。传了它就把长条画成"第二遍扫描"：
+   *         块早就全到齐了（filled=cells），这一遍是从左往右覆写成绿色 —— 否则界面会停在
+   *         100% 一动不动，看起来跟卡死没区别。 */
+  function paintStrip(box, frames, done, vdone) {
     const cells = Math.max(1, Math.min(frames, MAXCELL));
     makeStrip(box, cells);
     const per = frames / cells;
     const filled = Math.min(cells, Math.floor(done / per));
+    const vfilled = (vdone == null || !frames) ? -1 : Math.min(cells, Math.floor((vdone / frames) * cells));
     const kids = box.children;
     for (let i = 0; i < cells; i++) {
-      const el = kids[i];
-      const want = i < filled ? 'blk done' : i === filled && done < frames ? 'blk active' : 'blk';
-      if (el.className !== want) el.className = want;
+      let want;
+      if (vfilled >= 0) want = i < vfilled ? 'blk vfy' : 'blk done';
+      else want = i < filled ? 'blk done' : (i === filled && done < frames ? 'blk active' : 'blk');
+      if (kids[i].className !== want) kids[i].className = want;
     }
     return { cells, per };
   }
@@ -628,12 +664,32 @@
   let sender = null;
   let receiver = null;
 
+  /** 一帧一次地重画界面。
+   *  为什么必须合并：引擎每落盘一块就 emit 一次，千兆直连下是每秒上千次。而 paint 里要
+   *  重建状态行字符串、重建模式区 innerHTML、逐个比对 600 个格子 —— 主线程被自己的界面占满，
+   *  进度条当然"不动"（它在等主线程腾出手来画）。合并到 requestAnimationFrame 之后，
+   *  DOM 写次数从 O(已传块数) 降到 O(60)，状态仍然是每帧取最新的那一份。 */
   function mount(role) {
     const isSend = role === 'sender';
     const box = $(isSend ? '#blocks' : '#r-blocks');
+    const prefix = isSend ? '#send' : '#recv';
+    let queued = null;
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      const st = queued;
+      queued = null;
+      if (!st) return;
+      try { paint(prefix, st, box); } catch (err) { /* 界面出错不许把传输弄死 */ console.error(err); }
+    };
+    const schedule = () => {
+      if (raf) return;
+      // 后台标签页里 rAF 不跑：正好，那时候没人看，等回到前台再画最新的那一份
+      raf = (window.requestAnimationFrame || ((fn) => setTimeout(fn, 16)))(flush);
+    };
     const s = window.XferEngine.Session({
       role,
-      on(st) { paint(isSend ? '#send' : '#recv', st, box); },
+      on(st) { queued = st; schedule(); },
     });
     return s;
   }
@@ -656,20 +712,29 @@
     if (st.safety) t('safety').textContent = st.safety.replace(/(.{1})(?=.)/g, '$1 ');
     const [ctext, ccls] = chanOf(st.channel);
     const chanEl = t('chan');
-    // 降级（HTTP 入口没有 WebCrypto）单独给橙点：绿色=直连、蓝色=中转、橙色=降级
-    chanEl.className = 'chan' + (ccls ? ' ' + ccls : '') + (degraded() ? ' deg' : '');
+    // 圆点颜色只表示"走的是哪条路"（绿=直连 / 蓝=本服务器中转 / 紫=TURN / 黄=正在建）。
+    // 之前把"降级"也叠在同一个点上，结果是 HTTP 入口下永远是橙点 —— 用户反而看不出
+    // 到底有没有连上、走的是哪条路。降级改由模式区那颗 chip 表达。
+    chanEl.className = 'chan' + (ccls ? ' ' + ccls : '');
     const why = st.error && st.phase === 'retrying' ? ` · ${st.error}` : (st.note ? ` · ${st.note}` : '');
     t('chan-t').textContent = (st.channel === 'none' ? ctext : `${ctext}${why}`);
 
     const frames = st.frames || 0;
+    // 发送端取"已发出"和"已进中转区"里更大的那个：
+    // 只用 sentFrames，刷新续传后会从 0 开始（其实是接着传的）；只用 uploaded，从直连切到中转时
+    // 会突然往回跳（中转区没经手过前 15000 块）。取 max 既单调又不会撒谎。
     const doneN = st.role === 'sender'
-      ? (st.channel === 'server_relay' ? st.uploaded : st.sentFrames)
-      : st.stored;
+      ? Math.max(st.sentFrames || 0, st.uploaded || 0)
+      : (st.stored || 0);
+    // 校验阶段 done 已经是满的，长条改画"第二遍扫描"；其余相位不传 vdone
+    const vdone = st.phase === 'verifying' && st.verifyTotal
+      ? Math.floor((st.verifyDone || 0) * (frames / (st.verifyTotal || 1)))
+      : null;
     if (prefix === '#recv') $('#recv-live').hidden = st.phase === 'idle';
     else if (st.phase !== 'idle') $('#send-live').hidden = false;
 
     if (frames && st.phase !== 'idle') {
-      const { cells, per } = paintStrip(box, frames, doneN);
+      const { cells, per } = paintStrip(box, frames, doneN, vdone);
       // 每格多大要说清楚：格数被封顶后一格可能代表好几块
       const blkBytes = per * (window.XferProto ? XferProto.PLAIN_BLOCK : 131072);
       box.hidden = false;
@@ -680,9 +745,24 @@
     }
 
     if (st.role === 'receiver') {
-      const ok = st.verified;
-      $('#recv-done-wrap').hidden = !ok;
-      if (ok) renderFiles(st);
+      const ok = !!st.verified;
+      const busy = st.phase === 'verifying' || st.phase === 'saving';
+      // 校验/写盘这段时间就把这一块露出来，但保存键按不动、标题写明在干什么。
+      // 2.5GB 的校验要几十秒到几分钟，"一直什么都没有、忽然弹出按钮"是最难受的那种等待 ——
+      // 用户不知道是该等、该刷新、还是已经坏了。
+      $('#recv-done-wrap').hidden = !(ok || busy);
+      const secEl = $('#recv-done-sec');
+      if (secEl) {
+        secEl.textContent = ok ? '校验通过的文件'
+          : (st.phase === 'saving' ? '正在写盘（写完才算存好）' : '正在校验，还不能保存');
+      }
+      if (ok || busy) renderFiles(st);
+      const sv = $('#recv-save');
+      if (sv) {
+        sv.disabled = !ok || busy;
+        sv.textContent = st.phase === 'saving' ? '正在写盘…'
+          : (st.phase === 'verifying' ? '校验中，还不能保存' : '保存到这设备');
+      }
       const p = t('pause');
       if (p) p.textContent = pauseLabel(st, '接收');
     } else {
@@ -706,22 +786,54 @@
     .then((c) => { httpsPort = Number(c.httpsPort) || 0; })
     .catch(() => { /* 拿不到就不给具体地址，只说"用 HTTPS 入口" */ });
 
-  // 一句话说清当前模式与限制，并给可执行的下一步（HTTP 入口那行不是死胡同）
+  // 一句话说清当前模式，并给可执行的下一步。
+  // 用户的要求是"每种传输模式在界面上都要有对应的样子"：直连 / 服务器中转 / TURN 中继 /
+  // 正在建直连 / HTTP 降级 —— 这五种必须一眼分得开，而且各自要说清"快不快、为什么、怎么办"。
+  // 光有一行灰字「服务器密文中转」不够：它和「TURN 中继」长得一模一样，用户没法判断到底走了哪条路。
+  const CHIP = {
+    p2p: ['p2p', '点对点直连'],
+    server_relay: ['relay', '服务器中转'],
+    turn_relay: ['turn', 'TURN 中转'],
+    p2p_connecting: ['connecting', '正在建直连'],
+    none: ['', '未连接'],
+  };
   function paintMode(prefix, st) {
     const el = $(`${prefix}-mode`);
     if (!el) return;
     const deg = degraded();
-    const parts = [];
-    if (deg) {
-      parts.push({ txt: '降级模式：当前是 HTTP 入口，浏览器没给加密接口，所以用纯 JS 加密（约 7MB/s），也用不了点对点直连。内容依旧是端到端加密的，只是没有前向保密。', warn: true });
-    } else {
-      parts.push({ txt: '本会话用浏览器原生 WebCrypto（ECDH P-256 派生会话密钥）。', warn: false });
+    // 这块是 innerHTML 重建，别每帧都来一次：签名没变就直接跳过
+    const sig = [prefix, deg, st.channel, st.kex, st.engine, st.overBudget, st.persist, st.budget,
+      st.quota ? `${st.quota.need}>${st.quota.quota}` : ''].join('|');
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+
+    const [cls, label] = CHIP[st.channel] || CHIP.none;
+    const chips = [`<span class="chip ${cls}">${label}</span>`];
+    // 加密层也要露出来：ECDH 有前向保密，kex='code' 那一档没有 —— 这是安全属性，不能只写在文档里
+    if (st.kex === 'p256') chips.push('<span class="chip p2p">ECDH P-256</span>');
+    else if (st.kex === 'code') chips.push('<span class="chip deg">仅口令派生 · 无前向保密</span>');
+    else chips.push('<span class="chip">密钥协商中</span>');
+    if (st.engine) {
+      chips.push(`<span class="chip ${st.engine === 'native' ? '' : 'deg'}">`
+        + `${st.engine === 'native' ? '原生 WebCrypto' : '纯 JS 加密（约 7MB/s）'}</span>`);
     }
-    if (st.channel === 'server_relay') parts.push({ txt: '现在是服务器密文中转：服务器只搬密文，看不到文件名和内容。', warn: false });
-    else if (st.channel === 'p2p') parts.push({ txt: '现在是点对点直连：内容不经过服务器。', warn: false });
-    else if (st.channel === 'p2p_connecting') parts.push({ txt: '正在尝试点对点直连；连不上会自动改走服务器中转。', warn: false });
-    // 不只是告诉用户"你降级了"，要给一个能做的动作；端口从服务端配置来，不写死
+    if (deg) chips.push('<span class="chip deg">HTTP 入口 · 已降级</span>');
+
+    const parts = [];
+    if (st.channel === 'p2p') {
+      parts.push({ txt: '点对点直连：字节不过服务器，速度只受两端链路限制'
+        + `${deg ? '' : '（同一个局域网里有线能跑到百兆/千兆）'}。` });
+    } else if (st.channel === 'turn_relay') {
+      parts.push({ txt: 'TURN 中继：**不是直连**，字节经过第三方 TURN 服务器（只搬密文）。速度取决于那台 TURN 的带宽。', warn: true });
+    } else if (st.channel === 'server_relay') {
+      parts.push({ txt: '服务器密文中转：服务器只搬密文，看不到文件名和内容。速度受服务器与两端带宽限制。', warn: true });
+      if (!deg) parts.push({ txt: '同一个局域网想更快：看状态区那行「直连诊断」——最常见的原因是 udp 3478 被防火墙/安全软件挡了。' });
+    } else if (st.channel === 'p2p_connecting') {
+      parts.push({ txt: '正在尝试点对点直连（最多约 8 秒）；建不起来会自动改走服务器中转，进度不会丢，不用你操作。' });
+    }
     if (deg) {
+      parts.push({ txt: '降级模式：HTTP 入口拿不到浏览器的加密接口，所以用纯 JS 加密（约 7MB/s），也用不了点对点直连。内容依旧是端到端加密的，只是没有前向保密。', warn: true });
+      // 不只是告诉用户"你降级了"，要给一个能做的动作；端口从服务端配置来，不写死
       parts.push({ txt: httpsPort
         ? `要直连请改用 HTTPS 入口：https://${location.hostname}:${httpsPort}`
         : '要直连请改用 HTTPS 入口（地址里的端口问部署这台服务的人）', warn: true });
@@ -744,7 +856,8 @@
         + '很可能在途中报「本地写入被中止」。换一台设备收，或别用隐私模式/先清掉站点数据。', warn: true });
     }
     el.hidden = false;
-    el.innerHTML = parts.map((p) => `<span class="mode-i${p.warn ? ' warn' : ''}">${p.txt}</span>`).join('');
+    el.innerHTML = `<div class="chips">${chips.join('')}</div>`
+      + parts.map((p) => `<span class="mode-i${p.warn ? ' warn' : ''}">${p.txt.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')}</span>`).join('');
   }
 
   // 准备期/终态的按钮上锁。终态要放开，否则传完一次就只能刷新页面。
@@ -758,9 +871,15 @@
     if (cp) { cp.disabled = prep; cp.title = prep ? '传输码还在算，请稍等' : ''; }
     if (cpl) { cpl.disabled = prep; cpl.title = prep ? '传输码还在算，请稍等' : ''; }
     // 会话没建立之前暂停/重连没有对象；建立之后只有终态才停
+    // 校验/写盘期间**不能暂停**（那不是"传输"在停，而是本地在算），按了也没用 ——
+    // 所以按钮直接置灰并写明原因，别让用户点了没反应还以为坏了
+    const busy = st.phase === 'verifying' || st.phase === 'saving';
     const ps = $(`${prefix}-pause`), rc = $(`${prefix}-recon`);
-    if (ps) ps.disabled = prep || frozen;
-    if (rc) rc.disabled = prep || frozen;
+    if (ps) {
+      ps.disabled = prep || frozen || busy;
+      ps.title = busy ? '正在校验/写盘，这段时间不能暂停' : (prep ? '传输码还在算，请稍等' : '');
+    }
+    if (rc) { rc.disabled = prep || frozen || busy; rc.title = busy ? '正在校验/写盘，不能重连' : ''; }
     // 接收端入口：活动会话期间禁止再点（点了会起第二个会话），输入框也锁住
     if (prefix === '#recv') {
       const go = $('#recv-go'), inp = $('#recv-in');
@@ -813,6 +932,17 @@
       }
       if (st.speed) lines.push(`${fmt(st.speed)}/s` + (st.eta ? ` · 大约还剩 ${secs(st.eta)}` : ' · 剩余时间估算中'));
     }
+    // 校验 / 写盘：2.5GB 这两个阶段各要几十秒到几分钟。不给百分比的话，界面就只剩
+    // 一句静态的"正在逐块校验"，用户只能猜是不是死了 —— 这正是"卡了很久才弹出保存按钮"的现场。
+    if (st.phase === 'verifying' && st.verifyTotal) {
+      const p = Math.min(100, Math.round(((st.verifyDone || 0) / st.verifyTotal) * 100));
+      lines.push(`逐块复核 ${p}%（${st.verifyDone || 0}/${st.verifyTotal} 块）`
+        + ' —— 每一块都要重新解密再算哈希，这一步慢是正常的，别关页面');
+    }
+    if (st.phase === 'saving' && st.saveTotal) {
+      const p = Math.min(100, Math.round(((st.saveDone || 0) / st.saveTotal) * 100));
+      lines.push(`正在写盘 ${p}%（${st.saveDone || 0}/${st.saveTotal} 块）—— 写完才会提示「已保存」`);
+    }
     if (st.expiresAt) {
       const left = st.expiresAt - Date.now();
       lines.push(left > 0 ? `会话还剩 ${secs(left / 1000)}` : '会话已过期');
@@ -837,7 +967,10 @@
         lines.push('有 STUN 但一个 srflx 候选都没拿到：多半是 udp 3478 出不去（防火墙/安全软件）。放行后两端才能拿到真实内网地址。');
       }
     }
-    el.textContent = lines.filter(Boolean).join('\n');
+    // 只在文本真的变了才写 DOM：赋值 textContent 会重建内部文本节点，
+    // 一帧一次是无所谓，但以前是"每落盘一块一次"，那点开销叠起来就够把主线程压住了
+    const text = lines.filter(Boolean).join('\n');
+    if (el.textContent !== text) el.textContent = text;
     // 传输中的预计剩余时间单独一行：状态行本身已经很长，混在一起手机上会折成一坨
     if (!err && etaEl && (st.phase === 'transferring' || st.phase === 'paused' || st.phase === 'retrying') && st.speed > 0) {
       const left = Math.max(0, st.totalBytes - Math.min(st.totalBytes, Math.round(doneN * (st.totalBytes / (st.frames || 1)))));

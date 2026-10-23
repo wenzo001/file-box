@@ -782,3 +782,38 @@ test('会话开始必须持一把 Web Lock：否则后台标签页会被冻结�
   const st = await waitVerified(receiver, 60000);
   assert.ok(st.verified, `没传完：phase=${st.phase} error=${st.error}`);
 }));
+
+// 2.5GB 的"校验"和"写盘"各是几十秒到几分钟的活。以前这两段**一个进度数字都不给**，
+// 界面上只有一句静态的"正在逐块校验"，用户的原话就是"卡了很久，最后才弹出保存按钮"。
+// 这条腿盯的是：这两个相位必须持续往外推帧级进度，界面才有东西可画。
+test('校验与写盘都要往外报进度：不能只有一句"正在加载"，那是卡死的长相', () => withLab({
+  slot: 101, drainRate: 8 * MB, cfg: { p2pTimeoutMs: 600 },
+}, async ({ env, sender, cfg }) => {
+  const size = 8 * MB;
+  const frames = Math.ceil(size / FRAME) + 1;
+  const trace = [];
+  const rx = env.E.Session({ role: 'receiver', on(st) { trace.push(st); }, config: cfg });
+  try {
+    const code = (await sender.send([{ relPath: 'v.bin', name: 'v.bin', size, mime: 'application/octet-stream', file: fakeFile('v.bin', size, 71) }])).code;
+    await rx.accept(code);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 90000 && !rx.state.verified && rx.state.phase !== 'failed') await sleep(50);
+    assert.ok(rx.state.verified, `没校验通过：phase=${rx.state.phase} error=${rx.state.error}`);
+
+    const vPts = trace.filter((s) => s.phase === 'verifying' && s.verifyTotal > 0);
+    assert.ok(vPts.length >= 3, `校验阶段只报了 ${vPts.length} 次进度（共 ${frames} 帧）：界面无从画百分比`);
+    // 0 号是加密清单，复核时不再走它 —— 总数要比帧数少一，否则进度永远差一块、停在 98%
+    assert.strictEqual(vPts[vPts.length - 1].verifyTotal, frames - 1, '复核总块数要如实（不含清单帧）');
+    assert.ok(vPts.some((s) => s.verifyDone > 0 && s.verifyDone < frames - 1), '没有任何一次"中间进度" —— 等于只有 0 和 100 两个数');
+
+    await rx.saveAll(null);
+    const sPts = trace.filter((s) => s.phase === 'saving' && s.saveTotal > 0);
+    assert.ok(sPts.length >= 3, `写盘阶段只报了 ${sPts.length} 次进度：界面会一直停在"正在解密写盘"`);
+    assert.strictEqual(Math.max(...sPts.map((s) => s.saveDone)), frames - 1, '写盘进度没有走到 100%');
+
+    const [one] = await rx.collected();
+    assert.deepStrictEqual(Buffer.from(await one.blob.arrayBuffer()), Buffer.from(expectBytes(size, 71)), '内容不对');
+  } finally {
+    try { rx.close(); } catch { /* 已经关了 */ }
+  }
+}));
