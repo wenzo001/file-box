@@ -3,8 +3,7 @@ import { api } from './api.js';
 
 const OPFS_DIR = 'fb-lib-dl';
 
-function saveBlob(blob, name) {
-  const a = document.createElement('a');
+export function saveBlob(blob, name) {  const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = String(name || 'download').replace(/[/\\]/g, '_');
   a.click();

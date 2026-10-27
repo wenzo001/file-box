@@ -12,7 +12,7 @@
   ▼
 一个 Node 进程
   ├── uploads/     批次密文
-  ├── .library/    NeDB 目录索引（嵌入式，不是独立数据库服务）
+  ├── .library/    NeDB 目录索引 + 公共设置（嵌入式，不是独立数据库服务）
   ├── .stats/      下载次数账本
   ├── .uploading/  未完成分块暂存
   └── .transfer/   无痕传输中转
@@ -30,7 +30,7 @@
 | 构建 / 打包机 | Node.js ≥ 18、npm、git（或直接拿源码目录）；需要安装 devDependencies |
 | 运行机 | Node.js ≥ 18；可选 pm2；只需要 `dist-web`、`server.js`、`lib/`、生产 `node_modules/` |
 | 端口 | 默认 HTTP 3000 / HTTPS 3443；pm2 配置里默认 HTTP 4444 / HTTPS 3443 |
-| 磁盘 | `uploads/` + `.library/` + `.stats/` 在应用目录；默认总量上限 10GB；目录数量上限 `MAX_FOLDERS` 默认 10000 |
+| 磁盘 | `uploads/` + `.library/` + `.stats/` 在应用目录；默认总量上限 10GB；目录数量上限 `MAX_FOLDERS` 默认 10000（目录层级本身不限） |
 
 ## 3 一套脚本：安装、构建、发布
 
@@ -113,7 +113,7 @@ npm start            # 默认 3000/3443；不需要 npm install
 | 目录 | 内容 | 丢了会怎样 |
 |---|---|---|
 | `uploads/` | 批次密文 | 文件丢失（不可恢复） |
-| `.library/` | NeDB 目录树 / 批次归属 / TTL / 清单哈希 | 文件还在，目录树和 TTL 丢失，全部回到「未分档」 |
+| `.library/` | NeDB 目录树 / 批次归属 / TTL / 清单哈希 / 公共设置（`defaultTtlHours`） | 文件还在，目录树、TTL 和全局设置丢失，全部回到「未分档」，新上传回到默认 1 小时 |
 | `.stats/` | 下载次数账本 | 文件还在，下载次数归零 |
 
 ```bash
@@ -161,7 +161,7 @@ pm2 restart file-box
 | `npm ci` 失败 | 锁文件与 `package.json` 不一致；在构建机重新 `npm install` 生成锁并提交 |
 | 端口被占 | `pm2` 配置默认 4444/3443；`npm start` 默认 3000/3443；改 `PORT`/`HTTPS_PORT` |
 | 上传 413 | 反代 `client_max_body_size` 太小，或单块超过 32MB |
-| 目录树突然全变未分档 | `.library` 丢失/损坏；文件仍在。用 `.bak` 恢复，或接受重新建目录 |
+| 目录树突然全变未分档 | `.library` 丢失/损坏；文件仍在。用 `.bak` 恢复，或接受重新建目录（全局自动删除设置会回到默认 1 小时） |
 | 目录索引启动报损坏 | 会优先读 `.bak`；两个都坏会改名 `*.corrupt-*` 并从空库启动，不会删文件 |
 | 多实例/多进程 | NeDB 索引不是多进程安全；只跑一个 `file-box` 进程 |
 | 页面还是旧版 | 浏览器缓存；刷新一次。旧 `public/index.html` 已删除，旧 `/next` 会跳回根 |
@@ -180,7 +180,7 @@ pm2 restart file-box
 npm run setup
 npm run release
 npm test
-node test/lab/library-smoke.js       # 真浏览器：目录 / 上传 / 下载 / 重命名 / 搜索 / 移动端
+node test/lab/library-smoke.js       # 真浏览器：多栏目录 / 全局 TTL / 分享高亮 / zip / 搜索 / 移动端
 SMOKE_MB=2 node test/lab/ui-smoke.js # 真浏览器：无痕传输
 ```
 

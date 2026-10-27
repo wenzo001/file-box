@@ -32,7 +32,11 @@ test('空库：/api/library 返回未分档、TTL 选项和用量；旧 /api/lis
   assert.ok(r.body.folders.some((f) => f.id === '__unfiled__' && f.system === true));
   assert.deepStrictEqual(r.body.batches, []);
   assert.deepStrictEqual(r.body.ttlOptions, [1, 4, 8, 48, 72, 120, 240, 2160]);
+  assert.deepStrictEqual(r.body.settings, { defaultTtlHours: 1 });
+  assert.strictEqual(r.body.folders.find((f) => f.id === '__unfiled__').lastUpdatedAt, null);
   assert.strictEqual(r.body.usage.limitGB, 1);
+  const unfiledDel = await fetch(`${srv.base}/api/folders/__unfiled__`, { method: 'DELETE' });
+  assert.strictEqual(unfiledDel.status, 400, '未分档是系统目录，不能删除');
 
   const old = await jget(`${srv.base}/api/list`);
   assert.strictEqual(old.status, 200);
@@ -58,6 +62,7 @@ test('目录 CRUD：同名 409、非法名 400、移动 / 重命名 / 空目录�
   const renamed = await patchFolder(child.body.folder._id, { name: 'API 2026Q4-改' });
   assert.strictEqual(renamed.status, 200);
   assert.strictEqual(renamed.body.folder.name, 'API 2026Q4-改');
+  assert.strictEqual(renamed.body.folder._id, child.body.folder._id, '改名不能换目录 ID：分享链接要稳定');
 
   const badPatch = await patchFolder(child.body.folder._id, { name: 'x', parentId: a.body.folder._id });
   assert.strictEqual(badPatch.status, 400, '一次只能改名称或位置');
@@ -66,6 +71,41 @@ test('目录 CRUD：同名 409、非法名 400、移动 / 重命名 / 空目录�
   const del = await fetch(`${srv.base}/api/folders/${empty.body.folder._id}?mode=empty`, { method: 'DELETE' });
   assert.strictEqual(del.status, 200);
   assert.strictEqual(folderById((await library()).body, empty.body.folder._id), undefined);
+});
+
+test('公共配置：默认 1 小时；修改后不带 ttlHours 的上传按新配置记账', async () => {
+  let settings = await jget(`${srv.base}/api/settings`);
+  assert.strictEqual(settings.status, 200);
+  assert.deepStrictEqual(settings.body.settings, { defaultTtlHours: 1 });
+
+  const changed = await jget(`${srv.base}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ defaultTtlHours: 4 }),
+  });
+  assert.strictEqual(changed.status, 200);
+  assert.strictEqual(changed.body.settings.defaultTtlHours, 4);
+
+  const bad = await jget(`${srv.base}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ defaultTtlHours: 2 }),
+  });
+  assert.strictEqual(bad.status, 400);
+
+  const out = await uploadBundle(srv, hexKey(), [{ enc: 'settings.enc', chunks: [4] }], {});
+  const data = (await library()).body;
+  assert.strictEqual(data.settings.defaultTtlHours, 4);
+  const batch = data.batches.find((b) => b.name === out.folder);
+  assert.strictEqual(batch.ttlHours, 4);
+  assert.ok(batch.expiresAt > Date.now() + 3 * 3600_000);
+  await fetch(`${srv.base}/api/folder/${out.folder}`, { method: 'DELETE' });
+
+  await jget(`${srv.base}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ defaultTtlHours: 1 }),
+  });
 });
 
 test('上传到目录：folderId / TTL 写入、目录汇总、批次移动、expectFolder 防误删', async () => {
@@ -94,6 +134,7 @@ test('上传到目录：folderId / TTL 写入、目录汇总、批次移动、ex
   assert.strictEqual(folderById(data, srcId).count, 1);
   assert.strictEqual(folderById(data, srcId).size, batch.size);
   assert.strictEqual(folderById(data, srcId).earliestExpiresAt, out.expiresAt);
+  assert.ok(folderById(data, srcId).lastUpdatedAt >= batch.uploadedAt, '目录行要能显示最后更新时间');
 
   const moved = await jget(`${srv.base}/api/batches/${out.folder}`, {
     method: 'PATCH',

@@ -473,7 +473,9 @@ async function buildLibraryPayload() {
   const folderMap = new Map(folderDocs.map((f) => [f._id, f]));
   const metaMap = new Map(batchDocs.map((b) => [b._id, b]));
 
-  const emptySummary = () => ({ count: 0, size: 0, downloads: 0, earliestExpiresAt: null });
+  const emptySummary = () => ({
+    count: 0, size: 0, downloads: 0, earliestExpiresAt: null, lastUpdatedAt: null,
+  });
   const summary = new Map([['__unfiled__', emptySummary()]]);
   for (const f of folderDocs) summary.set(f._id, emptySummary());
 
@@ -491,6 +493,7 @@ async function buildLibraryPayload() {
       expiresAt,
       ttlHours: ttl,
       legacy: !meta || meta.legacy === true,
+      manifestHash: meta?.manifestHash || null,
     };
   });
 
@@ -501,6 +504,9 @@ async function buildLibraryPayload() {
       s.count += b.count;
       s.size += b.size;
       s.downloads += b.downloads;
+      if (Number.isFinite(b.uploadedAt) && (s.lastUpdatedAt === null || b.uploadedAt > s.lastUpdatedAt)) {
+        s.lastUpdatedAt = b.uploadedAt;
+      }
       if (b.expiresAt !== null && (s.earliestExpiresAt === null || b.expiresAt < s.earliestExpiresAt)) {
         s.earliestExpiresAt = b.expiresAt;
       }
@@ -536,6 +542,7 @@ async function buildLibraryPayload() {
     usage: { used: disk.reduce((s, b) => s + b.size, 0), limit: STORAGE_LIMIT, limitGB: STORAGE_LIMIT_GB },
     httpsPort: HTTPS_PORT,
     ttlOptions: TTL_HOURS,
+    settings: libraryReady ? await library.getSettings() : { defaultTtlHours: 1 },
     folders,
     batches,
   };
@@ -566,6 +573,10 @@ app.post('/api/upload/init', express.json({ limit: '2mb' }), asyncHandler(async 
     const parsed = ttlHours.safeParse(req.body.ttlHours);
     if (!parsed.success) return res.status(400).json({ error: '自动删除时长不合法' });
     ttl = parsed.data;
+  } else if (libraryReady) {
+    // 未显式指定时使用「公共配置区」里的全局默认值；在 init 时定稿，
+    // 传到一半设置被改也不会把这一批改成别的时长
+    ttl = (await library.getSettings()).defaultTtlHours;
   }
 
   // 每次开始上传前顺手回收到期批次；失败不会影响本次上传
@@ -759,6 +770,7 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
         count: meta.files.filter((f) => f.enc !== MANIFEST).length,
         folderId: targetFolderId,
         expiresAt: indexed && ttl ? uploadedAt + ttl * 3600_000 : null,
+        ttlHours: ttl,
         folderMissing,
         indexed,
       });
@@ -852,6 +864,19 @@ app.get('/api/list', (req, res) => {
 app.get('/api/library', asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json(await buildLibraryPayload());
+}));
+
+// ---- 公共配置：所有之后发起的上传都使用这里的默认自动删除时长 ----
+app.get('/api/settings', requireLibrary, asyncHandler(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ settings: await library.getSettings(), ttlOptions: TTL_HOURS });
+}));
+
+app.put('/api/settings', requireLibrary, express.json({ limit: '16kb' }), asyncHandler(async (req, res) => {
+  const data = parseBody(res, schemas.settingsPatch, req.body);
+  if (!data) return;
+  const settings = await library.setSettings(data);
+  res.json({ ok: true, settings });
 }));
 
 // ---- 目录 CRUD ----
@@ -1310,7 +1335,7 @@ app.use((err, req, res, next) => {
     console.log(`file-box 已启动`);
     console.log(`  HTTP : http://localhost:${PORT}`);
     console.log(`  HTTPS: https://localhost:${HTTPS_PORT}（推荐，首次访问需信任自签证书一次）`);
-    console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB；没有全局自动清理，文件保留到手动删除）`);
+    console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB；新上传默认 ${library.defaultTtlHours} 小时后自动删除，可在页面顶部公共配置区修改；文件夹只手动删除）`);
     console.log(`目录索引: ${LIBRARY_DIR}${libraryReady ? '' : '（不可用，按未分档运行）'}`);
     console.log('文件在浏览器内端到端加密后上传，服务器磁盘只保存密文');
   });

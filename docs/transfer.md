@@ -319,8 +319,9 @@ Binding，拿到的就是**各自的真实内网 IP:port**——这正是绕过 
 
 ## 10 测试与验证口径
 
-`node --test --test-concurrency=1 "test/*.test.js"` → **154 条全绿 / 0 失败**（2026-10-27 文件库目录版；151 条 + 目录数量保护 / 清单 CAS / 临时清单不可见 3 条。历史轮次：122 → 129，见下）。
+`node --test --test-concurrency=1 "test/*.test.js"` → **161 条全绿 / 0 失败**（2026-10-27 文件库多栏版；157 条 + 2 条展示层（热乎/标红/1 小时）+ 1 条公共设置重启持久化 + 1 条「到期状态类不许被 CSS 的 display:none 规则吃掉」静态判据。历史轮次：122 → 129 → 154 → 157 → 160 → 161，见下）。
 真浏览器那一路另有 `test/lab/ui-smoke.js`（不进 npm test）：真 Chromium、两个页面上下文，判据打在**渲染结果**上（格子尺寸、配色、done 轨迹、保存键状态、零 console.error）。
+文件库界面另有 `node test/lab/library-smoke.js`（不进 npm test）：多栏展开、右键建目录、全局 TTL、热乎/到期、文件夹链接改名不变、文件分享高亮、目录 / 多选 zip、全局搜索路径、拖拽上传、窄屏可见性；本轮通过且零 console/page 错误。
 （注意：这个仓库里 `node --test test/` 会报 Cannot find module，必须用 glob 形式；
 并行跑会因端口/负载互撞产生一批假的 ETIMEDOUT，所以要 `--test-concurrency=1`。）
 

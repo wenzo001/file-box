@@ -1,104 +1,193 @@
-// 新目录界面的真浏览器冒烟（不属于 npm test）。
+// 目录界面的真浏览器冒烟（不属于 npm test）。
 // 先 npm run build，再 node test/lab/library-smoke.js；默认打开 dist-web 根页面。
-// 判据打在渲染结果上：目录创建、上传后 TTL、下载字节、重命名、搜索、删除、移动端列宽。
+// 判据打在渲染结果上：多栏展开、右键建目录、上传 / 热乎 / 到期、全局 TTL、
+// 目录与文件分享高亮、目录 / 多选 zip、全局搜索路径、拖拽上传、窄屏可见性。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const assert = require('assert');
+const { unzipSync, strFromU8 } = require('fflate');
 const { chromium } = require('C:/Users/lhcz-fu/AppData/Local/npm-cache/_npx/9833c18b2d85bc59/node_modules/playwright-core');
 const { startServer } = require('../helpers');
 
 const EXE = process.env.CHROME_PATH || 'C:/Users/lhcz-fu/AppData/Local/Chromium/Application/chrome.exe';
 const SHOT = (name) => path.join(os.tmpdir(), name);
+const tmp = (name) => path.join(os.tmpdir(), name);
 
 (async () => {
   const srv = await startServer();
-  const uploadFile = path.join(os.tmpdir(), 'fb-library-smoke.txt');
-  fs.writeFileSync(uploadFile, 'hello from library smoke');
+  const f1 = tmp('fb-library-甲.txt');
+  const f2 = tmp('fb-library-乙.txt');
+  fs.writeFileSync(f1, 'AAA-content');
+  fs.writeFileSync(f2, 'BBB-content');
   const browser = await chromium.launch({ executablePath: EXE, headless: true });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  const ctx = await browser.newContext({ viewport: { width: 1400, height: 950 }, acceptDownloads: true });
+  await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: srv.base });
+  const page = await ctx.newPage();
   const errs = [];
   page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
+  const readClip = () => page.evaluate(() => navigator.clipboard.readText());
+  const fileRow = (name) => page.locator('.file-row', { hasText: name });
 
   try {
     await page.goto(`${srv.base}/`, { waitUntil: 'networkidle' });
-    await page.waitForSelector('.topbar');
+    await page.waitForSelector('.columns');
 
-    // 建目录并进入
-    await page.getByRole('button', { name: '新建文件夹' }).click();
-    await page.locator('.dialog .input').fill('冒烟目录');
+    // 公共 TTL：改成 4 小时，必须落到服务端；上传不带 TTL 时按它记账
+    await page.locator('#ttl-select').selectOption('4');
+    await page.waitForTimeout(400);
+    let lib = await (await fetch(`${srv.base}/api/library`)).json();
+    assert.strictEqual(lib.settings.defaultTtlHours, 4, '全局 TTL 没有落到服务端');
+
+    // 目录栏头新建；输入框 20 字上限
+    await page.locator('.column').first().getByRole('button', { name: '新建文件夹' }).click();
+    const input = page.locator('.dialog .input');
+    assert.strictEqual(await input.evaluate((el) => el.maxLength), 20, '目录名输入框没有 20 字上限');
+    await input.fill('冒烟项目');
     await page.locator('.dialog .btn-primary').click();
-    const folderRow = page.locator('.folder-row', { hasText: '冒烟目录' });
-    await folderRow.waitFor({ timeout: 10000 });
-    await folderRow.locator('.folder-main').click();
-    await page.waitForTimeout(200);
+    await page.waitForSelector('.folder-row');
+    await page.locator('.folder-row', { hasText: '冒烟项目' }).click();
+    await page.waitForTimeout(400);
+    assert.strictEqual(await page.locator('.column').count(), 2, '点目录后没有展开第二栏');
 
-    // 上传：默认 1 小时；文件行必须显示到期，且不能写成 2 小时
-    await page.locator('input[type=file]').setInputFiles(uploadFile);
-    await page.waitForSelector('.file-row .name', { timeout: 30000 });
-    const firstName = await page.locator('.file-row .name').first().innerText();
-    assert.strictEqual(firstName, 'fb-library-smoke.txt');
-    const expiry = await page.locator('.file-row .expiry').first().innerText();
-    assert.match(expiry, /(1 小时|60 分钟)/, `默认 TTL 显示不对: ${expiry}`);
-    assert.doesNotMatch(expiry, /2 小时/, `默认 1 小时被取整成 2 小时: ${expiry}`);
+    // 空白处右键新建子目录
+    await page.locator('.column').last().locator('.col-list').click({ button: 'right', position: { x: 60, y: 260 } });
+    await page.locator('.context-menu .menu-item', { hasText: '新建子文件夹' }).click();
+    await page.locator('.dialog .input').fill('子目录乙');
+    await page.locator('.dialog .btn-primary').click();
+    await page.waitForSelector('.folder-row:has-text("子目录乙")');
+    await page.locator('.folder-row', { hasText: '子目录乙' }).click();
+    await page.waitForTimeout(400);
+
+    // 上传两件；目录行有文件数与最后更新；文件在 10 分钟内标「热乎」
+    await page.locator('input[type=file]').setInputFiles([f1, f2]);
+    await page.waitForFunction(() => document.querySelectorAll('.file-row').length >= 2, { timeout: 30000 });
+    const parent = page.locator('.column').nth(1).locator('.folder-row', { hasText: '子目录乙' });
+    const parentMeta = await parent.locator('.col-meta').innerText();
+    assert.match(parentMeta, /2 个文件/);
+    assert.match(parentMeta, /最后更新/);
+    assert.ok(await page.locator('.file-row .tag.hot').count() >= 2, '刚上传的文件没有「热乎」标');
+    const expiry = await page.locator('.file-row .col-expiry').first().innerText();
+    assert.match(expiry, /4 小时后删除/);
+    lib = await (await fetch(`${srv.base}/api/library`)).json();
+    assert.strictEqual(lib.batches[0].ttlHours, 4, '上传没有使用全局 TTL');
     await page.screenshot({ path: SHOT('fb-library-desktop.png'), fullPage: true });
 
-    // 下载字节
-    const [download] = await Promise.all([
-      page.waitForEvent('download', { timeout: 30000 }),
-      page.locator('.file-row .linkbtn').first().click(),
-    ]);
-    const downloaded = await download.path();
-    assert.strictEqual(download.suggestedFilename(), 'fb-library-smoke.txt');
-    assert.strictEqual(fs.readFileSync(downloaded, 'utf8'), 'hello from library smoke');
+    // 目录「⋯」菜单：重命名 / 删除 / 分享链接都在
+    await parent.locator('.col-more').click();
+    const folderMenu = await page.locator('.context-menu .menu-item').allInnerTexts();
+    assert.ok(folderMenu.includes('重命名') && folderMenu.includes('删除文件夹') && folderMenu.includes('复制文件夹链接'));
+    await page.keyboard.press('Escape');
 
-    // 重命名
-    await page.locator('.file-row .icon-btn').first().click();
-    await page.locator('.menu-item', { hasText: '重命名' }).click();
-    await page.locator('.dialog .input').fill('冒烟改名.txt');
+    // 分享链接改名后仍指向同一个目录 ID
+    await parent.locator('.col-more').click();
+    await page.locator('.context-menu .menu-item', { hasText: '复制文件夹链接' }).click();
+    await page.waitForTimeout(250);
+    const beforeLink = new URL(await readClip());
+    const folderId = beforeLink.searchParams.get('f');
+    assert.ok(folderId, '文件夹链接没有带 f=<id>');
+    await parent.locator('.col-more').click();
+    await page.locator('.context-menu .menu-item', { hasText: '重命名' }).click();
+    await page.locator('.dialog .input').fill('子目录乙-改');
     await page.locator('.dialog .btn-primary').click();
-    await page.waitForFunction(() => document.querySelector('.file-row .name')?.textContent.includes('冒烟改名.txt'), { timeout: 10000 });
-    assert.ok((await page.locator('.file-row .name').first().innerText()).includes('冒烟改名.txt'));
+    await page.waitForSelector('.folder-row:has-text("子目录乙-改")');
+    const renamed = page.locator('.column').nth(1).locator('.folder-row', { hasText: '子目录乙-改' });
+    await renamed.locator('.col-more').click();
+    await page.locator('.context-menu .menu-item', { hasText: '复制文件夹链接' }).click();
+    await page.waitForTimeout(250);
+    const afterLink = new URL(await readClip());
+    assert.strictEqual(afterLink.searchParams.get('f'), folderId, '改名后文件夹链接变了');
 
-    // 搜索
-    await page.locator('.search input').fill('冒烟改名');
-    await page.waitForTimeout(200);
-    assert.strictEqual(await page.locator('.file-row').count(), 1);
-    await page.locator('.search input').fill('不存在');
-    await page.waitForTimeout(200);
-    assert.strictEqual(await page.locator('.empty').count(), 1);
+    // 文件分享：打开后文件与所在目录高亮
+    await page.locator('.file-row').first().locator('.col-more').click();
+    await page.locator('.context-menu .menu-item', { hasText: '复制文件分享链接' }).click();
+    await page.waitForTimeout(250);
+    const shareUrl = await readClip();
+    assert.match(shareUrl, /[?&]file=/);
+    await page.goto(shareUrl, { waitUntil: 'networkidle' });
+    await page.waitForSelector('.file-row.shared');
+    assert.strictEqual(await page.locator('.file-row.shared').count(), 1);
+    assert.strictEqual(await page.locator('.banner.share').count(), 1);
+    assert.ok(await page.locator('.folder-row.shared').count() >= 1);
+
+    // 目录 zip：逐个解开并核对内容
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 30000 }),
+      page.locator('.column').last().locator('.col-head button[aria-label="打包下载这个文件夹"]').click(),
+    ]);
+    const names = Object.keys(unzipSync(new Uint8Array(fs.readFileSync(await dl.path()))));
+    assert.ok(names.some((n) => n.endsWith('fb-library-甲.txt')));
+    assert.ok(names.some((n) => n.endsWith('fb-library-乙.txt')));
+    assert.strictEqual(strFromU8(unzipSync(new Uint8Array(fs.readFileSync(await dl.path())))[
+      names.find((n) => n.endsWith('fb-library-甲.txt'))
+    ]), 'AAA-content');
+
+    // 全局搜索：文件名 + 所在目录路径
+    await page.locator('.search input').fill('fb-library-乙');
+    await page.waitForTimeout(350);
+    assert.strictEqual(await page.locator('.result-row').count(), 1);
+    const resultPath = await page.locator('.result-path').innerText();
+    assert.match(resultPath, /冒烟项目/);
+    assert.match(resultPath, /子目录乙-改/);
     await page.locator('.search input').fill('');
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(350);
 
-    // 移动端：文件名列不能被挤没，到期文案要留在名字下面
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.waitForTimeout(300);
-    const nameBox = await page.locator('.file-row .name').first().boundingBox();
-    assert.ok(nameBox && nameBox.width > 100, `移动端文件名列太窄: ${JSON.stringify(nameBox)}`);
-    const metaText = await page.locator('.file-row .meta').first().innerText();
-    assert.ok(/小时|分钟/.test(metaText), `移动端到期文案丢了: ${metaText}`);
-    const actionsBox = await page.locator('.file-row .actions').first().boundingBox();
-    assert.ok(actionsBox && actionsBox.x + actionsBox.width <= 390, '移动端操作列溢出了屏幕');
-    await page.screenshot({ path: SHOT('fb-library-mobile.png'), fullPage: true });
+    // 多选 zip
+    await page.locator('.file-row .col-check').nth(0).check();
+    await page.locator('.file-row .col-check').nth(1).check();
+    const [dl2] = await Promise.all([
+      page.waitForEvent('download', { timeout: 30000 }),
+      page.locator('.selection-bar .linkbtn', { hasText: '打包下载' }).click(),
+    ]);
+    const multi = Object.keys(unzipSync(new Uint8Array(fs.readFileSync(await dl2.path()))));
+    assert.ok(multi.filter((n) => !n.endsWith('/')).length >= 2);
 
-    // 删文件 → 删目录
-    await page.locator('.file-row .icon-btn').first().click();
-    await page.locator('.menu-item.danger').click();
-    await page.locator('.dialog .btn-danger').click();
-    await page.waitForTimeout(1000);
-    assert.strictEqual(await page.locator('.file-row').count(), 0);
-    await page.locator('.crumb-btn').first().click();
-    await page.waitForTimeout(400);
-    const folderRow2 = page.locator('.folder-row', { hasText: '冒烟目录' });
-    await folderRow2.locator('.icon-btn').click();
-    await page.locator('.menu-item.danger').click();
-    await page.locator('.dialog .btn-danger').click();
+    // 整批上传移动：从子目录移回父目录，两个文件一起走
+    await page.locator('.file-row', { hasText: 'fb-library-甲' }).locator('.col-more').click();
+    const fileMenu = await page.locator('.context-menu .menu-item').allInnerTexts();
+    assert.ok(fileMenu.includes('移动这批上传到…'), '文件菜单缺少整批移动');
+    await page.locator('.context-menu .menu-item', { hasText: '移动这批上传到…' }).click();
+    await page.locator('.dialog select').selectOption({ label: '冒烟项目' });
+    await page.locator('.dialog .btn-primary').click();
     await page.waitForFunction(
-      () => ![...document.querySelectorAll('.folder-row .name')].some((n) => n.textContent.includes('冒烟目录')),
+      () => document.querySelectorAll('.column:last-child .file-row').length === 0,
       { timeout: 15000 },
     );
-    assert.strictEqual(await page.locator('.folder-row', { hasText: '冒烟目录' }).count(), 0);
+    await page.waitForFunction(() => {
+      const row = [...document.querySelectorAll('.column:first-child .folder-row')]
+        .find((r) => r.textContent.includes('冒烟项目'));
+      return row && /2 个文件/.test(row.textContent);
+    }, { timeout: 15000 });
+    const projectMeta = await page.locator('.column').first().locator('.folder-row', { hasText: '冒烟项目' }).locator('.col-meta').innerText();
+    assert.match(projectMeta, /2 个文件/, '整批移动后父目录文件数不对');
+
+    // 拖拽上传到当前栏
+    const dt = await page.evaluateHandle(() => {
+      const d = new DataTransfer();
+      d.items.add(new File(['drop-content'], '拖拽.txt', { type: 'text/plain' }));
+      return d;
+    });
+    await page.locator('.column').last().locator('.col-list').dispatchEvent('drop', { dataTransfer: dt });
+    await page.waitForFunction(
+      () => [...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('拖拽.txt')),
+      { timeout: 30000 },
+    );
+
+    // 窄屏：当前栏必须自动滚到视野内
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(600);
+    const box = await page.locator('.column:last-child .file-row').first().boundingBox();
+    assert.ok(box && box.x >= 0 && box.x < 390, `窄屏下当前目录不在视野内: ${JSON.stringify(box)}`);
+    // 三行都要真渲染：旧表格的窄屏规则曾把倒计时那一行整行 display:none 掉
+    const expiryCell = page.locator('.column:last-child .file-row .col-expiry').first();
+    const expiryBox = await expiryCell.boundingBox();
+    assert.ok(
+      expiryBox && expiryBox.height > 8 && expiryBox.width > 20,
+      `窄屏倒计时那一行没渲染出尺寸: ${JSON.stringify(expiryBox)}`,
+    );
+    assert.match(await expiryCell.innerText(), /小时后删除/, '窄屏倒计时文字不对');
+    await page.screenshot({ path: SHOT('fb-library-mobile.png') });
 
     assert.deepStrictEqual(errs, [], `浏览器有 console/page 错误:\n${errs.join('\n')}`);
     console.log('[library-smoke] 通过');
@@ -112,6 +201,7 @@ const SHOT = (name) => path.join(os.tmpdir(), name);
   } finally {
     await browser.close();
     await srv.stop();
-    fs.rmSync(uploadFile, { force: true });
+    fs.rmSync(f1, { force: true });
+    fs.rmSync(f2, { force: true });
   }
 })().catch((err) => { console.error(err); process.exit(1); });

@@ -1,8 +1,6 @@
 // 上传任务：复用原上传引擎的分块规划 / 批次指纹 / 加密 / CRC 语义，只把 DOM 换成 Vue 状态。
 import { api } from './api.js';
 
-export const UPLOAD_TTL_OPTIONS = [1, 4, 8, 48, 72, 120, 240, 2160];
-
 const UPLOAD_TARGET = 4 * 1024 * 1024;
 const PLAIN_BLOCK = 512 * 1024;
 const PAD_UNIT = 64 * 1024;
@@ -116,10 +114,11 @@ async function encryptChunk(spec, file, ci) {
 }
 
 export class UploadTask {
-  constructor(files, { folderId = null, ttlHours = 1, onUpdate = () => {} } = {}) {
+  constructor(files, { folderId = null, ttlHours = null, onUpdate = () => {} } = {}) {
     this.files = files;
     this.folderId = folderId || null;
-    this.ttlHours = ttlHours || 1;
+    // null = 交给服务端按「公共配置区」的全局设置定稿
+    this.ttlHours = Number.isFinite(ttlHours) ? ttlHours : null;
     this.onUpdate = onUpdate;
     this.state = 'queued';
     this.uploadId = '';

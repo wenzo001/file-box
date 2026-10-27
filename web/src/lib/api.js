@@ -25,6 +25,8 @@ const q = (value) => encodeURIComponent(String(value));
 export const api = {
   library: () => request('library'),
   uploads: () => request('uploads'),
+  settings: () => request('settings'),
+  saveSettings: (settings) => json('settings', 'PUT', settings),
 
   createFolder: (name, parentId) => json('folders', 'POST', { name, parentId }),
   patchFolder: (id, patch) => json(`folders/${q(id)}`, 'PATCH', patch),

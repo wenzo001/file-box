@@ -52,7 +52,7 @@ test('目录：同名去重（大小写不敏感）、不同父级可同名、�
   );
 });
 
-test('目录：重命名、移动、禁止移入自身 / 后代、深度上限', async () => {
+test('目录：重命名、移动、禁止移入自身 / 后代、层级不设上限', async () => {
   const a = await lib.createFolder({ name: '移动-A', parentId: null });
   const b = await lib.createFolder({ name: '移动-B', parentId: a._id });
 
@@ -74,15 +74,46 @@ test('目录：重命名、移动、禁止移入自身 / 后代、深度上限',
   assert.strictEqual(back.parentId, a._id);
 
   let parentId = null;
-  for (let i = 1; i <= 8; i++) {
+  for (let i = 1; i <= 12; i++) {
     const f = await lib.createFolder({ name: `层-${i}`, parentId });
     assert.strictEqual(await lib.depthOf(f._id), i);
     parentId = f._id;
   }
+  // 12 层之后还能继续建：Finder 式无限层级
+  const deeper = await lib.createFolder({ name: '层-13', parentId });
+  assert.strictEqual(await lib.depthOf(deeper._id), 13);
+});
+
+test('目录名：20 个字为上限（按 Unicode 字符计）', async () => {
+  const exact = '一二三四五六七八九十一二三四五六七八九十';
+  assert.strictEqual(Array.from(exact).length, 20);
+  const ok = await lib.createFolder({ name: exact, parentId: null });
+  assert.strictEqual(ok.name, exact);
   await assert.rejects(
-    () => lib.createFolder({ name: '层-9', parentId }),
-    expectCode('DEPTH_LIMIT'),
+    () => lib.createFolder({ name: `${exact}多`, parentId: null }),
+    expectCode('INVALID_NAME'),
   );
+});
+
+test('公共设置：默认 1 小时，修改后持久化，非法值拒绝', async () => {
+  assert.deepStrictEqual(await lib.getSettings(), { defaultTtlHours: 1 });
+  assert.deepStrictEqual(await lib.setSettings({ defaultTtlHours: 4 }), { defaultTtlHours: 4 });
+  assert.deepStrictEqual(await lib.getSettings(), { defaultTtlHours: 4 });
+  await assert.rejects(
+    () => lib.setSettings({ defaultTtlHours: 2 }),
+    expectCode('INVALID_TTL'),
+  );
+  await lib.setSettings({ defaultTtlHours: 1 });
+});
+
+test('公共设置：换进程重启后仍生效', async () => {
+  const persistDir = path.join(dir, 'settings-persist');
+  const first = await createLibrary({ libraryDir: persistDir, backupDelayMs: 5 }).init();
+  await first.setSettings({ defaultTtlHours: 8 });
+  await first.close();
+  const reopened = await createLibrary({ libraryDir: persistDir, backupDelayMs: 5 }).init();
+  assert.deepStrictEqual(await reopened.getSettings(), { defaultTtlHours: 8 });
+  await reopened.close();
 });
 
 test('目录数量保护：超过 maxFolders 拒绝，防止无认证环境无限建目录', async () => {
