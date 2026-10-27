@@ -71,7 +71,7 @@ test('没吐成字节就不许计数：404、闸门拒绝、外来目录', async
   } finally { await srv.stop(); }
 });
 
-test('重启后计数还在；目录被删（手动或到期清理）账本就跟着清掉', async () => {
+test('重启后计数还在；目录被手动删除时账本就跟着清掉', async () => {
   const dir = fs.mkdtempSync(require('os').tmpdir() + '/fbdl-');
   let srv = await oneShot({}, dir, 54);
   try {

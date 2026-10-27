@@ -389,7 +389,7 @@
     </div>
   </section>
 
-  <div class="sec"><span>文件列表</span><span class="sec-note" id="retention-note">超 90 天自动清理</span></div>
+  <div class="sec"><span>文件列表</span></div>
   <section class="panel">
     <div id="loading"><div class="spinner"></div>加载中…</div>
     <div id="list"></div>
@@ -1084,14 +1084,13 @@ async function loadList(full = true) {
     const r = await fetch('api/list');
     const data = await r.json();
     // 存储用量（旧版后端可能无 usage 字段，兜底避免列表不渲染）
-    const u = data.usage || { used: 0, limit: 1, limitGB: 10, retentionDays: 90 };
+    const u = data.usage || { used: 0, limit: 1, limitGB: 10 };
     overLimit = u.used >= u.limit;
     $('#usage-fill').style.width = Math.min(100, (u.used / u.limit) * 100) + '%';
     $('#usage-used').textContent = `已用 ${fmtSize(u.used)}`;
     $('#usage-limit').textContent = `上限 ${u.limitGB} GB`;
     $('#usage').classList.toggle('warn', overLimit);
     $('#warn').style.display = overLimit ? 'block' : 'none';
-    $('#retention-note').textContent = `超 ${u.retentionDays || 90} 天自动清理`;
     if (!uploading) $('#submit').disabled = overLimit;
     lastList = data;
     // HTTP 非安全上下文没有 WebCrypto，加解密只能跑纯 JS（实测慢约 150 倍）→ 给用户指个路
@@ -1583,7 +1582,7 @@ function delFolder(name) {
             toast('已删除');
             refreshList(); // 局部移除该行即可
           } catch (e) {
-            // 目录已被清掉（自动清理 / 手动删除等）时，刷新列表移除幽灵行
+            // 目录已被删掉时，刷新列表移除幽灵行
             toast(e.message);
             refreshList();
           }

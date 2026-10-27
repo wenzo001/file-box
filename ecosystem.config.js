@@ -7,7 +7,6 @@ module.exports = {
         PORT: 4444,        // HTTP 端口（可直接用）
         HTTPS_PORT: 3443,  // HTTPS 端口（推荐，首次访问需信任自签证书一次）
         STORAGE_LIMIT_GB: 10,
-        RETENTION_DAYS: 90,
         UPLOAD_TTL_HOURS: 48, // 未完成的断点续传批次留 2 天，超时回收
         // ---- 无痕传输（详见 docs/transfer.md）----
         TRANSFER_DIR: './.transfer', // 密文中转区，必须与 uploads 分开（与 server.js 默认值一致）

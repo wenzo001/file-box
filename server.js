@@ -19,9 +19,7 @@ const PORT = Number(process.env.PORT) || 3000;              // HTTP 端口（完
 const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;   // HTTPS 端口（传输层加密 + 原生加密引擎）
 const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, 'uploads');
 const STORAGE_LIMIT_GB = Number(process.env.STORAGE_LIMIT_GB) || 10; // 存储总量上限
-const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || 90;      // 超过 N 天的目录自动清理
 const STORAGE_LIMIT = STORAGE_LIMIT_GB * 1024 * 1024 * 1024;
-const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 // 加密清单文件名（前端生成；列表计数时排除）
 const MANIFEST = 'manifest.enc';
@@ -71,7 +69,7 @@ function safeName(name) {
 // ---- 目录闸门 ----
 // 本服务在 uploads 下只创建一种目录：commitStaging() 生成的「YYYYMMDD_HHmm」
 // （同一分钟挤第二个及以后是「YYYYMMDD_HHmm_序号」）。名字是这里唯一的身份来源，
-// 列表 / 下载 / 归档 / 删除 / 到期清理五个地方都按它认人，别处不许再造第二套。
+// 列表 / 下载 / 归档 / 删除四个地方都按它认人，别处不许再造第二套。
 const FOLDER_NAME = /^\d{8}_\d{4}(_\d+)?$/;
 const isFolderName = (name) => FOLDER_NAME.test(String(name || ''));
 const realpathOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
@@ -167,7 +165,7 @@ function countDownload(folder, file) {
   downloads[folder] = rec;
   scheduleFlush();
 }
-/** 目录被删（手动或到期清理）后账本条目要跟着走：否则它一直占着一格，还可能被以后同名的目录继承 */
+/** 目录被删（手动）后账本条目要跟着走：否则它一直占着一格，还可能被以后同名的目录继承 */
 function forgetDownloads(folder) {
   if (!(folder in downloads)) return;
   delete downloads[folder];
@@ -193,34 +191,7 @@ function dirSize(dir) {
   return total;
 }
 
-/** 从目录名解析上传时间戳（仅识别 YYYYMMDD_HHmm 格式） */
-function folderTime(name) {
-  const m = String(name).match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})/);
-  if (!m) return null;
-  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
-}
-
-/** 清理超过保留期的目录（自动运行：启动时、每 6 小时、每次上传前） */
-function cleanupExpired() {
-  ensureUploadDir();
-  const now = Date.now();
-  const removed = [];
-  for (const d of fs.readdirSync(UPLOAD_DIR, { withFileTypes: true })) {
-    if (!d.isDirectory() || !isFolderName(d.name)) continue; // 链接与外来目录一律不动
-    const t = folderTime(d.name);
-    if (t !== null && now - t > RETENTION_MS) {
-      fs.rmSync(path.join(UPLOAD_DIR, d.name), { recursive: true, force: true });
-      forgetDownloads(d.name);
-      removed.push(d.name);
-    }
-  }
-  if (removed.length) {
-    console.log(`[清理] 已自动删除超过 ${RETENTION_DAYS} 天的目录: ${removed.join(', ')}`);
-  }
-}
-cleanupExpired();
 warnIgnored();
-setInterval(cleanupExpired, 6 * 60 * 60 * 1000).unref();
 
 // ---- 上传：分块 + 断点续传 ----
 // 分块先落到 uploads 之外的 .uploading/<批次>/，全部块传完再按「完成那一刻」的时间
@@ -406,7 +377,6 @@ reclaimStagingOnBoot();
 
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
 app.post('/api/upload/init', express.json({ limit: '2mb' }), (req, res) => {
-  cleanupExpired();
   const { key, files } = req.body || {};
   if (typeof key !== 'string' || !/^[a-f0-9]{16,64}$/.test(key)) {
     return res.status(400).json({ error: '批次标识不合法' });
@@ -583,7 +553,7 @@ app.get('/api/list', (req, res) => {
   const used = folders.reduce((s, f) => s + f.size, 0);
   res.json({
     folders,
-    usage: { used, limit: STORAGE_LIMIT, limitGB: STORAGE_LIMIT_GB, retentionDays: RETENTION_DAYS },
+    usage: { used, limit: STORAGE_LIMIT, limitGB: STORAGE_LIMIT_GB },
     httpsPort: HTTPS_PORT,
   });
 });
@@ -717,7 +687,7 @@ app.use((err, req, res, next) => {
     console.log(`file-box 已启动`);
     console.log(`  HTTP : http://localhost:${PORT}`);
     console.log(`  HTTPS: https://localhost:${HTTPS_PORT}（推荐，首次访问需信任自签证书一次）`);
-    console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB，超过 ${RETENTION_DAYS} 天自动清理）`);
+    console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB；没有全局自动清理，文件保留到手动删除）`);
     console.log('文件在浏览器内端到端加密后上传，服务器磁盘只保存密文');
   });
   http.createServer(app).listen(PORT);
