@@ -223,3 +223,106 @@ test('未完成上传：列表不含真实名、取消会清掉暂存', async ()
   const missing = await fetch(`${srv.base}/api/uploads/${hexKey()}`, { method: 'DELETE' });
   assert.strictEqual(missing.status, 404);
 });
+
+// ---- 单文件跨目录移动（拆批次）----
+const BATCH_DIR = /^\d{8}_\d{4}(_\d+)?$/;
+const newFolder = async (name) => {
+  const r = await jget(`${srv.base}/api/folders`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  assert.strictEqual(r.status, 200, `建目录失败: ${JSON.stringify(r.body)}`);
+  const lib = await jget(`${srv.base}/api/library`);
+  const f = lib.body.folders.find((x) => x.name === name);
+  assert.ok(f, '新目录没出现在 /api/library 里');
+  return f.id;
+};
+const batchRow = async (name) => {
+  const lib = await jget(`${srv.base}/api/library`);
+  return lib.body.batches.find((b) => b.name === name) || null;
+};
+const batchDirs = () => fs.readdirSync(path.join(srv.dir, 'uploads')).filter((n) => BATCH_DIR.test(n));
+
+test('移动单个文件：拆出新批次，源批次与到期时间都不许被改写坏', async () => {
+  const { out, mf } = await bundleWithManifest();
+  const src = out.folder;
+  const to = await newFolder('移动去处');
+  const keepB = manifest([{ name: 'b.txt', size: 4, enc: 'b.enc' }]);
+  const onlyA = manifest([{ name: 'a.txt', size: 4, enc: 'a.enc' }]);
+  const before = await batchRow(src);
+
+  const r = await post(`/api/batches/${src}/file-move`, {
+    file: 'a.enc', to, sourceManifest: b64(keepB), targetManifest: b64(onlyA), expectedManifestHash: hash(mf),
+  });
+  assert.strictEqual(r.status, 200, `移动失败: ${JSON.stringify(r.body)}`);
+  const toName = r.body.toBatch;
+  assert.ok(BATCH_DIR.test(toName), `新批次名不符合命名规则: ${toName}`);
+  assert.strictEqual(r.body.sourceRemoved, false, '源批次还剩一个文件，不该被清理');
+
+  const uploads = path.join(srv.dir, 'uploads');
+  assert.strictEqual(fs.existsSync(path.join(uploads, src, 'a.enc')), false, '密文还留在源批次');
+  assert.ok(fs.readFileSync(path.join(uploads, src, 'manifest.enc')).equals(keepB), '源清单没换成去掉这一条的版本');
+  assert.ok(fs.existsSync(path.join(uploads, toName, 'a.enc')), '新批次里没有这条密文');
+  assert.ok(fs.readFileSync(path.join(uploads, toName, 'manifest.enc')).equals(onlyA), '新批次清单不该带上别的文件');
+
+  const moved = await batchRow(toName);
+  assert.strictEqual(moved.folderId, to, '新批次没挂到目标目录');
+  assert.strictEqual(moved.legacy, false, '拆出来的批次被标成了旧数据');
+  assert.strictEqual(moved.uploadedAt, before.uploadedAt, '上传时间被重置了');
+  assert.strictEqual(moved.ttlHours, before.ttlHours, 'TTL 快照被改写');
+  assert.strictEqual(moved.expiresAt, before.expiresAt, '到期时间被重置，倒计时会偷偷续命');
+
+  const dl = await fetch(`${srv.base}/api/download/${toName}/a.enc`);
+  assert.strictEqual(dl.status, 200, '移动后下载不到');
+  assert.strictEqual((await dl.arrayBuffer()).byteLength, 4, '下载到的字节数不对');
+});
+
+test('移动单个文件：清单 CAS 不匹配时 409，且一个字节都不许动', async () => {
+  const { out, mf } = await bundleWithManifest();
+  const src = out.folder;
+  const to = await newFolder('CAS 拒绝去处');
+  const dirsBefore = batchDirs().length;
+  const r = await post(`/api/batches/${src}/file-move`, {
+    file: 'a.enc', to, sourceManifest: b64(manifest([])), targetManifest: b64(manifest([])),
+    expectedManifestHash: hash(Buffer.from('不是这份清单')),
+  });
+  assert.strictEqual(r.status, 409, `陈旧清单没被拒: ${JSON.stringify(r.body)}`);
+  assert.strictEqual(batchDirs().length, dirsBefore, `被拒的移动留下了多余批次目录: ${batchDirs().join(',')}`);
+  assert.ok(fs.existsSync(path.join(srv.dir, 'uploads', src, 'a.enc')), '被拒之后源文件不见了');
+  assert.ok(fs.readFileSync(path.join(srv.dir, 'uploads', src, 'manifest.enc')).equals(mf), '被拒之后源清单被改过');
+});
+
+test('移动单个文件：目标目录不存在要 404，且不许搬走文件', async () => {
+  const { out } = await bundleWithManifest();
+  const src = out.folder;
+  const dirsBefore = batchDirs().length;
+  const r = await post(`/api/batches/${src}/file-move`, {
+    file: 'a.enc', to: 'no-such-folder', sourceManifest: b64(manifest([])), targetManifest: b64(manifest([])),
+    expectedManifestHash: hash(manifest([
+      { name: 'a.txt', size: 4, enc: 'a.enc' }, { name: 'b.txt', size: 4, enc: 'b.enc' },
+    ])),
+  });
+  assert.strictEqual(r.status, 404, `不存在的目录没被拒: ${JSON.stringify(r.body)}`);
+  assert.strictEqual(batchDirs().length, dirsBefore, '目标目录不存在却已经建了新批次目录');
+  assert.ok(fs.existsSync(path.join(srv.dir, 'uploads', src, 'a.enc')), '目标不合法却把文件搬走了');
+});
+
+test('移动批次里最后一个文件：源批次连带清掉，不留空目录', async () => {
+  const mf = manifest([{ name: 'only.txt', size: 4, enc: 'o.enc' }]);
+  const out = await uploadBundle(srv, hexKey(), [
+    { enc: 'o.enc', chunks: [4], data: [Buffer.from('oooo')] },
+    { enc: 'manifest.enc', chunks: [mf.length], data: [mf] },
+  ]);
+  const src = out.folder;
+  const to = await newFolder('最后一件去处');
+  const r = await post(`/api/batches/${src}/file-move`, {
+    file: 'o.enc', to,
+    sourceManifest: b64(manifest([])), targetManifest: b64(manifest([{ name: 'only.txt', size: 4, enc: 'o.enc' }])),
+    expectedManifestHash: hash(mf),
+  });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  assert.strictEqual(r.body.sourceRemoved, true, '源批次空了却没报已清理');
+  assert.strictEqual(fs.existsSync(path.join(srv.dir, 'uploads', src)), false, '空批次目录留在盘上');
+  assert.strictEqual(await batchRow(src), null, '索引里还留着已清理的源批次');
+  assert.strictEqual((await batchRow(r.body.toBatch)).folderId, to, '最后一件没落到目标目录');
+});
+

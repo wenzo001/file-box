@@ -375,13 +375,22 @@ function nameProblem(name) {
 }
 
 /** 把暂存目录搬进 uploads，名字用完成时刻；撞上同分钟的批次就追加序号 */
-function commitStaging(stagingDir) {
+// 批次目录名只有一处生成：「YYYYMMDD_HHmm」，同一分钟挤第二个及以后是「_序号」。
+// 上传落盘与单文件拆批都走这里，别处不许再造第二套命名。
+function nextBatchDir() {
   const base = folderName(new Date());
   for (let i = 1; i <= 50; i++) {
     const name = i === 1 ? base : `${base}_${i}`;
     const target = path.join(UPLOAD_DIR, name);
+    if (!fs.existsSync(target)) return { name, target };
+  }
+  throw new Error('同一分钟内批次过多，请稍后重试');
+}
+
+function commitStaging(stagingDir) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { name, target } = nextBatchDir();
     try {
-      if (fs.existsSync(target)) continue;
       fs.renameSync(stagingDir, target); // 同盘 rename，一步到位
       return name;
     } catch (err) {
@@ -1113,6 +1122,90 @@ app.post('/api/batches/:batch/file-rename', express.json({ limit: '2mb' }), asyn
 // ---- 删除整个批次（谨慎操作：前端有确认弹层） ----
 // 只删"本服务自己按日期_时间建出来的真实目录"：名字形状 + lstat 真目录 + realpath 仍在 uploads 内，
 // 三道一起过。少任何一道都会留下口子（字符串前缀比较挡不住指向界外的链接）。
+// ---- 单文件跨目录移动：把一条文件从源批次物理拆出，落进目标目录下的新批次 ----
+// 清单是客户端加密的，服务端只搬密文与两份清单；任何一步没成都要把文件放回原处。
+app.post('/api/batches/:batch/file-move', express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
+  const batch = req.params.batch;
+  if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
+  const fromDir = resolveFolder(batch);
+  if (!fromDir) return res.status(404).json({ error: '批次不存在' });
+  const data = parseBody(res, schemas.fileMove, req.body);
+  if (!data) return;
+  const file = data.file;
+  if (file === MANIFEST || safeName(file) !== file) return res.status(400).json({ error: '文件名不合法' });
+  const srcPath = resolveFile(fromDir, file);
+  if (!srcPath) return res.status(404).json({ error: '文件不存在' });
+
+  const current = readManifestBytes(fromDir);
+  if (!current || hashBytes(current) !== data.expectedManifestHash) {
+    return res.status(409).json({ error: '清单已变化，请重新加载后重试' });
+  }
+  const nextSource = decodeManifestBase64(data.sourceManifest);
+  if (!nextSource) return res.status(400).json({ error: '更新后的源清单不合法或过大' });
+  const movedManifest = decodeManifestBase64(data.targetManifest);
+  if (!movedManifest) return res.status(400).json({ error: '新批次的清单不合法或过大' });
+
+  // 目标目录先验：物理搬完才发现目录不存在，会留下一个没登记的批次目录
+  let toFolderId = null;
+  if (data.to && data.to !== '__unfiled__') {
+    if (!libraryReady) return res.status(503).json({ error: '目录索引暂不可用' });
+    const doc = await library.getFolder(data.to);
+    if (!doc) return res.status(404).json({ error: '目标目录不存在' });
+    toFolderId = doc._id;
+  }
+
+  const meta = libraryReady ? await library.getBatch(batch) : null;
+  const { name: toName, target: toDir } = nextBatchDir();
+  fs.mkdirSync(toDir);
+  const dstPath = path.join(toDir, file);
+  try {
+    fs.renameSync(srcPath, dstPath);
+  } catch (err) {
+    fs.rmSync(toDir, { recursive: true, force: true });
+    console.error('[移动] 密文搬迁失败', err.code || err.message);
+    return res.status(500).json({ error: '移动失败，文件仍在原批次' });
+  }
+  try {
+    writeManifestAtomic(toDir, movedManifest);
+    writeManifestAtomic(fromDir, nextSource);
+  } catch (err) {
+    console.error('[移动] 清单写入失败', err.code || err.message);
+    try {
+      fs.renameSync(dstPath, srcPath);
+      fs.rmSync(toDir, { recursive: true, force: true });
+    } catch (rb) {
+      console.error('[移动] 回滚失败，需要人工处理', rb.code || rb.message);
+      return res.status(500).json({ error: '移动半途失败且回滚未成功，请勿重启服务' });
+    }
+    return res.status(500).json({ error: '移动失败，已还原到原批次' });
+  }
+
+  forgetDownload(batch, file);
+  forgetUsage();
+  let sourceRemoved = false;
+  const left = fs.readdirSync(fromDir).filter((n) => n !== MANIFEST && !n.endsWith('.tmp'));
+  if (!left.length) {
+    fs.rmSync(fromDir, { recursive: true, force: true });
+    forgetDownloads(batch);
+    sourceRemoved = true;
+  }
+  try {
+    await library.setBatch(toName, {
+      folderId: toFolderId,
+      uploadedAt: meta?.uploadedAt,
+      ttlHours: meta?.ttlHours,
+      expiresAt: meta?.expiresAt,
+      manifestHash: hashBytes(movedManifest),
+    });
+    if (sourceRemoved) await library.removeBatch(batch);
+    else await library.setBatchHash(batch, hashBytes(nextSource));
+  } catch (err) {
+    console.error('[移动] 目录索引更新失败', err.code || err.message);
+    return res.status(500).json({ error: '索引更新失败，请刷新后重试' });
+  }
+  res.json({ ok: true, toBatch: toName, sourceRemoved });
+}));
+
 app.delete('/api/folder/:folder', asyncHandler(async (req, res) => {
   const name = req.params.folder;
   if (!isFolderName(name)) return res.status(400).json({ error: '目录名无效' });
