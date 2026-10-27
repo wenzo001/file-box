@@ -15,6 +15,9 @@ uploads/
 # 发布产物（npm run pack 生成）
 dist/
 
+# 新界面的 Vite 构建产物（npm run build 生成）
+dist-web/
+
 # 未完成的分块上传暂存（跑起来才生成）
 .uploading/
 

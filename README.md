@@ -70,6 +70,23 @@ npm start
 
 启动后浏览器访问：`http://服务器IP:3000`（也支持 `https://服务器IP:3443`，见下文「HTTP 与 HTTPS」）
 
+### 新界面开发（/next，切换前不影响默认页面）
+
+前端源码在 `web/`，用 Vue 3 + Vite 6 + Reka UI 构建；构建产物在 `dist-web/next/`（不入库）。默认 `/` 仍是旧页面，新界面挂在 `/next/`，等目录 UI 完成后再切根。
+
+```bash
+# 终端 1：API 服务
+npm run dev:server
+
+# 终端 2：Vite 开发服务器（5173，/api 代理到 3000）
+npm run dev
+
+# 或者先构建，再由 Express 托管 /next/
+npm run build
+npm start
+# 访问 http://服务器IP:3000/next/
+```
+
 ## 打包（出自包含发布产物）
 
 ```bash
