@@ -145,6 +145,8 @@ const columns = computed(() => columnIds.value.map((id) => {
     files: id ? filesForFolder(id) : [],
   };
 }));
+// 当前路径上的每一级（含当前这一级自己）：所在栏的那一行要亮成选中态
+const pathIds = computed(() => new Set(columnIds.value.slice(1)));
 
 const folderPathText = (id) => {
   if (!id) return '全部文件';
@@ -1298,6 +1300,7 @@ onBeforeUnmount(() => {
         <input v-model="query" type="search" placeholder="搜索全部文件夹和文件" aria-label="全局搜索文件夹和文件">
       </label>
       <div class="toolbar-actions">
+        <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB</span>
         <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> 上传到「{{ uploadTargetLabel }}」</button>
         <a class="btn" href="../transfer.html">无痕传输</a>
       </div>
@@ -1321,32 +1324,6 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="layout">
-      <aside class="sidebar">
-        <button class="side-item" :class="{ active: currentId === null }" @click="navigate(null)">
-          <Folder :size="18" /> 全部文件
-        </button>
-        <button class="side-item" :class="{ active: currentId === '__unfiled__' }" @click="navigate('__unfiled__')">
-          <Inbox :size="18" /> 未分档
-          <span class="tag">系统</span>
-          <span class="badge">{{ data.folders.find((f) => f.id === '__unfiled__')?.count || 0 }}</span>
-        </button>
-        <div class="side-sep"></div>
-        <button
-          v-for="f in treeRows"
-          :key="f.id"
-          class="side-item tree"
-          :class="{ active: currentId === f.id, shared: sharedFolderIds.has(f.id) }"
-          :style="{ paddingLeft: `${12 + f.depth * 16}px` }"
-          @click="navigate(f.id)"
-        >
-          <Folder :size="16" /> <span class="ellipsis">{{ f.name }}</span>
-        </button>
-        <div class="usage">
-          <div class="usage-bar"><span :style="{ width: `${Math.min(100, (data.usage.used / data.usage.limit) * 100)}%` }"></span></div>
-          <div class="usage-text">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB</div>
-        </div>
-      </aside>
-
       <main class="main">
         <div v-if="libraryNotReady" class="banner">目录索引暂不可用，当前按未分档展示；上传与下载仍可用。</div>
         <div v-if="httpsUrl" class="banner">
@@ -1484,6 +1461,7 @@ onBeforeUnmount(() => {
                   class="col-row folder-row"
                   :class="{
                     selected: isSelected(`folder:${folder.id}`),
+                    current: pathIds.has(folder.id),
                     shared: sharedFolderIds.has(folder.id),
                   }"
                   @click="navigate(folder.id)"

@@ -118,6 +118,7 @@ a { color: var(--accent); }
   min-width: 0;
 }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; }
+.topbar-usage { color: var(--text3); font-size: 12px; white-space: nowrap; }
 .upload-group { display: flex; align-items: center; gap: 0; }
 .upload-group .btn-primary { border-radius: 9px 0 0 9px; }
 .ttl {
@@ -182,54 +183,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 
 /* ---- 布局 ---- */
-.layout {
-  display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
-  gap: 0;
-  min-height: calc(100vh - 58px);
-}
-.sidebar {
-  padding: 14px 10px;
-  border-right: 1px solid var(--sep);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-.side-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 38px;
-  padding: 0 12px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text2);
-  text-align: left;
-  font-size: 14px;
-}
-.side-item:hover { background: var(--fill); color: var(--text); }
-.side-item.active { background: var(--fill2); color: var(--text); font-weight: 600; }
-.side-item.tree { font-size: 13px; }
-.side-sep { height: 1px; background: var(--sep); margin: 8px 6px; }
-.badge {
-  margin-left: auto;
-  min-width: 20px;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 10px;
-  background: var(--fill2);
-  color: var(--text2);
-  font-size: 11px;
-  line-height: 20px;
-  text-align: center;
-}
-.usage { margin-top: auto; padding: 14px 8px 4px; }
-.usage-bar { height: 5px; background: var(--fill2); border-radius: 3px; overflow: hidden; }
-.usage-bar span { display: block; height: 100%; background: var(--accent); }
-.usage-text { margin-top: 6px; color: var(--text3); font-size: 11px; }
+/* 导航只留一套（分栏 + 顶部面包屑）：这里不再有第二棵目录树，容量读数搬到顶栏 */
+.layout { min-height: calc(100vh - 110px); }
 
 .main { position: relative; padding: 16px 18px 40px; min-width: 0; }
 .drop-overlay {
@@ -277,64 +232,9 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   border-radius: 13px;
   overflow: hidden;
 }
-.table-head, .row {
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) 88px 120px 110px 76px 126px;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-}
-.table-head {
-  min-height: 38px;
-  border-bottom: 1px solid var(--sep);
-  color: var(--text3);
-  font-size: 12px;
-}
-.th {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  text-align: left;
-  padding: 4px 0;
-  font-size: 12px;
-}
-.th.name { text-align: left; }
-.th.actions { text-align: right; }
-.row {
-  min-height: 56px;
-  border-bottom: 1px solid var(--sep);
-}
-.row:last-child { border-bottom: 0; }
-.row:hover { background: var(--fill); }
-.row.selected { background: color-mix(in srgb, var(--accent) 9%, transparent); }
-.check-cell { display: flex; align-items: center; justify-content: center; }
-.check-cell input { width: 16px; height: 16px; accent-color: var(--accent); }
-.row-main {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  padding: 8px 0;
-  text-align: left;
-  color: var(--text);
-}
 .row-icon { flex: none; }
 .folder-icon { color: var(--accent); }
 .file-icon { color: var(--text3); }
-.name { font-size: 14px; }
-.meta { color: var(--text2); font-size: 12px; }
-.file-main .meta { display: none; }
-.folder-main { grid-column: 2 / 7; }
-.folder-row .actions { grid-column: 7; justify-self: end; }
-.size, .uploaded, .downloads, .expiry {
-  color: var(--text2);
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .tag {
   display: inline-block;
@@ -484,43 +384,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .crumb { order: 3; flex-basis: 100%; }
   .search { flex: 1; max-width: none; order: 2; }
   .toolbar-actions { order: 4; flex-basis: 100%; justify-content: flex-start; flex-wrap: wrap; }
-  .layout { display: block; }
-  .sidebar {
-    flex-direction: row;
-    align-items: center;
-    gap: 4px;
-    padding: 8px 10px;
-    border-right: 0;
-    border-bottom: 1px solid var(--sep);
-    overflow-x: auto;
-  }
-  .side-item { width: auto; min-height: 36px; white-space: nowrap; }
-  .side-item.tree { display: none; }
-  .side-sep, .usage { display: none; }
   .main { padding: 12px 10px 36px; }
-
-  .table-head, .row { grid-template-columns: 32px minmax(0, 1fr) 84px; }
-  .table-head .th:nth-child(3),
-  .table-head .th:nth-child(4),
-  .table-head .th:nth-child(5),
-  .table-head .th:nth-child(6) { display: none; }
-  .table-head .th.actions { text-align: right; }
-  .folder-main { grid-column: 2 / 3; }
-  .folder-row .actions { grid-column: 3; }
-  .folder-main, .file-main {
-    display: grid;
-    grid-template-columns: 20px minmax(0, 1fr);
-    column-gap: 10px;
-    align-items: start;
-  }
-  .folder-main .row-icon, .file-main .row-icon { grid-row: 1 / 3; margin-top: 2px; }
-  .folder-main .name, .file-main .name { grid-column: 2; }
-  .folder-main .meta, .file-main .meta { grid-column: 2; }
-  .file-main .meta { display: inline; }
-  .file-row .actions { grid-column: 3; }
-  .file-row .actions .linkbtn { font-size: 0; padding: 0 7px; }
-  .file-row .row-main { padding: 7px 0; }
-  .row { min-height: 52px; }
   .dialog { top: auto; bottom: 0; left: 0; transform: none; width: 100%; border-radius: 16px 16px 0 0; }
   .menu { min-width: 180px; }
 }
@@ -542,7 +406,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .linkbtn { min-height: 44px; padding: 0 10px; }
   .btn { min-height: 44px; }
   .ttl { height: 44px; }
-  .side-item { min-height: 44px; }
+  .crumb-btn { min-height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -575,7 +439,6 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .ttl-global:disabled { opacity: 0.55; }
 
 /* ---- Finder 分栏 ---- */
-.sidebar { overflow-y: auto; }
 .browser { min-width: 0; }
 .columns {
   --col-w: 292px;
@@ -641,6 +504,10 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   user-select: none;
 }
 .col-row:hover { background: var(--fill); }
+/* 路径上的那一级：每一栏都要看得见"当前在哪一格"（灰底 + 左侧强调条 + 名字加粗）；
+   勾选的蓝底写在它后面，两个状态叠在同一行时蓝底赢、强调条仍在 */
+.col-row.current { background: var(--fill2); box-shadow: inset 3px 0 0 var(--accent); }
+.col-row.current .col-name { color: var(--text); font-weight: 600; }
 .col-row.selected { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .col-row.shared {
   outline: 2px solid color-mix(in srgb, var(--accent) 78%, transparent);
@@ -695,6 +562,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .col-row:hover .col-more,
 .col-row.selected .col-more,
+.col-row.current .col-more,
 .col-row.shared .col-more { opacity: 1; }
 .col-row .col-more:focus-visible { opacity: 1; }
 .col-empty {

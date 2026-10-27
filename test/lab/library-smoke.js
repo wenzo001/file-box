@@ -67,6 +67,55 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.locator('.folder-row', { hasText: '子目录乙' }).click();
     await page.waitForTimeout(400);
 
+    // 导航只留一套：左侧那棵重复的目录树必须不在场（分栏 + 面包屑已覆盖）
+    assert.strictEqual(await page.locator('.sidebar').count(), 0, '左侧栏那棵重复的目录树还在');
+
+    // 一级一级都要有选中态：路径上那几行必须亮，且真渲染出来、文字对比度够
+    const lit = await page.evaluate(() => {
+      const chan = (s) => s.match(/[\d.]+/g).slice(0, 3).map(Number);
+      const alpha = (s) => (s.match(/[\d.]+/g) || []).length > 3 ? Number(s.match(/[\d.]+/g)[3]) : 1;
+      const over = (fg, a, bg) => fg.map((c, i) => c * a + bg[i] * (1 - a));
+      const bgOf = (el) => {
+        let acc = [255, 255, 255];
+        for (let n = el; n; n = n.parentElement) {
+          const b = getComputedStyle(n).backgroundColor;
+          if (b === 'rgba(0, 0, 0, 0)' || b === 'transparent') continue;
+          const a = alpha(b);
+          acc = over(chan(b), a, acc);
+          if (a >= 1) break;
+        }
+        return acc;
+      };
+      const lum = (c) => c.map((v) => {
+        const s = v / 255;
+        return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+      });
+      const ratio = (fg, bg) => {
+        const [l1, l2] = [fg, bg].map((c) => { const [r, g, b] = lum(c); return 0.2126 * r + 0.7152 * g + 0.0722 * b; }).sort((a, b) => b - a);
+        return (l1 + 0.05) / (l2 + 0.05);
+      };
+      return [...document.querySelectorAll('.column')].map((col, i) => {
+        const row = col.querySelector('.col-row.current');
+        if (!row) return { col: i, current: null };
+        const name = row.querySelector('.col-name');
+        const r = row.getBoundingClientRect();
+        return {
+          col: i,
+          current: name.textContent.trim().split(/\s+/)[0],
+          h: Math.round(r.height),
+          contrast: Number(ratio(chan(getComputedStyle(name).color), bgOf(row)).toFixed(2)),
+        };
+      });
+    });
+    console.log('[library-smoke] 各级选中态:', JSON.stringify(lit));
+    const litRows = lit.filter((x) => x.current);
+    assert.strictEqual(litRows.length, 2, `三级路径上该有两行选中态，实到 ${litRows.length} 行: ${JSON.stringify(lit)}`);
+    assert.deepStrictEqual(litRows.map((x) => x.current), ['冒烟项目', '子目录乙'], '选中态没落在路径那两行上');
+    for (const row of litRows) {
+      assert.ok(row.h > 20, `第 ${row.col + 1} 栏的选中行没渲染出高度: ${JSON.stringify(row)}`);
+      assert.ok(row.contrast >= 4.5, `第 ${row.col + 1} 栏选中行文字对比度 ${row.contrast}:1 < 4.5:1`);
+    }
+
     // 上传两件；目录行有文件数与最后更新；文件在 10 分钟内标「热乎」
     await page.locator('input[type=file]').setInputFiles([f1, f2]);
     await page.waitForFunction(() => document.querySelectorAll('.file-row').length >= 2, { timeout: 30000 });
