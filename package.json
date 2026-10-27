@@ -8,8 +8,9 @@
     "dev": "vite --config vite.config.mjs",
     "dev:server": "node server.js",
     "build": "vite build --config vite.config.mjs",
-    "test": "node --test \"test/*.test.js\"",
-    "pack": "node scripts/pack.js"
+    "pretest": "npm run build",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "pack": "npm run build && node scripts/pack.js"
   },
   "engines": {
     "node": ">=18"

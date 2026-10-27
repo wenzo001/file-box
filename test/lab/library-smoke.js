@@ -1,5 +1,5 @@
 // 新目录界面的真浏览器冒烟（不属于 npm test）。
-// 先 npm run build，再 node test/lab/library-smoke.js；默认打开 dist-web/next。
+// 先 npm run build，再 node test/lab/library-smoke.js；默认打开 dist-web 根页面。
 // 判据打在渲染结果上：目录创建、上传后 TTL、下载字节、重命名、搜索、删除、移动端列宽。
 const fs = require('fs');
 const os = require('os');
@@ -22,7 +22,7 @@ const SHOT = (name) => path.join(os.tmpdir(), name);
   page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
 
   try {
-    await page.goto(`${srv.base}/next/`, { waitUntil: 'networkidle' });
+    await page.goto(`${srv.base}/`, { waitUntil: 'networkidle' });
     await page.waitForSelector('.topbar');
 
     // 建目录并进入
@@ -94,7 +94,10 @@ const SHOT = (name) => path.join(os.tmpdir(), name);
     await folderRow2.locator('.icon-btn').click();
     await page.locator('.menu-item.danger').click();
     await page.locator('.dialog .btn-danger').click();
-    await page.waitForTimeout(1000);
+    await page.waitForFunction(
+      () => ![...document.querySelectorAll('.folder-row .name')].some((n) => n.textContent.includes('冒烟目录')),
+      { timeout: 15000 },
+    );
     assert.strictEqual(await page.locator('.folder-row', { hasText: '冒烟目录' }).count(), 0);
 
     assert.deepStrictEqual(errs, [], `浏览器有 console/page 错误:\n${errs.join('\n')}`);

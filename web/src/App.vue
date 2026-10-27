@@ -18,7 +18,7 @@ import {
 } from 'reka-ui';
 import {
   ArrowLeft, ArrowUp, ChevronRight, Download, File, Folder, FolderPlus,
-  HardDrive, Inbox, ListChecks, Pause, Play, RotateCcw, Search, Upload,
+  HardDrive, Inbox, ListChecks, Pause, Play, RotateCcw, Search, Trash2, Upload,
 } from '@lucide/vue';
 import { api } from './lib/api.js';
 import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from './lib/manifest.js';
@@ -145,6 +145,11 @@ const displayRows = computed(() => {
 const hasFiles = computed(() => allFileRows.value.length > 0 || currentId.value === '__unfiled__');
 const empty = computed(() => !loading.value && !displayRows.value.length);
 const libraryNotReady = computed(() => data.value.libraryReady === false);
+const httpsUrl = computed(() => {
+  if (!data.value.httpsPort || location.protocol !== 'http:') return '';
+  if (window.FBCrypto && window.FBCrypto.native) return '';
+  return `https://${location.hostname}:${data.value.httpsPort}${location.pathname}${location.search}`;
+});
 const selectedItems = computed(() => {
   const map = new Map();
   for (const row of displayRows.value) {
@@ -230,12 +235,16 @@ function stateText(task) {
 function taskPct(task) {
   if (task.state === 'done') return 100;
   if (task.kind === 'upload') return task.total ? Math.round((task.done / task.total) * 100) : 0;
+  if (task.kind === 'folder-delete') return task.items?.length ? Math.round((task.index / task.items.length) * 100) : 0;
   return task.total ? Math.round((task.received / task.total) * 100) : 0;
 }
 
 function taskMeta(task) {
   if (task.kind === 'upload') {
     return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}`;
+  }
+  if (task.kind === 'folder-delete') {
+    return `已完成 ${task.index || 0}/${task.items?.length || 0} 项`;
   }
   return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)}`;
 }
@@ -561,6 +570,90 @@ function openRenameFile(row) {
   openPrompt('rename-file', '重命名文件', row.name, { row });
 }
 
+function collectFolderTree(rootId) {
+  const folderIds = new Set([rootId]);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const f of data.value.folders) {
+      if (f.parentId && folderIds.has(f.parentId) && !folderIds.has(f.id)) {
+        folderIds.add(f.id);
+        changed = true;
+      }
+    }
+  }
+  const depth = (id) => {
+    let d = 0;
+    let cur = id;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      d++;
+      cur = folderMap.value.get(cur)?.parentId || null;
+    }
+    return d;
+  };
+  const folders = [...folderIds].sort((a, b) => depth(b) - depth(a));
+  const batches = data.value.batches.filter((b) => b.folderId && folderIds.has(b.folderId));
+  return { folders, batches };
+}
+
+function startFolderDelete(folder) {
+  const { folders, batches } = collectFolderTree(folder.id);
+  const items = [
+    ...batches.map((batch) => ({ kind: 'batch', batch })),
+    ...folders.map((id) => ({ kind: 'folder', id })),
+  ];
+  const task = reactive({
+    id: `task-${++taskSeq}`,
+    kind: 'folder-delete',
+    title: `删除 ${folder.name}`,
+    state: 'running',
+    items,
+    index: 0,
+    error: '',
+  });
+  let paused = false;
+  let canceled = false;
+  const run = async () => {
+    task.state = 'running';
+    task.error = '';
+    try {
+      while (task.index < task.items.length) {
+        if (canceled) { task.state = 'canceled'; return; }
+        if (paused) { task.state = 'paused'; return; }
+        const item = task.items[task.index];
+        try {
+          if (item.kind === 'batch') await api.deleteBatch(item.batch.name, item.batch.folderId);
+          else await api.deleteFolder(item.id, 'empty');
+        } catch (err) {
+          if (err.status === 404) {
+            // 已被别人删掉，视为完成
+          } else if (err.status === 409 && item.kind === 'batch') {
+            // 快照之后被移走：不误删，继续删剩下的目录
+          } else {
+            throw err;
+          }
+        }
+        task.index++;
+      }
+      task.state = 'done';
+      toast('文件夹已删除');
+      await refreshLibrary();
+      refreshPending();
+    } catch (err) {
+      task.state = 'failed';
+      task.error = err.message || '删除失败';
+      toast(task.error);
+    }
+  };
+  task.pause = () => { if (task.state !== 'running') return; paused = true; task.state = 'paused'; };
+  task.resume = () => { if (task.state === 'done' || task.state === 'canceled') return; paused = false; run(); };
+  task.cancel = () => { canceled = true; paused = false; task.state = 'canceled'; };
+  task.remove = () => { tasks.value = tasks.value.filter((t) => t !== task); };
+  tasks.value.unshift(task);
+  run();
+}
+
 function openDeleteFolder(folder) {
   if (folder.system) { toast('未分档不能删除'); return; }
   openConfirm(
@@ -615,8 +708,8 @@ async function submitDialog() {
       await api.moveBatch(dialog.target.batch.name, value || null);
       toast('已移动');
     } else if (dialog.kind === 'delete-folder') {
-      await api.deleteFolder(dialog.target.folder.id);
-      toast('已删除文件夹');
+      startFolderDelete(dialog.target.folder);
+      toast('已开始删除，进度在任务中心');
     } else if (dialog.kind === 'delete-batch') {
       await api.deleteBatch(dialog.target.batch.name, dialog.target.batch.folderId || null);
       toast('已删除这批上传');
@@ -765,6 +858,9 @@ onBeforeUnmount(() => {
       >
         <div v-if="dragActive" class="drop-overlay">松手上传到「{{ uploadTargetLabel }}」</div>
         <div v-if="libraryNotReady" class="banner">目录索引暂不可用，当前按未分档展示；上传与下载仍可用。</div>
+        <div v-if="httpsUrl" class="banner">
+          当前是 HTTP 兼容模式，加解密会慢一个数量级。改用 <a :href="httpsUrl">HTTPS 地址</a> 可大幅提速（首次需信任自签证书）。
+        </div>
         <div v-if="error" class="banner danger">{{ error }} <button class="linkbtn" @click="refreshLibrary()">重试</button></div>
         <div v-if="manifestError" class="banner danger">部分文件名读取失败：{{ manifestError }} <button class="linkbtn" @click="loadFiles()">重试</button></div>
 
@@ -904,7 +1000,7 @@ onBeforeUnmount(() => {
           <div v-for="task in tasks" :key="task.id" class="task" :class="task.state">
             <div class="task-main">
               <div class="task-title">
-                <component :is="task.kind === 'upload' ? Upload : Download" :size="16" />
+                <component :is="task.kind === 'upload' ? Upload : task.kind === 'download' ? Download : Trash2" :size="16" />
                 <span class="ellipsis">{{ task.title }}</span>
                 <span class="task-state">{{ stateText(task) }}</span>
               </div>
@@ -918,10 +1014,15 @@ onBeforeUnmount(() => {
                 <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
                 <button v-if="task.state === 'done'" class="linkbtn" @click="task.openResult()">打开所在目录</button>
               </template>
-              <template v-else>
+              <template v-else-if="task.kind === 'download'">
                 <button v-if="task.state === 'running'" class="icon-btn" title="暂停" @click="task.pause()"><Pause :size="16" /></button>
                 <button v-else-if="['paused','failed'].includes(task.state)" class="icon-btn" title="继续" @click="task.resume()"><Play :size="16" /></button>
                 <button v-if="['paused','failed'].includes(task.state)" class="icon-btn" title="重试" @click="task.resume()"><RotateCcw :size="16" /></button>
+                <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
+              </template>
+              <template v-else>
+                <button v-if="task.state === 'running'" class="icon-btn" title="暂停" @click="task.pause()"><Pause :size="16" /></button>
+                <button v-else-if="['paused','failed'].includes(task.state)" class="icon-btn" title="继续" @click="task.resume()"><Play :size="16" /></button>
                 <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
               </template>
               <button v-if="['done','canceled'].includes(task.state)" class="linkbtn" @click="task.remove()">移除</button>

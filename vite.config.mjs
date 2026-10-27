@@ -1,14 +1,15 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
-// 新界面先挂在 /next/，默认页面仍是 public/index.html；切换根页面之前互不影响。
-// 构建产物 dist-web/next 由 Express 的 /next 静态路由托管。
+// 前端源码在 web/；public/ 只保留静态源（crypto.js / transfer.html 等）。
+// 构建产物 dist-web/ 由 Express 直接托管在站点根目录。
 export default defineConfig({
   root: 'web',
   base: './',
+  publicDir: '../public',
   plugins: [vue()],
   build: {
-    outDir: '../dist-web/next',
+    outDir: '../dist-web',
     emptyOutDir: true,
   },
   server: {

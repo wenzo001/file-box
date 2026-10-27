@@ -24,12 +24,16 @@ const INCLUDE = [
   'package-lock.json',
   'ecosystem.config.js',
   'README.md',
-  'public',
+  'dist-web',   // Vite 构建产物（含从 public/ 复制来的静态文件）
   'lib',        // server.js 里 require('./lib/transfer')，少了它解压即跑就是个崩溃
   'docs',
 ];
 // 产物顶层一旦出现这些，直接失败
-const FORBIDDEN = [/^uploads\//, /^\.uploading\//, /^\.certs\//, /^\.git\//, /^dist\//, /\.log$/, /^\.env/, /^scripts\//];
+const FORBIDDEN = [
+  /^uploads\//, /^\.uploading\//, /^\.certs\//, /^\.git\//, /^dist\//,
+  /^web\//, /^public\//, /^vite\.config\.(mjs|js)$/, /^\.library\//,
+  /\.log$/, /^\.env/, /^scripts\//,
+];
 
 const sizeOf = (p) => (fs.statSync(p).isDirectory()
   ? fs.readdirSync(p).reduce((s, f) => s + sizeOf(path.join(p, f)), 0)
@@ -85,7 +89,7 @@ if (!lockEntries.length) {
 
 for (const item of INCLUDE) {
   if (!fs.existsSync(path.join(ROOT, item))) {
-    console.error(`[打包] 仓库里缺少 ${item}，先确认再打包`);
+    console.error(`[打包] 仓库里缺少 ${item}，先确认再打包${item === 'dist-web' ? '（先 npm run build）' : ''}`);
     process.exit(1);
   }
 }

@@ -1247,13 +1247,14 @@ transferApi.register(app);
 transferApi.bootReclaim();
 
 // ---- 前端静态页 ----
-// 新界面先挂在 /next/，默认页面仍是 public/index.html；切换根页面之前互不影响
-app.use('/next', express.static(path.join(__dirname, 'dist-web', 'next')));
-app.get('/next', (req, res) => {
-  if (fs.existsSync(path.join(__dirname, 'dist-web', 'next', 'index.html'))) return res.redirect('next/');
-  res.status(503).type('text').send('新界面尚未构建：先 npm run build');
-});
-app.use(express.static(path.join(__dirname, 'public')));
+// ---- 前端静态页（Vue + Vite 构建产物） ----
+// 源码在 web/，public/ 只放静态源；构建后 dist-web/ 由 Express 直接托管。
+if (!fs.existsSync(path.join(__dirname, 'dist-web', 'index.html'))) {
+  console.warn('[前端] dist-web/index.html 不存在：先 npm run build；当前根页面会 404');
+}
+app.use(express.static(path.join(__dirname, 'dist-web')));
+// 旧 /next 书签跳回根（相对路径，兼容反向代理子路径部署）
+app.get(/^\/next(?:\/.*)?$/, (req, res) => res.redirect('../'));
 
 // ---- 统一错误处理 ----
 app.use((err, req, res, next) => {

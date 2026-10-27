@@ -229,6 +229,11 @@ test('静态页可取（前端回归的入口）', async () => {
   for (const p of ['/', '/index.html', '/crypto.js', '/dec-worker.js']) {
     const res = await fetch(`${srv.base}${p}`);
     assert.strictEqual(res.status, 200, `${p} 取不到`);
-    if (p === '/index.html') assert.match(await res.text(), /上传/);
+    if (p === '/index.html') {
+      // 入口现在是 Vite 构建的 Vue 壳：断言挂载点与标题，不再断言具体按钮文案
+      const html = await res.text();
+      assert.match(html, /id="app"/);
+      assert.match(html, /文件盒子/);
+    }
   }
 });
