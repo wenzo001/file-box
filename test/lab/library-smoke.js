@@ -50,6 +50,13 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.locator('.folder-row', { hasText: '冒烟项目' }).click();
     await page.waitForTimeout(400);
     assert.strictEqual(await page.locator('.column').count(), 2, '点目录后没有展开第二栏');
+    // 最后一栏必须吃掉卡片剩余宽度：右侧留空档 = 界面看着"外面还套了一层"
+    const gutter = await page.evaluate(() => {
+      const card = document.querySelector('.columns').getBoundingClientRect();
+      const last = [...document.querySelectorAll('.column')].pop().getBoundingClientRect();
+      return Math.round(card.right - last.right);
+    });
+    assert.ok(gutter <= 2, `最后一栏右侧留了 ${gutter}px 空档，卡片看着像多套了一层`);
 
     // 空白处右键新建子目录
     await page.locator('.column').last().locator('.col-list').click({ button: 'right', position: { x: 60, y: 260 } });

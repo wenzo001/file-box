@@ -578,6 +578,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .sidebar { overflow-y: auto; }
 .browser { min-width: 0; }
 .columns {
+  --col-w: 292px;
   display: flex;
   align-items: stretch;
   height: calc(100vh - 270px);
@@ -591,7 +592,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .column {
   position: relative;
-  flex: 0 0 292px;
+  flex: 0 0 var(--col-w);
   min-width: 0;
   height: 100%;
   display: flex;
@@ -599,7 +600,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   border-right: 1px solid var(--sep);
   background: var(--card);
 }
-.column:last-child { border-right: 0; }
+/* 当前（最后一）栏吃掉剩余宽度：卡片右侧不留空档 —— 那片空白会让界面看着"外面还套了一层" */
+.column:last-child { flex: 1 0 var(--col-w); border-right: 0; }
 .col-head {
   display: flex;
   align-items: center;
@@ -608,7 +610,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   min-height: 58px;
   padding: 8px 8px 7px 10px;
   border-bottom: 1px solid var(--sep);
-  background: color-mix(in srgb, var(--card) 88%, var(--bg));
+  background: var(--card);
 }
 .col-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .col-title-text { display: flex; flex-direction: column; min-width: 0; }
@@ -805,8 +807,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 @media (max-width: 900px) {
   .config-strip { padding: 8px 12px; }
   .config-hint { flex-basis: 100%; }
-  .columns { height: calc(100vh - 318px); min-height: 300px; }
-  .column { flex-basis: min(84vw, 300px); }
+  .columns { --col-w: min(84vw, 300px); height: calc(100vh - 318px); min-height: 300px; }
   .col-more { opacity: 1; }
   .result-meta { grid-column: 2; grid-row: 3; }
   .result-row { grid-template-rows: auto auto auto; }
@@ -815,8 +816,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 @media (max-width: 560px) {
   .ttl-global { width: 100%; }
   .config-strip .config-label { font-size: 12px; }
-  .columns { height: calc(100vh - 360px); min-height: 260px; }
-  .column { flex-basis: 88vw; }
+  .columns { --col-w: 88vw; height: calc(100vh - 360px); min-height: 260px; }
   .col-icon { width: 34px; height: 34px; }
 }
 @media (max-width: 560px) {
