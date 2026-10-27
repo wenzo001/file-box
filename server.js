@@ -46,6 +46,7 @@ function parseBody(res, schema, body) {
 
 // 加密清单文件名（前端生成；列表计数时排除）
 const MANIFEST = 'manifest.enc';
+const MAX_MANIFEST = 1024 * 1024; // 加密清单上限（200 个文件也远小于这个数）
 
 // ---- 基础目录（不存在会自动创建） ----
 function ensureUploadDir() {
@@ -192,6 +193,14 @@ function countDownload(folder, file) {
 function forgetDownloads(folder) {
   if (!(folder in downloads)) return;
   delete downloads[folder];
+  scheduleFlush();
+}
+/** 单文件被删后只清这一格；整目录空了就把目录条目一起删掉 */
+function forgetDownload(folder, file) {
+  const rec = downloads[folder];
+  if (!rec || !(file in rec)) return;
+  delete rec[file];
+  if (!Object.keys(rec).length) delete downloads[folder];
   scheduleFlush();
 }
 
@@ -659,6 +668,7 @@ app.put('/api/upload/part', gateParts, express.raw({ type: 'application/octet-st
 // 正在拼装中的批次：finish 是逐块删除式的，两次并发 finish 会互相拼坏文件再互相 500，
 // 第二个请求要么等待要么直接拒绝 —— 这里选"在拼的直接 409"，客户端重试会拿到 404/结果
 const assembling = new Set();
+const cancelRequested = new Set();
 
 app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
   const { uploadId } = req.body || {};
@@ -666,7 +676,8 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
   if (!meta) return res.status(404).json({ error: '上传已过期，请重新开始' });
   if (assembling.has(uploadId)) return res.status(409).json({ error: '该批次正在合并中，请勿重复提交' });
   assembling.add(uploadId);
-  const done = () => assembling.delete(uploadId);
+  const done = () => { assembling.delete(uploadId); cancelRequested.delete(uploadId); };
+  let canceled = false;
   const dir = uploadDirOf(uploadId);
   const have = new Set(haveParts(uploadId).map((p) => `${p.f}-${p.c}`));
   const total = meta.files.reduce((s, f) => s + f.chunks.length, 0);
@@ -676,12 +687,15 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
   }
   (async () => {
     try {
+      if (cancelRequested.has(uploadId)) { canceled = true; throw new Error('canceled'); }
       if (usedBytes() >= STORAGE_LIMIT) { done(); return tooLarge(res); } // 落盘前再确认一次，别把上限撑破
       for (let fi = 0; fi < meta.files.length; fi++) {
+        if (cancelRequested.has(uploadId)) { canceled = true; throw new Error('canceled'); }
         const f = meta.files[fi];
         const out = path.join(dir, `${f.enc}.assembling`);
         fs.rmSync(out, { force: true }); // 上次拼一半的残骸不能拿来追加
         for (let ci = 0; ci < f.chunks.length; ci++) {
+          if (cancelRequested.has(uploadId)) { canceled = true; throw new Error('canceled'); }
           const part = path.join(dir, `part-${fi}-${ci}.bin`);
           await pipeline(fs.createReadStream(part), fs.createWriteStream(out, { flags: 'a' }));
           fs.rmSync(part, { force: true }); // 拼一块删一块，峰值不翻倍
@@ -746,7 +760,8 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
         indexed,
       });
     } catch (err) {
-      console.error('[上传] 合并分块失败', err);
+      const wasCanceled = canceled || cancelRequested.has(uploadId);
+      if (!wasCanceled) console.error('[上传] 合并分块失败', err);
       // 块已经边拼边删了，这个批次不可能再"续"：整批丢掉，让下次从头来。
       // 留着只会留下拼一半的文件，下次追加拼接就成了坏文件
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 删不掉也得先回复客户端 */ }
@@ -755,10 +770,66 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
       try {
         // 详情（含绝对路径的 err.message）只进日志：这条响应是给浏览器看的，
         // 匿名请求不该知道服务装在哪个目录（审计里 enc="a.enc:" 就把它骗出来过）
-        if (!res.headersSent) res.status(500).json({ error: '合并分块失败，请重新上传这一批' });
+        if (!res.headersSent) {
+          res.status(wasCanceled ? 409 : 500).json({
+            error: wasCanceled ? '合并已取消' : '合并分块失败，请重新上传这一批',
+          });
+        }
       } catch { /* 连接已经断了，没什么可做的 */ }
     }
   })().catch((err) => console.error('[上传] 收尾流程异常', err));
+});
+
+// ---- 未完成的上传批次：给任务中心在刷新后恢复 / 清理用，不返回真实文件名 ----
+function uploadStagingList() {
+  let entries;
+  try { entries = fs.readdirSync(STAGING_DIR, { withFileTypes: true }); } catch { return []; }
+  const out = [];
+  for (const d of entries) {
+    if (!d.isDirectory() || !isUploadId(d.name)) continue;
+    const meta = readMeta(d.name);
+    if (!meta) continue;
+    const files = Array.isArray(meta.files) ? meta.files : [];
+    const totalChunks = files.reduce((s, f) => s + (Array.isArray(f.chunks) ? f.chunks.length : 0), 0);
+    const bytes = files.reduce((s, f) => s + (Array.isArray(f.chunks) ? f.chunks.reduce((a, b) => a + b, 0) : 0), 0);
+    let updatedAt = Date.now();
+    try { updatedAt = fs.statSync(uploadDirOf(d.name)).mtimeMs; } catch { /* 刚被清掉 */ }
+    out.push({
+      uploadId: d.name,
+      fileCount: files.length,
+      totalChunks,
+      receivedChunks: haveParts(d.name).length,
+      bytes,
+      updatedAt,
+      folderId: meta.folderId || null,
+      ttlHours: Number.isFinite(meta.ttlHours) ? meta.ttlHours : null,
+    });
+  }
+  return out.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+app.get('/api/uploads', (req, res) => {
+  res.json({ uploads: uploadStagingList() });
+});
+
+app.delete('/api/uploads/:id', (req, res) => {
+  const id = req.params.id;
+  if (!isUploadId(id)) return res.status(400).json({ error: '批次标识不合法' });
+  if (assembling.has(id)) {
+    cancelRequested.add(id);
+    return res.status(202).json({ ok: true, canceling: true });
+  }
+  const dir = uploadDirOf(id);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: '上传不存在' });
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    console.error('[上传] 清理暂存失败', err.code, id.slice(0, 8));
+    return res.status(500).json({ error: '清理失败' });
+  }
+  cancelRequested.delete(id);
+  forgetUsage();
+  res.json({ ok: true });
 });
 
 // ---- 文件列表（旧页面 / 旧缓存兼容：按时间倒序） ----
@@ -847,6 +918,163 @@ app.patch('/api/batches/:batch', requireLibrary, express.json({ limit: '64kb' })
   res.json({ ok: true, ...out });
 }));
 
+// ---- 单文件删除 / 重命名：清单由客户端重写，服务端只做原子替换与哈希校验 ----
+function readManifestBytes(dir) {
+  const p = path.join(dir, MANIFEST);
+  try {
+    const st = fs.lstatSync(p);
+    if (!st.isFile()) return null; // 链接 / 目录都不当清单
+    return fs.readFileSync(p);
+  } catch { return null; }
+}
+
+function hashBytes(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+function writeManifestAtomic(dir, buf) {
+  const p = path.join(dir, MANIFEST);
+  try {
+    if (fs.lstatSync(p).isSymbolicLink()) {
+      const err = new Error('清单是链接，拒绝写入');
+      err.code = 'SYMLINK';
+      throw err;
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  fs.mkdirSync(STAGING_DIR, { recursive: true });
+  const tmp = path.join(STAGING_DIR, `manifest-${crypto.randomBytes(6).toString('hex')}.tmp`);
+  fs.writeFileSync(tmp, buf);
+  try {
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    if (err.code !== 'EXDEV') throw err;
+    // 暂存区与 uploads 不在同一个盘时退化为批内临时名；仍是先写完再改名
+    const local = `${p}.tmp`;
+    fs.writeFileSync(local, buf);
+    fs.renameSync(local, p);
+  }
+}
+
+function decodeManifestBase64(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  const buf = Buffer.from(value, 'base64');
+  return buf.length && buf.length <= MAX_MANIFEST ? buf : null;
+}
+
+app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
+  const batch = req.params.batch;
+  if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
+  const dir = resolveFolder(batch);
+  if (!dir) return res.status(404).json({ error: '批次不存在' });
+  const data = parseBody(res, schemas.fileDelete, req.body);
+  if (!data) return;
+  const file = data.file;
+  if (file === MANIFEST || safeName(file) !== file) {
+    return res.status(400).json({ error: '文件名不合法' });
+  }
+
+  const current = readManifestBytes(dir);
+  if (data.expectedManifestHash) {
+    if (!current || hashBytes(current) !== data.expectedManifestHash) {
+      return res.status(409).json({ error: '清单已变化，请重新加载后重试' });
+    }
+  }
+
+  let nextManifest = null;
+  if (data.manifest) {
+    nextManifest = decodeManifestBase64(data.manifest);
+    if (!nextManifest) return res.status(400).json({ error: '更新后的加密清单不合法或过大' });
+  } else if (current) {
+    return res.status(400).json({ error: '需要同时提交更新后的加密清单' });
+  }
+
+  if (nextManifest) {
+    try {
+      writeManifestAtomic(dir, nextManifest);
+    } catch (err) {
+      console.error('[文件删除] 清单写入失败', err.code || err.message);
+      return res.status(500).json({ error: '清单写入失败' });
+    }
+    if (libraryReady) {
+      try { await library.setBatchHash(batch, hashBytes(nextManifest)); }
+      catch (err) { console.error('[目录索引] 清单摘要更新失败', err.code || err.message); }
+    }
+  }
+
+  const fp = resolveFile(dir, file);
+  if (fp) {
+    try {
+      fs.rmSync(fp, { force: true });
+    } catch (err) {
+      console.error('[文件删除] 删除失败', err.code, file);
+      return res.status(500).json({ error: '删除失败' });
+    }
+  }
+  forgetDownload(batch, file);
+
+  let remaining;
+  try {
+    remaining = fs.readdirSync(dir).filter((name) => name !== MANIFEST);
+  } catch {
+    return res.status(500).json({ error: '读取目录失败' });
+  }
+  if (!remaining.length) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      console.error('[文件删除] 清理空批次失败', err.code || err.message);
+      return res.status(500).json({ error: '清理空批次失败' });
+    }
+    forgetDownloads(batch);
+    forgetUsage();
+    if (libraryReady) {
+      try { await library.removeBatch(batch); }
+      catch (err) { console.error('[目录索引] 批次清理失败', err.code || err.message); }
+    }
+    return res.json({ ok: true, batchRemoved: true });
+  }
+  forgetUsage();
+  res.json({ ok: true, batchRemoved: false });
+}));
+
+app.post('/api/batches/:batch/file-rename', express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
+  const batch = req.params.batch;
+  if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
+  const dir = resolveFolder(batch);
+  if (!dir) return res.status(404).json({ error: '批次不存在' });
+  const data = parseBody(res, schemas.fileRename, req.body);
+  if (!data) return;
+  const file = data.file;
+  if (file === MANIFEST || safeName(file) !== file) {
+    return res.status(400).json({ error: '文件名不合法' });
+  }
+  if (!resolveFile(dir, file)) return res.status(404).json({ error: '文件不存在' });
+
+  const current = readManifestBytes(dir);
+  if (!current) return res.status(400).json({ error: '旧数据没有加密清单，不能重命名' });
+  if (hashBytes(current) !== data.expectedManifestHash) {
+    return res.status(409).json({ error: '清单已变化，请重新加载后重试' });
+  }
+  const nextManifest = decodeManifestBase64(data.manifest);
+  if (!nextManifest) return res.status(400).json({ error: '更新后的加密清单不合法或过大' });
+
+  try {
+    writeManifestAtomic(dir, nextManifest);
+  } catch (err) {
+    console.error('[文件重命名] 清单写入失败', err.code || err.message);
+    return res.status(500).json({ error: '清单写入失败' });
+  }
+  if (libraryReady) {
+    try { await library.setBatchHash(batch, hashBytes(nextManifest)); }
+    catch (err) { console.error('[目录索引] 清单摘要更新失败', err.code || err.message); }
+  }
+  forgetUsage();
+  res.json({ ok: true });
+}));
+
 // ---- 删除整个批次（谨慎操作：前端有确认弹层） ----
 // 只删"本服务自己按日期_时间建出来的真实目录"：名字形状 + lstat 真目录 + realpath 仍在 uploads 内，
 // 三道一起过。少任何一道都会留下口子（字符串前缀比较挡不住指向界外的链接）。
@@ -894,13 +1122,52 @@ app.delete('/api/folder/:folder', asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ---- 下载单个文件（密文，前端收到后自动解密） ----
+// ---- 下载单个文件（密文，前端收到后自动解密；支持 Range 续传） ----
 app.get('/api/download/:folder/:file', (req, res) => {
   const folderReal = resolveFolder(req.params.folder);
   const fp = resolveFile(folderReal, req.params.file);
   if (!fp) return res.status(404).json({ error: '文件不存在' }); // 不区分"名字不合法/不在界内/不存在"，不给探测者反馈
-  countDownload(path.basename(folderReal), path.basename(fp)); // 走到这里才算是"开始吐字节"
-  res.download(fp, path.basename(fp));
+  const folderName = path.basename(folderReal);
+  const fileName = path.basename(fp);
+  res.setHeader('Accept-Ranges', 'bytes');
+
+  const range = req.headers.range;
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range));
+    if (m && (m[1] !== '' || m[2] !== '')) {
+      let stat;
+      try { stat = fs.statSync(fp); } catch { return res.status(404).json({ error: '文件不存在' }); }
+      let start = m[1] === '' ? null : Number(m[1]);
+      let end = m[2] === '' ? null : Number(m[2]);
+      if (start === null) {
+        start = Math.max(0, stat.size - end);
+        end = stat.size - 1;
+      } else if (end === null || end >= stat.size) {
+        end = stat.size - 1;
+      }
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end || start >= stat.size) {
+        res.status(416).setHeader('Content-Range', `bytes */${stat.size}`);
+        return res.end();
+      }
+      // 续传请求（起点 > 0）不重复计下载次数；只有真正从头取才 +1
+      if (start === 0) countDownload(folderName, fileName);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+      const stream = fs.createReadStream(fp, { start, end });
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(500).end();
+        else res.destroy();
+      });
+      stream.pipe(res);
+      return;
+    }
+  }
+
+  countDownload(folderName, fileName); // 走到这里才算是"开始吐字节"
+  res.download(fp, fileName);
 });
 
 // ---- 归档下载：把整个目录的密文拼成一条流（纯聚合，不压缩） ----
