@@ -134,6 +134,29 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await parent.locator('.col-more').click();
     const folderMenu = await page.locator('.context-menu .menu-item').allInnerTexts();
     assert.ok(folderMenu.includes('重命名') && folderMenu.includes('删除文件夹') && folderMenu.includes('复制文件夹链接'));
+
+    // 自绘右键菜单拿不到 Reka 的 data-highlighted，三态必须自己画：hover 变底色、删除标红、禁用不亮
+    const bg = (loc) => loc.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const fg = (loc) => loc.evaluate((el) => getComputedStyle(el).color);
+    const renameItem = page.locator('.context-menu .menu-item', { hasText: '重命名' });
+    const dangerItem = page.locator('.context-menu .menu-item.danger');
+    assert.strictEqual(await dangerItem.count(), 1, '目录菜单里没有唯一那颗删除项');
+    const idleBg = await bg(renameItem);
+    assert.notStrictEqual(await fg(dangerItem), await fg(renameItem), '删除项文字色和普通项一样，没标红');
+    await renameItem.hover();
+    const hoverBg = await bg(renameItem);
+    assert.notStrictEqual(hoverBg, idleBg, `菜单项 hover 没有反馈：底色前后都是 ${idleBg}`);
+    await dangerItem.hover();
+    assert.notStrictEqual(await bg(dangerItem), idleBg, '删除项 hover 没画底色');
+    await page.keyboard.press('Escape');
+
+    // 禁用项不许被 hover 点亮（Chromium 对 disabled 按钮照样算 :hover）
+    await page.locator('.column').first().locator('.folder-row', { hasText: '未分档' }).locator('.col-more').click();
+    const offItem = page.locator('.context-menu .menu-item[disabled]');
+    assert.strictEqual(await offItem.count(), 1, '未分档菜单里该有那颗禁用的删除项');
+    const offIdle = await bg(offItem);
+    await offItem.hover();
+    assert.strictEqual(await bg(offItem), offIdle, `禁用项被 hover 点亮了：${offIdle} → ${await bg(offItem)}`);
     await page.keyboard.press('Escape');
 
     // 分享链接改名后仍指向同一个目录 ID

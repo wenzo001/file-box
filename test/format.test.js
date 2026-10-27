@@ -56,6 +56,16 @@ test('删掉的那套重复导航不许长回来：App.vue 与 app.css 里不许
   }
 });
 
+test('右键菜单三态与触摸档 44pt 必须在 CSS 里真声明（静态守机制）', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css'), 'utf8');
+  const coarse = (css.match(/@media \(pointer: coarse\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
+  assert.ok(coarse.length > 0, '一条 pointer:coarse 规则都没扫到，说明扫描器瞎了');
+  assert.match(coarse, /\.context-menu \.menu-item \{[^}]*min-height:\s*44px/, '触摸档没给右键菜单项 44pt 目标');
+  assert.match(css, /\.context-menu \.menu-item:hover:not\(:disabled\)/, '右键菜单项没有 hover 规则');
+  assert.match(css, /\.context-menu \.menu-item:active:not\(:disabled\)/, '右键菜单项没有按下态');
+  assert.match(css, /\.context-menu \.menu-item:disabled/, '右键菜单项没有禁用态');
+});
+
 test('到期状态类不许复用元素名：CSS 里任何 display:none 的规则都不能点到它', async () => {
   // 事故口径：状态类曾返回裸 'expiry'，被旧表格的窄屏规则 .file-row > .expiry 命中，
   // 第三行（倒计时）在手机上去掉——文字判据抓不到，只有量渲染几何才看得见。

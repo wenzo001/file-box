@@ -668,6 +668,16 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   border: 0;
   background: transparent;
 }
+/* Reka 那套菜单靠 [data-highlighted] 画悬停；自绘右键菜单没有这个属性，三态得自己写 */
+.context-menu .menu-item:hover:not(:disabled),
+.context-menu .menu-item:focus-visible { background: var(--fill); color: var(--text); }
+.context-menu .menu-item:active:not(:disabled) { background: var(--fill2); }
+.context-menu .menu-item.danger { color: var(--red); }
+.context-menu .menu-item.danger:hover:not(:disabled),
+.context-menu .menu-item.danger:focus-visible {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
 .context-menu .menu-item:disabled { opacity: 0.45; cursor: not-allowed; }
 .char-count { margin-top: 5px; color: var(--text2); font-size: 11px; text-align: right; }
 .char-count.over { color: var(--red); }
@@ -698,4 +708,5 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .col-more { opacity: 1; width: 44px; height: 44px; }
   .col-icon { width: 44px; height: 44px; }
   .col-tools { gap: 0; }
+  .context-menu .menu-item { min-height: 44px; }
 }
