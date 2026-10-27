@@ -1249,9 +1249,14 @@ transferApi.bootReclaim();
 // ---- 前端静态页 ----
 // ---- 前端静态页（Vue + Vite 构建产物） ----
 // 源码在 web/，public/ 只放静态源；构建后 dist-web/ 由 Express 直接托管。
-if (!fs.existsSync(path.join(__dirname, 'dist-web', 'index.html'))) {
-  console.warn('[前端] dist-web/index.html 不存在：先 npm run build；当前根页面会 404');
+const FRONT_INDEX = path.join(__dirname, 'dist-web', 'index.html');
+if (!fs.existsSync(FRONT_INDEX)) {
+  console.warn('[前端] dist-web/index.html 不存在：先 npm run setup（或 npm run build）');
 }
+app.get(['/', '/index.html'], (req, res, next) => {
+  if (fs.existsSync(FRONT_INDEX)) return next();
+  res.status(503).type('text').send('前端尚未构建：先运行 npm run setup（或 npm run build）');
+});
 app.use(express.static(path.join(__dirname, 'dist-web')));
 // 旧 /next 书签跳回根（相对路径，兼容反向代理子路径部署）
 app.get(/^\/next(?:\/.*)?$/, (req, res) => res.redirect('../'));

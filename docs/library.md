@@ -88,12 +88,14 @@ uploads/20261027_1431/          ← 批次目录（日期名，路径闸门仍�
 ## 7 构建与部署
 
 ```bash
-npm install
+npm run setup      # 安装前后端依赖 + 构建 dist-web
 npm run dev        # Vite 5173；另开 npm run dev:server 提供 API
-npm run build      # 生成 dist-web/
 npm start          # Express 托管 /api + dist-web
-npm run pack       # 先 build，再出自包含 tar 包
+npm run release    # setup（安装 + build）+ 自包含 tar 包
+npm run pack       # 依赖已装好时只 build + 出包
 ```
+
+完整的生产部署、备份、升级/回滚、反代与排障见 [`deploy.md`](deploy.md)。
 
 - 源码：`web/`（Vue 3 + Vite 6 + Reka UI + VueUse + SortableJS + fflate + Lucide）。
 - 静态源：`public/`（`crypto.js` / `dec-worker.js` / `transfer.html` / `xfer-*.js` / `progress-strip.css`）。

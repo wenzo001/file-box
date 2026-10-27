@@ -65,16 +65,16 @@
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
-npm install
+# 一条命令：Node 检查 + 安装前后端依赖 + 构建 dist-web
+npm run setup
 
-# 2. 构建前端（Vue + Vite，产物在 dist-web/）
-npm run build
-
-# 3. 启动（Express 同时托管 /api 与 dist-web）
+# 启动（Express 同时托管 /api 与 dist-web）
 npm start
 # 或 node server.js
 ```
+
+> 前端没有单独的 `package.json` / 安装命令；根目录一次安装同时覆盖后端运行时和前端构建依赖。
+> 完整部署、备份、升级、反代与排障见 [`docs/deploy.md`](docs/deploy.md)。
 
 启动后浏览器访问：`http://服务器IP:3000`（也支持 `https://服务器IP:3443`，见下文「HTTP 与 HTTPS」）。
 `npm start` 前必须先 `npm run build`；没构建时启动日志会提示，根页面会 404。
@@ -95,10 +95,17 @@ npm run build
 ## 打包（出自包含发布产物）
 
 ```bash
+# 首次 / 依赖变化后：安装 + 构建 + 出包，一条命令
+npm run release
+
+# 依赖已装好、只改了代码：build + 出包
 npm run pack
+
 # 产物：dist/file-box-1.0.0.tar.gz（大小与文件数见打包输出）
 #      dist/file-box/                同内容的目录，可直接跑
 ```
+
+`npm run release` 等价于 `npm run setup` + `node scripts/pack.js`；目标机拿到 tar 包后**不需要 `npm install`、不需要 build**。
 
 **这个包是自包含的**：生产依赖已按 `package-lock.json` 的生产闭包一起打进去，
 服务器上**不需要再 `npm install`**，解压就能启动。（只有一个是例外：Node.js 运行时本身不在包里，
@@ -127,9 +134,11 @@ npm run pack
 
 ## 生产部署（跑 dist）
 
+完整步骤（含一键脚本、备份、升级/回滚、反向代理、排障）见 [`docs/deploy.md`](docs/deploy.md)。最短路径：
+
 ```bash
 # 1. 本地打包并传到服务器
-npm run pack
+npm run release
 scp dist/file-box-1.0.0.tar.gz user@server:/tmp/
 
 # 2. 服务器上解压到部署目录（不需要 npm install）
@@ -310,10 +319,11 @@ pm2 save
 
 ```bash
 git pull                # 拉取最新代码
-npm install             # 如有新依赖（构建需要 devDependencies）
-npm run build           # 重新生成 dist-web/
+npm run setup           # 安装前后端依赖 + 重新生成 dist-web/
 pm2 restart file-box    # 重启生效
 ```
+
+只改了前端也可以 `npm run build`；用发布包部署则不需要 build / install。
 
 用上面的 dist 发布包部署，则见「升级与回滚」。
 
