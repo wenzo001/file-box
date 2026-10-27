@@ -49,7 +49,9 @@ button, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 a { color: var(--accent); }
 
-.app { min-height: 100vh; }
+/* 100vh 在 iOS Safari 上是"地址栏收起后"的高度，实际可视区更矮 ⇒ 卡片底会被推到屏外；
+   所以每条 vh 都紧跟一条 dvh 覆盖，老浏览器自动退回上一行 */
+.app { min-height: 100vh; min-height: 100dvh; }
 
 /* ---- 顶栏 ---- */
 .topbar {
@@ -60,6 +62,9 @@ a { color: var(--accent); }
   align-items: center;
   gap: 10px;
   padding: 10px 18px;
+  /* 页面开了 viewport-fit=cover，刘海会让内容压到屏幕上缘；下缘的 home 指示条不属于顶栏，交给 .main 让开 */
+  padding-top: calc(10px + env(safe-area-inset-top));
+  padding-bottom: 10px;
   background: var(--hdr);
   backdrop-filter: saturate(180%) blur(18px);
   -webkit-backdrop-filter: saturate(180%) blur(18px);
@@ -108,7 +113,8 @@ a { color: var(--accent); }
   height: 36px;
   border-radius: 9px;
   background: var(--fill);
-  color: var(--text3);
+  /* 占位符原本 3.33:1，手机上几乎看不清"这里能搜什么" */
+  color: var(--text2);
 }
 .search input {
   border: 0;
@@ -116,11 +122,15 @@ a { color: var(--accent); }
   background: transparent;
   width: 100%;
   min-width: 0;
+  /* iOS 聚焦 font-size<16px 的输入框会强制放大整页且回不去 */
+  font-size: 16px;
 }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; }
 .topbar-usage { color: var(--text3); font-size: 12px; white-space: nowrap; }
 .upload-group { display: flex; align-items: center; gap: 0; }
 .upload-group .btn-primary { border-radius: 9px 0 0 9px; }
+/* 上传按钮的目的地、传输页链接在窄屏会各自撑出一行；短标签只说动作，目的地由面包屑和工具行说清楚 */
+.lbl-short { display: none; }
 .ttl {
   height: 36px;
   border: 1px solid var(--sep);
@@ -187,9 +197,11 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 
 /* ---- 布局 ---- */
 /* 导航只留一套（分栏 + 顶部面包屑）：这里不再有第二棵目录树，容量读数搬到顶栏 */
-.layout { min-height: calc(100vh - 110px); }
+.layout { min-height: calc(100vh - 110px); min-height: calc(100dvh - 110px); }
 
-.main { position: relative; padding: 16px 18px 40px; min-width: 0; }
+.main { position: relative; padding: 16px 18px calc(40px + env(safe-area-inset-bottom)); min-width: 0; }
+/* 顶栏是 sticky 的：整页滚到视口里的那一行/那颗按钮，若不给自己让出一顶栏的高度，就会被它盖住点不到 */
+.col-row, .col-head, .task { scroll-margin-top: calc(56px + env(safe-area-inset-top)); }
 .drop-overlay {
   position: fixed;
   inset: 0;
@@ -381,7 +393,9 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 28px;
+  /* toast 只是播报，不许吃掉底下那一行的点击（窄屏上它正好压在列表最后一行） */
+  pointer-events: none;
+  bottom: calc(28px + env(safe-area-inset-bottom));
   z-index: 70;
   transform: translateX(-50%);
   max-width: calc(100vw - 32px);
@@ -442,9 +456,11 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .config-icon { color: var(--accent); flex: none; }
 .config-label { color: var(--text); font-weight: 600; }
-.config-hint { color: var(--text2); font-size: 12px; }
+/* 配置说明在浅蓝色条上原本只有 4.12:1，小字读不清；压深到 ≥4.5 */
+.config-hint { color: color-mix(in srgb, var(--text) 22%, var(--text2)); font-size: 12px; }
 .ttl-global {
   height: 34px;
+  font-size: 16px;
   border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--sep));
   border-radius: 8px;
   background: var(--card);
@@ -536,7 +552,10 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .col-row.expiring { background: color-mix(in srgb, var(--red) 9%, transparent); }
 .col-row.expiring .col-name { color: var(--red); }
-.col-row .col-check { grid-column: 1; grid-row: 1 / 4; width: 15px; height: 15px; accent-color: var(--accent); }
+/* 命中区交给外面那层 label（.check-hit），input 只画视觉上的小方框：44 是"点得到"，不是"画 44" */
+.col-check { width: 15px; height: 15px; accent-color: var(--accent); }
+.check-hit { display: inline-grid; place-items: center; flex: none; }
+.col-row .check-hit { grid-column: 1; grid-row: 1 / 4; }
 .col-row .row-icon { grid-column: 2; grid-row: 1 / 4; }
 .col-name {
   grid-column: 3;
@@ -710,7 +729,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 @media (max-width: 560px) {
   .ttl-global { width: 100%; }
   .config-strip .config-label { font-size: 12px; }
-  .columns { --col-w: 88vw; height: calc(100vh - 360px); min-height: 260px; }
+  .columns { --col-w: 88vw; }
   .col-icon { width: 34px; height: 34px; }
 }
 @media (max-width: 560px) {
@@ -725,4 +744,44 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .col-icon { width: 44px; height: 44px; }
   .col-tools { gap: 0; }
   .context-menu .menu-item { min-height: 44px; }
+}
+
+/* ---- 手机档（≤560）：整页走文档流，分栏卡片只给一条高度地板 ----
+   顶栏 + 配置条 + 面包屑 + 工具行在手机上约吃掉 180px，568 高的屏只剩 388 给内容和任务面板。
+   把两者塞进同一屏去 flex 抢高度，实测会把分栏挤到 61px：卡片是 overflow-y:hidden，
+   下面的行既看不见也滚不到，等于永久裁掉。所以这里不抢屏——卡片至少 280px，
+   一屏装不下就交给页面滚，任务面板跟在卡片下面。 */
+@media (max-width: 560px) {
+  /* 顶栏在手机上原本要 3～4 行、约 200px；继续 sticky 就永久吃掉三分之一屏。
+     改成随页面滚走，并把面包屑、搜索各给一行，动作按钮跟着品牌挤在第一行。 */
+  .topbar { position: static; gap: 6px 8px; padding: 8px 10px; }
+  .brand { font-size: 16px; }
+  .topbar-usage { display: none; }
+  .lbl-full { display: none; }
+  .lbl-short { display: inline; }
+  .toolbar-actions { order: 1; flex: 0 1 auto; min-width: 0; margin-left: auto; }
+  .crumb { order: 2; flex: 1 1 100%; overflow: hidden auto; padding: 0; }
+  .search { order: 3; flex: 1 1 100%; height: 44px; min-width: 0; }
+  .layout { min-height: 0; }
+  .main { padding: 10px 10px calc(16px + env(safe-area-inset-bottom)); }
+  .columns { height: calc(100vh - 330px); height: clamp(280px, calc(100dvh - 330px), 640px); min-height: 280px; }
+  .tool-row { flex-wrap: nowrap; gap: 4px; min-height: 44px; margin-bottom: 6px; }
+  .tool-status { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool-count { flex: none; }
+  .tool-actions { flex: none; gap: 0; margin-left: 0; }
+  .tool-btn { width: 44px; height: 44px; justify-content: center; padding: 0; }
+  .tool-btn .tool-label { display: none; }
+  .config-strip { padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
+  .config-hint { flex: 1 1 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+}
+
+/* 复选框是勾选的唯一入口，15px 在手机上点不中：外面那层 label 撑到 44×44 当命中区，原生方框仍画 22px */
+@media (pointer: coarse) {
+  .col-row { grid-template-columns: 44px 22px minmax(0, 1fr) 44px; }
+  .col-row .check-hit { width: 44px; height: 44px; }
+  .col-row .col-check { width: 22px; height: 22px; }
+  /* 栏头的"全选本栏"也是勾选入口，同样要 44 的命中区 */
+  .col-tools .check-hit { width: 44px; height: 44px; }
+  .col-tools .col-check { width: 22px; height: 22px; }
+  .ttl-global { height: 44px; }
 }

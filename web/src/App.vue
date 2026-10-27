@@ -12,7 +12,7 @@ import {
 } from 'reka-ui';
 import {
   ChevronRight, Clock, Download, File, Folder, FolderPlus, HardDrive, Inbox,
-  Link2, ListChecks, Package, Pause, Play, RotateCcw, Search, Trash2, Upload,
+  Link2, ListChecks, Package, Pause, Play, RotateCcw, Search, Trash2, Upload, X,
 } from '@lucide/vue';
 import { api } from './lib/api.js';
 import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from './lib/manifest.js';
@@ -1420,8 +1420,8 @@ onBeforeUnmount(() => {
       </label>
       <div class="toolbar-actions">
         <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB</span>
-        <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> 上传到「{{ uploadTargetLabel }}」</button>
-        <a class="btn" href="../transfer.html">无痕传输</a>
+        <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> <span class="lbl-full">上传到「{{ uploadTargetLabel }}」</span><span class="lbl-short">上传</span></button>
+        <a class="btn" href="../transfer.html"><span class="lbl-full">无痕传输</span><span class="lbl-short">传输</span></a>
       </div>
     </header>
 
@@ -1438,7 +1438,7 @@ onBeforeUnmount(() => {
       >
         <option v-for="h in ttlOptions" :key="h" :value="h">{{ ttlLabel(h) }}后自动删除</option>
       </select>
-      <span class="config-hint" v-if="!libraryNotReady">当前：新上传的文件会在「{{ ttlLabel(settingsTtl) }}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。</span>
+      <span class="config-hint" v-if="!libraryNotReady" :title="`当前：新上传的文件会在「${ttlLabel(settingsTtl)}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。`">当前：新上传的文件会在「{{ ttlLabel(settingsTtl) }}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。</span>
       <span class="config-hint" v-else>目录索引暂不可用，自动删除设置暂时不能修改。</span>
     </div>
 
@@ -1470,11 +1470,21 @@ onBeforeUnmount(() => {
           <span class="tool-status">上传到 <b>{{ uploadTargetLabel }}</b> · {{ uploadTtlText }}<span v-if="filesLoading"> · 正在读取文件名 {{ manifestProgress.done }}/{{ manifestProgress.total }}</span></span>
           <span class="tool-count" :class="{ on: selected.length }">{{ selected.length ? `已选 ${selected.length} 项` : '未选择' }}</span>
           <div class="tool-actions">
-            <button class="linkbtn" @click="toggleAll">全选当前可见</button>
-            <button class="linkbtn" :disabled="!selectedFileCount" @click="copySelectedShare">复制分享链接</button>
-            <button class="linkbtn" :disabled="!selected.length" @click="downloadSelectedZip"><Package :size="15" /> 打包下载</button>
-            <button class="linkbtn danger-text" :disabled="!selected.length" @click="openDeleteSelected">删除</button>
-            <button class="linkbtn" :disabled="!selected.length" @click="selected = []">取消</button>
+            <button class="linkbtn tool-btn" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll">
+              <ListChecks :size="17" aria-hidden="true" /><span class="tool-label">全选当前可见</span>
+            </button>
+            <button class="linkbtn tool-btn" :disabled="!selectedFileCount" title="复制分享链接" aria-label="复制分享链接" @click="copySelectedShare">
+              <Link2 :size="17" aria-hidden="true" /><span class="tool-label">复制分享链接</span>
+            </button>
+            <button class="linkbtn tool-btn" :disabled="!selected.length" title="打包下载" aria-label="打包下载" @click="downloadSelectedZip">
+              <Package :size="17" aria-hidden="true" /><span class="tool-label">打包下载</span>
+            </button>
+            <button class="linkbtn tool-btn danger-text" :disabled="!selected.length" title="删除" aria-label="删除" @click="openDeleteSelected">
+              <Trash2 :size="17" aria-hidden="true" /><span class="tool-label">删除</span>
+            </button>
+            <button class="linkbtn tool-btn" :disabled="!selected.length" title="取消选择" aria-label="取消选择" @click="selected = []">
+              <X :size="17" aria-hidden="true" /><span class="tool-label">取消</span>
+            </button>
           </div>
         </div>
 
@@ -1534,14 +1544,15 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <div class="col-tools">
-                  <input
-                    v-if="col.folders.length || col.files.length"
-                    type="checkbox"
-                    class="col-check"
-                    :checked="allSelectedIn(columnKeys(col))"
-                    :aria-label="`全选 ${colLabel(col)}`"
-                    @change="toggleColumn(col)"
-                  >
+                  <label v-if="col.folders.length || col.files.length" class="check-hit">
+                    <input
+                      type="checkbox"
+                      class="col-check"
+                      :checked="allSelectedIn(columnKeys(col))"
+                      :aria-label="`全选 ${colLabel(col)}`"
+                      @change="toggleColumn(col)"
+                    >
+                  </label>
                   <button
                     v-if="col.folder"
                     class="icon-btn col-icon"
@@ -1586,14 +1597,15 @@ onBeforeUnmount(() => {
                   @click="navigate(folder.id)"
                   @contextmenu.prevent.stop="openFolderMenu($event, folder)"
                 >
-                  <input
-                    type="checkbox"
-                    class="col-check"
-                    :checked="isSelected(`folder:${folder.id}`)"
-                    :aria-label="`选择 ${folder.name}`"
-                    @click.stop
-                    @change="toggleSelect(`folder:${folder.id}`)"
-                  >
+                  <label class="check-hit" @click.stop>
+                    <input
+                      type="checkbox"
+                      class="col-check"
+                      :checked="isSelected(`folder:${folder.id}`)"
+                      :aria-label="`选择 ${folder.name}`"
+                      @change="toggleSelect(`folder:${folder.id}`)"
+                    >
+                  </label>
                   <Folder :size="20" class="row-icon folder-icon" />
                   <span class="col-name" :title="folder.name">{{ folder.name }}
                     <span v-if="folder.system" class="tag">系统</span>
@@ -1622,14 +1634,15 @@ onBeforeUnmount(() => {
                   @dblclick="addDownload(row)"
                   @contextmenu.prevent.stop="openFileMenu($event, row)"
                 >
-                  <input
-                    type="checkbox"
-                    class="col-check"
-                    :checked="isSelected(row.key)"
-                    :aria-label="`选择 ${row.name}`"
-                    @click.stop
-                    @change="toggleSelect(row.key)"
-                  >
+                  <label class="check-hit" @click.stop>
+                    <input
+                      type="checkbox"
+                      class="col-check"
+                      :checked="isSelected(row.key)"
+                      :aria-label="`选择 ${row.name}`"
+                      @change="toggleSelect(row.key)"
+                    >
+                  </label>
                   <File :size="20" class="row-icon file-icon" />
                   <span class="col-name" :title="row.name">{{ row.name }}
                     <span v-if="isHot(row.uploadedAt, now)" class="tag hot">热乎</span>

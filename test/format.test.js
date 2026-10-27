@@ -88,3 +88,22 @@ test('到期状态类不许复用元素名：CSS 里任何 display:none 的规�
   const hits = hiddenIn(css).filter((sel) => /expiry/i.test(sel));
   assert.deepStrictEqual(hits, [], `有隐藏规则点名 expiry 类，状态类会再被布局吃掉:\n${hits.join('\n')}`);
 });
+
+test('手机档守机制：界面层不许钉顶、卡片要有高度地板、44 是命中区不是画出来的框', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css'), 'utf8');
+  const mobile = (css.match(/@media \(max-width: 560px\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
+  assert.ok(mobile.length > 0, '一条 max-width:560 规则都没扫到，说明扫描器瞎了');
+  assert.ok(mobile.includes('position: static'),
+    '手机档没让顶栏随页面滚走：sticky 会把 3～4 行界面层永久压在浏览区头上');
+  assert.match(mobile, /\.columns\s*\{[^}]*min-height:\s*280px/,
+    '手机档分栏卡片没有 280px 高度地板：让卡片和任务面板抢同一屏，实测会被挤到 62px、栏内行永久裁掉');
+  const coarse = (css.match(/@media \(pointer: coarse\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
+  // 两条命中区规则要各自点名：只写 /\.check-hit/ 的话，栏头那条会替行那条背锅（下刀试过，摘掉行那条仍绿）
+  assert.match(coarse, /\.col-row \.check-hit\s*\{[^}]*width:\s*44px/, '触摸档目录行/文件行的勾选入口没有 44 命中区');
+  assert.match(coarse, /\.col-tools \.check-hit\s*\{[^}]*width:\s*44px/, '触摸档栏头「全选本栏」没有 44 命中区');
+  assert.match(coarse, /\.col-row \.col-check\s*\{[^}]*width:\s*22px/,
+    '触摸档原生方框的尺寸变了：44 应该是命中区（外面那层 label），不是把复选框本身画成 44');
+  const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'App.vue'), 'utf8');
+  const wraps = (app.match(/class="check-hit"/g) || []).length;
+  assert.ok(wraps >= 3, `勾选入口的命中区包装层只有 ${wraps} 处，应为 3（栏头全选 / 目录行 / 文件行）`);
+});
