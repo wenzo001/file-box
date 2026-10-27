@@ -1347,18 +1347,16 @@ onBeforeUnmount(() => {
           <button class="linkbtn" @click="dismissShare">关闭</button>
         </div>
 
-        <div class="upload-line">
-          上传到 <b>{{ uploadTargetLabel }}</b> · <span class="muted">{{ uploadTtlText }}</span>
-          <span v-if="filesLoading" class="muted"> · 正在读取文件名 {{ manifestProgress.done }}/{{ manifestProgress.total }}</span>
-        </div>
-
-        <div v-if="selected.length" class="selection-bar">
-          <span>已选 {{ selected.length }} 项</span>
-          <button class="linkbtn" @click="toggleAll">全选当前可见</button>
-          <button class="linkbtn" :disabled="!selectedFileCount" @click="copySelectedShare">复制分享链接</button>
-          <button class="linkbtn" @click="downloadSelectedZip"><Package :size="15" /> 打包下载</button>
-          <button class="linkbtn danger-text" @click="openDeleteSelected">删除</button>
-          <button class="linkbtn" @click="selected = []">取消</button>
+        <div class="tool-row">
+          <span class="tool-status">上传到 <b>{{ uploadTargetLabel }}</b> · {{ uploadTtlText }}<span v-if="filesLoading"> · 正在读取文件名 {{ manifestProgress.done }}/{{ manifestProgress.total }}</span></span>
+          <span class="tool-count" :class="{ on: selected.length }">{{ selected.length ? `已选 ${selected.length} 项` : '未选择' }}</span>
+          <div class="tool-actions">
+            <button class="linkbtn" @click="toggleAll">全选当前可见</button>
+            <button class="linkbtn" :disabled="!selectedFileCount" @click="copySelectedShare">复制分享链接</button>
+            <button class="linkbtn" :disabled="!selected.length" @click="downloadSelectedZip"><Package :size="15" /> 打包下载</button>
+            <button class="linkbtn danger-text" :disabled="!selected.length" @click="openDeleteSelected">删除</button>
+            <button class="linkbtn" :disabled="!selected.length" @click="selected = []">取消</button>
+          </div>
         </div>
 
         <section v-if="searching" class="search-panel">

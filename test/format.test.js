@@ -39,8 +39,9 @@ test('删掉的那套重复导航不许长回来：App.vue 与 app.css 里不许
   const banned = [
     'sidebar', 'side-item', 'side-sep', 'usage-bar', 'usage-text',
     'table-head', 'check-cell', 'row-main', 'folder-main', 'file-main',
+    'selection-bar', 'upload-line',
   ];
-  assert.ok(banned.length >= 10, '名单被删空了，这条判据就成了恒真');
+  assert.ok(banned.length >= 12, '名单被删空了，这条判据就成了恒真');
   const files = [
     ['App.vue', path.join(__dirname, '..', 'web', 'src', 'App.vue')],
     ['app.css', path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css')],

@@ -130,6 +130,25 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.strictEqual(lib.batches[0].ttlHours, 4, '上传没有使用全局 TTL');
     await page.screenshot({ path: SHOT('fb-library-desktop.png'), fullPage: true });
 
+    // 工具行常驻：勾选前后分栏卡片的 y 必须一模一样（旧选中栏一出现就把界面顶下去）
+    const cardY = async () => Math.round((await page.locator('.columns').boundingBox()).y);
+    const toolBtn = (text) => page.locator('.tool-actions .linkbtn', { hasText: text });
+    const yIdle = await cardY();
+    assert.strictEqual(await toolBtn('复制分享链接').isDisabled(), true, '一件没选时「复制分享链接」应不可点');
+    assert.strictEqual(await toolBtn('删除').isDisabled(), true, '一件没选时「删除」应不可点');
+    assert.strictEqual(await toolBtn('全选当前可见').isDisabled(), false, '「全选当前可见」是入口，必须一直可点');
+    assert.strictEqual(await page.locator('.tool-count').innerText(), '未选择');
+    await toolBtn('全选当前可见').click();
+    await page.waitForTimeout(300);
+    const yOn = await cardY();
+    assert.strictEqual(yOn, yIdle, `勾选后界面被顶下去 ${yOn - yIdle}px，工具行不该改变布局`);
+    assert.strictEqual(await toolBtn('复制分享链接').isDisabled(), false, '勾选后「复制分享链接」应可用');
+    assert.match(await page.locator('.tool-count').innerText(), /已选 \d+ 项/);
+    await toolBtn('取消').click();
+    await page.waitForTimeout(250);
+    assert.strictEqual(await page.locator('.tool-count').innerText(), '未选择', '取消后计数没回到「未选择」');
+    assert.strictEqual(await cardY(), yIdle, '取消选择后界面高度回不去');
+
     // 目录「⋯」菜单：重命名 / 删除 / 分享链接都在
     await parent.locator('.col-more').click();
     const folderMenu = await page.locator('.context-menu .menu-item').allInnerTexts();
@@ -217,7 +236,7 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.locator('.file-row .col-check').nth(1).check();
     const [dl2] = await Promise.all([
       page.waitForEvent('download', { timeout: 30000 }),
-      page.locator('.selection-bar .linkbtn', { hasText: '打包下载' }).click(),
+      page.locator('.tool-actions .linkbtn', { hasText: '打包下载' }).click(),
     ]);
     const multi = Object.keys(unzipSync(new Uint8Array(fs.readFileSync(await dl2.path()))));
     assert.ok(multi.filter((n) => !n.endsWith('/')).length >= 2);
