@@ -27,6 +27,9 @@ transfer/
 
 # 下载次数账本（在 uploads 之外，跑起来才生成）
 .stats/
+
+# 目录索引（NeDB，在 uploads 之外，跑起来才生成；随 uploads 一起备份）
+.library/
 .DS_Store
 Thumbs.db
 

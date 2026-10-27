@@ -157,6 +157,19 @@ test('目录子树：空目录检查、递归删目录、路径与高度', async
   assert.strictEqual(await lib.getFolder(a._id), null);
 });
 
+test('递归删目录：多个目录一次删干净，遗留批次归未分档而不是变成孤儿', async () => {
+  const a = await lib.createFolder({ name: '删-A', parentId: null });
+  const b = await lib.createFolder({ name: '删-B', parentId: a._id });
+  await lib.setBatch('20260106_1000', { folderId: b._id, uploadedAt: 1_700_000_000_000 });
+
+  const out = await lib.deleteFolders([a._id, b._id]);
+  assert.strictEqual(out.deleted, 2);
+  assert.strictEqual(await lib.getFolder(a._id), null);
+  assert.strictEqual(await lib.getFolder(b._id), null);
+  assert.strictEqual((await lib.getBatch('20260106_1000')).folderId, null);
+  await lib.removeBatch('20260106_1000');
+});
+
 test('持久化 / 备份 / 损坏恢复：优先主文件，坏文件退 .bak，两个都坏从空库启动', async () => {
   const persistDir = path.join(dir, 'persist');
   const first = await createLibrary({ libraryDir: persistDir, backupDelayMs: 5 }).init();

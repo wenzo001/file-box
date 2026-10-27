@@ -91,18 +91,17 @@ npm start
 
 ```bash
 npm run pack
-# 产物：dist/file-box-1.0.0.tar.gz   1.6 MB（内含 1756 个文件，文件总大小 7.8 MB；
-#      因为小文件多，解压后实际占盘约 12 MB）
+# 产物：dist/file-box-1.0.0.tar.gz（大小与文件数见打包输出）
 #      dist/file-box/                同内容的目录，可直接跑
 ```
 
-**这个包是自包含的**：生产依赖已按 `package-lock.json` 的闭包（91 个包）一起打进去，
+**这个包是自包含的**：生产依赖已按 `package-lock.json` 的生产闭包一起打进去，
 服务器上**不需要再 `npm install`**，解压就能启动。（只有一个是例外：Node.js 运行时本身不在包里，
 目标机仍要有 Node ≥ 18 —— 要连 Node 一起带，就得走容器或单文件打包，那是另一套做法。）
 
 包里只有两类东西：
 
-- 应用文件 8 个 —— `server.js`、`public/`（前端 3 个静态文件）、`package.json`、
+- 应用文件 —— `server.js`、`public/`（旧页面静态文件）、`lib/`、`docs/`、`package.json`、
   `package-lock.json`、`ecosystem.config.js`、`README.md`
 - `node_modules/` —— 生产依赖闭包，按锁文件精确收集
 
@@ -113,13 +112,13 @@ npm run pack
 - dev 依赖，以及 npm 的账本文件与按平台生成的 `.bin` 启动器
 
 > ⚠️ **一个前提**：带 `node_modules` 跨机器跑，成立的条件是依赖全是纯 JS。
-> 当前两个依赖（express / selfsigned）及其 91 个传递依赖都没有原生二进制、
+> 当前生产依赖（express / selfsigned / zod / @seald-io/nedb）及其纯 JS 传递依赖都没有原生二进制、
 > install 脚本或 os/cpu 限定，所以从 Windows 打包带到 Linux 可用 —— 打包脚本每次都会重新检查这一点，
 > 将来若引入了带 `.node` 二进制的依赖，打包会直接失败并提示改在目标系统上打包。
 
-> 本项目前端零构建：`public/` 下的文件由 Express 直出，没有编译/混淆步骤，
-> 改了前端不用重新打包（开发时刷新页面即可）；但**改了 `package.json` 的依赖**，
-> 要先 `npm install` 再 `npm run pack`，包里才是新的依赖。
+> 默认页面 `/` 仍是零构建：`public/` 下的文件由 Express 直出，改了刷新页面即可。
+> 新界面在 `/next/` 用 Vue 3 + Vite 构建（见上文），源码在 `web/`；它还没有进入发布包，切根时再调整打包脚本。
+> **改了 `package.json` 的依赖**，要先 `npm install` 再 `npm run pack`，包里才是新的依赖。
 
 ## 生产部署（跑 dist）
 
@@ -206,6 +205,8 @@ env: {
 > - `PORT`：HTTP 端口，默认 `3000`
 > - `HTTPS_PORT`：HTTPS 端口，默认 `3443`
 > - `STORAGE_LIMIT_GB`：存储总量上限（GB），默认 `10`。达到上限后上传会被拒绝，并提示清理
+> - `LIBRARY_DIR`：目录索引（NeDB）所在目录，默认 `<uploads 父目录>/.library`。**不要放进 uploads**，备份时随 uploads 一起备份
+> - `TTL_SWEEP_MS`：批次 TTL 扫描间隔（毫秒），默认 `60000`
 > - `UPLOAD_TTL_HOURS`：未完成批次（断点续传的暂存）保留小时数，默认 `48`（2 天）。超时自动回收，下次上传从头再来
 > - `TRUST_PROXY`：反向代理部署时设为 `1`（或 Express trust proxy 配置串），`req.ip` 才是真实客户端地址；无痕传输的限流按 IP 记账，不设的话反代后所有用户共享一个桶
 > - `STUN_PORT`：无痕传输内置 STUN 的 UDP 端口，默认 `3478`。**局域网直连靠它**（Chrome 的 host 候选是 mDNS 名，跨机器常常解析不了）。设 `0` 关掉，改用自建 `STUN_URLS`
@@ -266,6 +267,7 @@ server {
 - 页面上传区域会实时显示「已用 / 上限」用量条；接近或达到上限时变红，并提示删除无用文件，此时上传按钮自动禁用
 - **没有全局自动清理**：文件和目录保留到手动删除；需要释放空间时用目录行右侧垃圾桶图标
 - 旧备份 / 长期项目资料不会因为目录名日期老而在启动或上传时被删除
+- 目录索引在 `<uploads 父目录>/.library`（NeDB 的两个数据文件 + `.bak`），随 `uploads` 一起备份；不要放进 `uploads` 内
 
 ### 下载次数
 

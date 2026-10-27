@@ -2,9 +2,12 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 const express = require('express');
 const selfsigned = require('selfsigned');
+const { createLibrary, LibraryError, TTL_HOURS } = require('./lib/library');
+const { folderIdOrUnfiled, ttlHours, schemas } = require('./lib/schemas');
 
 const app = express();
 // 反代部署时设 TRUST_PROXY=1（或 express 支持的 trust proxy 配置串），
@@ -20,6 +23,26 @@ const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;   // HTTPS 端口（�
 const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, 'uploads');
 const STORAGE_LIMIT_GB = Number(process.env.STORAGE_LIMIT_GB) || 10; // 存储总量上限
 const STORAGE_LIMIT = STORAGE_LIMIT_GB * 1024 * 1024 * 1024;
+const LIBRARY_DIR = process.env.LIBRARY_DIR
+  ? path.resolve(process.env.LIBRARY_DIR)
+  : path.join(path.dirname(UPLOAD_DIR), '.library');
+const TTL_SWEEP_MS = Number(process.env.TTL_SWEEP_MS) || 60 * 1000;
+const library = createLibrary({ libraryDir: LIBRARY_DIR, log: console });
+let libraryReady = false;
+
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const requireLibrary = (req, res, next) => {
+  if (!libraryReady) return res.status(503).json({ error: '目录索引暂时不可用，请稍后重试' });
+  next();
+};
+function parseBody(res, schema, body) {
+  const parsed = schema.safeParse(body || {});
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || '请求不合法' });
+    return null;
+  }
+  return parsed.data;
+}
 
 // 加密清单文件名（前端生成；列表计数时排除）
 const MANIFEST = 'manifest.enc';
@@ -375,14 +398,167 @@ const forgetUsage = () => { usageCache.at = 0; }; // 提交/删除后立刻失�
 // 启动回收放在占用统计可用之后（sweepStaging 要调 forgetUsage，提前调会踩到未初始化的缓存）
 reclaimStagingOnBoot();
 
+// ---- 文件库目录索引：磁盘事实 + NeDB 目录树 ----
+const BATCH_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+const FOLDER_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+
+/** 只扫本服务创建的日期批次；文件名/大小来自磁盘，下载次数来自 .stats */
+function scanUploadBatches() {
+  ensureUploadDir();
+  return fs
+    .readdirSync(UPLOAD_DIR, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && isFolderName(d.name))
+    .map((d) => {
+      const dir = path.join(UPLOAD_DIR, d.name);
+      const rec = downloads[d.name] || {};
+      const files = fs
+        .readdirSync(dir)
+        .map((f) => ({ name: f, size: fs.statSync(path.join(dir, f)).size, downloads: rec[f] || 0 }))
+        .sort((a, b) => BATCH_COLLATOR.compare(a.name, b.name));
+      return {
+        name: d.name,
+        count: files.filter((f) => f.name !== MANIFEST).length,
+        size: files.reduce((s, f) => s + f.size, 0),
+        downloads: files.reduce((s, f) => s + f.downloads, 0),
+        files,
+      };
+    })
+    .sort((a, b) => BATCH_COLLATOR.compare(b.name, a.name));
+}
+
+/** 旧批次的展示时间：只用于 uploadedAt 兜底，不参与清理 */
+function batchTime(name) {
+  const m = String(name).match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})/);
+  if (!m) return null;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
+}
+
+/** 物理删除一个批次 + 清下载账本；目录不存在也视为成功（可重试） */
+function deleteBatchPhysical(name) {
+  const dir = resolveFolder(name);
+  if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  forgetDownloads(name);
+  forgetUsage();
+}
+
+async function sweepExpired() {
+  if (!libraryReady) return [];
+  return library.sweepExpired({ deleteBatch: async (name) => deleteBatchPhysical(name) });
+}
+
+async function reconcileLibrary() {
+  if (!libraryReady) return;
+  const docs = await library.allBatches();
+  for (const doc of docs) {
+    if (!resolveFolder(doc._id)) await library.removeBatch(doc._id);
+  }
+}
+
+async function buildLibraryPayload() {
+  const disk = scanUploadBatches();
+  const folderDocs = libraryReady ? await library.allFolders() : [];
+  const batchDocs = libraryReady ? await library.allBatches() : [];
+  const folderMap = new Map(folderDocs.map((f) => [f._id, f]));
+  const metaMap = new Map(batchDocs.map((b) => [b._id, b]));
+
+  const emptySummary = () => ({ count: 0, size: 0, downloads: 0, earliestExpiresAt: null });
+  const summary = new Map([['__unfiled__', emptySummary()]]);
+  for (const f of folderDocs) summary.set(f._id, emptySummary());
+
+  const batches = disk.map((b) => {
+    const meta = metaMap.get(b.name) || null;
+    let folderId = meta?.folderId || null;
+    if (folderId && !folderMap.has(folderId)) folderId = null;
+    const uploadedAt = Number.isFinite(meta?.uploadedAt) ? meta.uploadedAt : batchTime(b.name);
+    const expiresAt = Number.isFinite(meta?.expiresAt) ? meta.expiresAt : null;
+    const ttl = Number.isFinite(meta?.ttlHours) ? meta.ttlHours : null;
+    return {
+      ...b,
+      folderId,
+      uploadedAt,
+      expiresAt,
+      ttlHours: ttl,
+      legacy: !meta || meta.legacy === true,
+    };
+  });
+
+  for (const b of batches) {
+    const add = (id) => {
+      const s = summary.get(id);
+      if (!s) return;
+      s.count += b.count;
+      s.size += b.size;
+      s.downloads += b.downloads;
+      if (b.expiresAt !== null && (s.earliestExpiresAt === null || b.expiresAt < s.earliestExpiresAt)) {
+        s.earliestExpiresAt = b.expiresAt;
+      }
+    };
+    add(b.folderId || '__unfiled__');
+    let parent = b.folderId ? (folderMap.get(b.folderId)?.parentId || null) : null;
+    const seen = new Set();
+    while (parent && !seen.has(parent)) {
+      seen.add(parent);
+      add(parent);
+      parent = folderMap.get(parent)?.parentId || null;
+    }
+  }
+
+  const folders = [
+    {
+      id: '__unfiled__', parentId: null, name: '未分档', system: true,
+      createdAt: null, updatedAt: null, ...summary.get('__unfiled__'),
+    },
+    ...folderDocs.map((f) => ({
+      id: f._id, parentId: f.parentId, name: f.name, system: false,
+      createdAt: f.createdAt, updatedAt: f.updatedAt, ...summary.get(f._id),
+    })),
+  ];
+  folders.sort((a, b) => {
+    if (a.system !== b.system) return a.system ? -1 : 1;
+    return FOLDER_COLLATOR.compare(a.name, b.name);
+  });
+
+  return {
+    now: Date.now(),
+    libraryReady,
+    usage: { used: disk.reduce((s, b) => s + b.size, 0), limit: STORAGE_LIMIT, limitGB: STORAGE_LIMIT_GB },
+    httpsPort: HTTPS_PORT,
+    ttlOptions: TTL_HOURS,
+    folders,
+    batches,
+  };
+}
+
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
-app.post('/api/upload/init', express.json({ limit: '2mb' }), (req, res) => {
+app.post('/api/upload/init', express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
   const { key, files } = req.body || {};
   if (typeof key !== 'string' || !/^[a-f0-9]{16,64}$/.test(key)) {
     return res.status(400).json({ error: '批次标识不合法' });
   }
   const bad = metaProblem(files);
   if (bad) return res.status(400).json({ error: bad });
+
+  let folderId = null;
+  const requestedFolder = req.body.folderId && req.body.folderId !== '__unfiled__';
+  if (req.body.folderId !== undefined && req.body.folderId !== null) {
+    const parsed = folderIdOrUnfiled.safeParse(req.body.folderId);
+    if (!parsed.success) return res.status(400).json({ error: '目录标识不合法' });
+    if (parsed.data && parsed.data !== '__unfiled__' && libraryReady) {
+      if (!(await library.getFolder(parsed.data))) return res.status(404).json({ error: '目录不存在' });
+      folderId = parsed.data;
+    }
+  }
+
+  let ttl = null;
+  if (req.body.ttlHours !== undefined && req.body.ttlHours !== null) {
+    const parsed = ttlHours.safeParse(req.body.ttlHours);
+    if (!parsed.success) return res.status(400).json({ error: '自动删除时长不合法' });
+    ttl = parsed.data;
+  }
+
+  // 每次开始上传前顺手回收到期批次；失败不会影响本次上传
+  if (libraryReady) await sweepExpired();
+
   // 上限要连着「这批声明的字节」一起算：只看到当前占用的话，分块是逐个写进来的，没人拦
   const stagedHere = fs.existsSync(uploadDirOf(key)) ? dirSize(uploadDirOf(key)) : 0;
   const declared = declaredBytes(files);
@@ -396,14 +572,27 @@ app.post('/api/upload/init', express.json({ limit: '2mb' }), (req, res) => {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(`[上传] 批次 ${key.slice(0, 8)} 分块布局变化，重新开始`);
   }
+  const meta = { v: 2, key, files, folderId, ttlHours: ttl };
   if (!sameLayout) {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ v: 1, key, files }));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta));
+  } else if (old.v !== 2 || old.folderId !== folderId || old.ttlHours !== ttl) {
+    // 目标目录 / TTL 改了但分块布局没变：块继续可用，只更新账本
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta));
   }
   const have = sameLayout ? haveParts(key) : [];
   const total = files.reduce((s, f) => s + f.chunks.length, 0);
-  res.json({ ok: true, uploadId: key, have, total, resumed: have.length > 0 });
-});
+  res.json({
+    ok: true,
+    uploadId: key,
+    have,
+    total,
+    resumed: have.length > 0,
+    folderId,
+    ttlHours: ttl,
+    folderMissing: Boolean(requestedFolder && !folderId),
+  });
+}));
 
 // 内存上界：express.raw 是把整块读进内存才交给处理函数的，并发一多就是 N×32MB。
 // 超过上界先挡回去 —— 429 在客户端属于"可重试"，它会退避重传同一块，进度不丢。
@@ -507,8 +696,55 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
       }
       const folder = commitStaging(dir); // 名字 = 完成时刻
       forgetUsage(); // 刚搬进 uploads，缓存里的占用已经不准了
+
+      const uploadedAt = Date.now();
+      const ttl = Number.isFinite(meta.ttlHours) ? meta.ttlHours : null;
+      let targetFolderId = meta.folderId || null;
+      let folderMissing = false;
+      let indexed = false;
+      if (libraryReady) {
+        if (targetFolderId && !(await library.getFolder(targetFolderId))) {
+          targetFolderId = null;
+          folderMissing = true;
+        }
+        let manifestHash = null;
+        try {
+          const manifestPath = path.join(UPLOAD_DIR, folder, MANIFEST);
+          if (fs.existsSync(manifestPath)) {
+            manifestHash = crypto.createHash('sha256').update(fs.readFileSync(manifestPath)).digest('hex');
+          }
+        } catch (err) {
+          console.warn('[目录索引] 清单摘要计算失败', err.code || err.message);
+        }
+        try {
+          await library.setBatch(folder, {
+            folderId: targetFolderId,
+            uploadedAt,
+            ttlHours: ttl,
+            expiresAt: ttl ? uploadedAt + ttl * 3600_000 : null,
+            manifestHash,
+          });
+          indexed = true;
+        } catch (err) {
+          console.error('[目录索引] 批次写入失败', err.code || err.message);
+          targetFolderId = null;
+        }
+      } else if (meta.folderId) {
+        // 索引不可用时不能假装已经归档；文件仍在磁盘，按未分档展示
+        targetFolderId = null;
+        folderMissing = true;
+      }
+
       done();
-      res.json({ ok: true, folder, count: meta.files.filter((f) => f.enc !== MANIFEST).length });
+      res.json({
+        ok: true,
+        folder,
+        count: meta.files.filter((f) => f.enc !== MANIFEST).length,
+        folderId: targetFolderId,
+        expiresAt: indexed && ttl ? uploadedAt + ttl * 3600_000 : null,
+        folderMissing,
+        indexed,
+      });
     } catch (err) {
       console.error('[上传] 合并分块失败', err);
       // 块已经边拼边删了，这个批次不可能再"续"：整批丢掉，让下次从头来。
@@ -525,31 +761,9 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
   })().catch((err) => console.error('[上传] 收尾流程异常', err));
 });
 
-// ---- 文件列表（按时间倒序：新的在前） ----
-// 文件名/大小来自磁盘（密文名）；真实文件名在前端解密 manifest.enc 后还原
+// ---- 文件列表（旧页面 / 旧缓存兼容：按时间倒序） ----
 app.get('/api/list', (req, res) => {
-  ensureUploadDir();
-  const folders = fs
-    .readdirSync(UPLOAD_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && isFolderName(d.name)) // 链接目录与外来目录一律不列（看得见却动不了的界面最容易骗人）
-    .map((d) => {
-      const dir = path.join(UPLOAD_DIR, d.name);
-      const rec = downloads[d.name] || {};
-      const files = fs
-        .readdirSync(dir)
-        .map((f) => ({ name: f, size: fs.statSync(path.join(dir, f)).size, downloads: rec[f] || 0 }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-      return {
-        name: d.name,
-        count: files.filter((f) => f.name !== MANIFEST).length,
-        size: files.reduce((s, f) => s + f.size, 0),
-        // 目录级就按"界面上看得见的这些文件"求和：账本里若有已被移走的文件的残留计数，
-        // 不该让汇总和逐行数字对不上
-        downloads: files.reduce((s, f) => s + f.downloads, 0),
-        files,
-      };
-    })
-    .sort((a, b) => b.name.localeCompare(a.name));
+  const folders = scanUploadBatches();
   const used = folders.reduce((s, f) => s + f.size, 0);
   res.json({
     folders,
@@ -558,25 +772,127 @@ app.get('/api/list', (req, res) => {
   });
 });
 
-// ---- 删除整个目录（谨慎操作：前端有确认弹层） ----
+// ---- 新界面的目录树 + 批次视图 ----
+app.get('/api/library', asyncHandler(async (req, res) => {
+  res.json(await buildLibraryPayload());
+}));
+
+// ---- 目录 CRUD ----
+app.post('/api/folders', requireLibrary, express.json({ limit: '64kb' }), asyncHandler(async (req, res) => {
+  const data = parseBody(res, schemas.folderCreate, req.body);
+  if (!data) return;
+  const folder = await library.createFolder(data);
+  res.json({ ok: true, folder });
+}));
+
+app.patch('/api/folders/:id', requireLibrary, express.json({ limit: '64kb' }), asyncHandler(async (req, res) => {
+  const data = parseBody(res, schemas.folderPatch, req.body);
+  if (!data) return;
+  const folder = data.name !== undefined
+    ? await library.renameFolder(req.params.id, data)
+    : await library.moveFolder(req.params.id, data);
+  res.json({ ok: true, folder });
+}));
+
+app.delete('/api/folders/:id', requireLibrary, asyncHandler(async (req, res) => {
+  if (req.params.id === '__unfiled__') return res.status(400).json({ error: '未分档不能删除' });
+
+  if (req.query.mode === 'empty') {
+    await library.deleteEmptyFolder(req.params.id);
+    return res.json({ ok: true, folders: 1, batches: 0 });
+  }
+
+  const subtree = await library.folderSubtree(req.params.id);
+  const metaByName = new Map((await library.allBatches()).map((b) => [b._id, b]));
+  const failed = [];
+  for (const name of subtree.batches) {
+    const meta = metaByName.get(name);
+    // 快照之后被移到别处的批次不跟着删，避免误删别人刚整理好的文件
+    if (meta && meta.folderId && !subtree.folderIds.includes(meta.folderId)) {
+      failed.push({ name, error: '批次已经移动到别的目录' });
+      continue;
+    }
+    try {
+      deleteBatchPhysical(name);
+      await library.removeBatch(name);
+    } catch (err) {
+      failed.push({ name, error: err.code || '删除失败' });
+    }
+  }
+  if (failed.length) {
+    return res.status(500).json({ error: `有 ${failed.length} 个批次删除失败`, failed });
+  }
+  const deleted = await library.deleteFolders(subtree.folderIds);
+  forgetUsage();
+  res.json({ ok: true, folders: deleted.deleted, batches: subtree.batches.length });
+}));
+
+// ---- 批次整体移动（单条 / 批量） ----
+app.patch('/api/batches', requireLibrary, express.json({ limit: '256kb' }), asyncHandler(async (req, res) => {
+  const data = parseBody(res, schemas.batchBulkMove, req.body);
+  if (!data) return;
+  const missing = data.names.filter((name) => !resolveFolder(name));
+  if (missing.length) return res.status(404).json({ error: `有 ${missing.length} 个批次不存在`, missing });
+  const out = await library.moveBatches(data.names, data.folderId);
+  res.json({ ok: true, ...out });
+}));
+
+app.patch('/api/batches/:batch', requireLibrary, express.json({ limit: '64kb' }), asyncHandler(async (req, res) => {
+  const name = req.params.batch;
+  if (!isFolderName(name)) return res.status(400).json({ error: '批次名不合法' });
+  if (!resolveFolder(name)) return res.status(404).json({ error: '批次不存在' });
+  const data = parseBody(res, schemas.batchMove, req.body);
+  if (!data) return;
+  const out = await library.moveBatches([name], data.folderId);
+  res.json({ ok: true, ...out });
+}));
+
+// ---- 删除整个批次（谨慎操作：前端有确认弹层） ----
 // 只删"本服务自己按日期_时间建出来的真实目录"：名字形状 + lstat 真目录 + realpath 仍在 uploads 内，
 // 三道一起过。少任何一道都会留下口子（字符串前缀比较挡不住指向界外的链接）。
-app.delete('/api/folder/:folder', (req, res) => {
-  if (!isFolderName(req.params.folder)) return res.status(400).json({ error: '目录名无效' });
-  const dir = resolveFolder(req.params.folder);
+app.delete('/api/folder/:folder', asyncHandler(async (req, res) => {
+  const name = req.params.folder;
+  if (!isFolderName(name)) return res.status(400).json({ error: '目录名无效' });
+
+  const rawExpect = req.query.expectFolder;
+  let expected;
+  if (rawExpect !== undefined) {
+    if (rawExpect === '__unfiled__' || rawExpect === '') expected = null;
+    else {
+      const parsed = folderIdOrUnfiled.safeParse(rawExpect);
+      if (!parsed.success) return res.status(400).json({ error: '目录标识不合法' });
+      expected = parsed.data;
+    }
+    if (!libraryReady) return res.status(503).json({ error: '目录索引暂时不可用，无法校验批次归属' });
+    const meta = await library.getBatch(name);
+    const actual = meta?.folderId || null;
+    if (actual !== expected) return res.status(409).json({ error: '批次已经移动到别的目录' });
+  }
+
+  const dir = resolveFolder(name);
   // 名字形状对但"不是本服务建的真目录"（链接、界外、已被清理、压根没有）统一按不存在回，
   // 不给探测者区分"这里有链接"的反馈
-  if (!dir) return res.status(404).json({ error: '目录不存在' });
+  if (!dir) {
+    if (libraryReady) {
+      try { await library.removeBatch(name); } catch (err) { console.error('[目录索引] 清理失败', err.code || err.message); }
+    }
+    forgetDownloads(name);
+    forgetUsage();
+    return res.status(404).json({ error: '目录不存在' });
+  }
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
-    console.error('[删除] 失败', err.code, req.params.folder);
+    console.error('[删除] 失败', err.code, name);
     return res.status(500).json({ error: '删除失败' });
   }
   forgetUsage(); // 腾出的空间要立刻反映到上限判断上
-  forgetDownloads(path.basename(dir));
+  forgetDownloads(name);
+  if (libraryReady) {
+    try { await library.removeBatch(name); } catch (err) { console.error('[目录索引] 清理失败', err.code || err.message); }
+  }
   res.json({ ok: true });
-});
+}));
 
 // ---- 下载单个文件（密文，前端收到后自动解密） ----
 app.get('/api/download/:folder/:file', (req, res) => {
@@ -675,6 +991,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ---- 统一错误处理 ----
 app.use((err, req, res, next) => {
   if (!err) return next();
+  if (err instanceof LibraryError) {
+    return res.status(err.status || 400).json({ error: err.message, code: err.code });
+  }
   console.error(err);
   // err.expose 是 express / body-parser 给"可以说给客户端的那类错"打的标（400 那一族）。
   // 没这个标的（fs 抛的、我们自己 throw 的）一律换成固定话术：绝对路径与底层错误码不外说。
@@ -688,12 +1007,28 @@ app.use((err, req, res, next) => {
 
 // ---- 双端口启动：HTTP 可直接用；HTTPS 更优（传输层加密 + 原生加密引擎） ----
 (async () => {
+  try {
+    await library.init();
+    libraryReady = true;
+  } catch (err) {
+    libraryReady = false;
+    console.error('[目录索引] 初始化失败，按未分档模式运行', err.code || err.message);
+  }
+  if (libraryReady) {
+    try { await reconcileLibrary(); } catch (err) { console.error('[目录索引] 启动对账失败', err.code || err.message); }
+    try { await sweepExpired(); } catch (err) { console.error('[目录索引] 启动 TTL 扫描失败', err.code || err.message); }
+    setInterval(() => {
+      sweepExpired().catch((err) => console.error('[目录索引] TTL 扫描失败', err.code || err.message));
+    }, TTL_SWEEP_MS).unref();
+  }
+
   const cert = await ensureCert();
   https.createServer(cert, app).listen(HTTPS_PORT, () => {
     console.log(`file-box 已启动`);
     console.log(`  HTTP : http://localhost:${PORT}`);
     console.log(`  HTTPS: https://localhost:${HTTPS_PORT}（推荐，首次访问需信任自签证书一次）`);
     console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB；没有全局自动清理，文件保留到手动删除）`);
+    console.log(`目录索引: ${LIBRARY_DIR}${libraryReady ? '' : '（不可用，按未分档运行）'}`);
     console.log('文件在浏览器内端到端加密后上传，服务器磁盘只保存密文');
   });
   http.createServer(app).listen(PORT);

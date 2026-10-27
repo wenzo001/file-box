@@ -57,6 +57,8 @@ async function boot(dir, PORT, extra) {
     UPLOAD_DIR: path.join(dir, 'uploads'),
     STAGING_DIR: path.join(dir, 'uploading'),
     TRANSFER_DIR: path.join(dir, 'transfer'),
+    LIBRARY_DIR: path.join(dir, 'library'),
+    TTL_SWEEP_MS: '60000',
     STORAGE_LIMIT_GB: '1',
     // 每个测试进程都去抢同一个 UDP 3478 没有意义（也没法并行跑）。默认关掉内置 STUN，
     // 只有 stun / 配置相关的腿自己显式指定端口。
@@ -110,12 +112,13 @@ const jget = async (url, opt) => {
   return { status: res.status, body };
 };
 
-/** 走完整的分块上传：密文内容由 cipher(fileIdx,chunkIdx,len) 决定，与真实前端一致 */
-async function uploadBundle(srv, key, files) {
+/** 走完整的分块上传：密文内容由 cipher(fileIdx,chunkIdx,len) 决定，与真实前端一致。
+ *  extra 用于目录 / TTL 等新字段（如 { folderId, ttlHours }）。 */
+async function uploadBundle(srv, key, files, extra = {}) {
   const init = await jget(`${srv.base}/api/upload/init`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, files }),
+    body: JSON.stringify({ key, files, ...extra }),
   });
   if (init.status !== 200) throw new Error(`init ${init.status}: ${JSON.stringify(init.body)}`);
   for (let fi = 0; fi < files.length; fi++) {
