@@ -150,6 +150,12 @@ const httpsUrl = computed(() => {
   if (window.FBCrypto && window.FBCrypto.native) return '';
   return `https://${location.hostname}:${data.value.httpsPort}${location.pathname}${location.search}`;
 });
+const legacyNoticeDismissed = ref(false);
+const legacyUnfiledCount = computed(() => data.value.batches.filter((b) => b.legacy && !b.folderId).length);
+function dismissLegacyNotice() {
+  legacyNoticeDismissed.value = true;
+  try { localStorage.setItem('fb-legacy-notice', '1'); } catch { /* 隐私模式 */ }
+}
 const selectedItems = computed(() => {
   const map = new Map();
   for (const row of displayRows.value) {
@@ -416,11 +422,20 @@ function addUpload(files, { folderId = null, ttlHours: ttl = 1 } = {}) {
     onUpdate: (u) => {
       Object.assign(task, u);
       if (u.state === 'done') {
-        const folderId = u.result?.folderId || null;
-        toast(u.result?.folderMissing ? '上传完成，但目标目录已不存在，文件在未分档' : '上传完成');
+        const res = u.result || {};
+        const folderId = res.folderId || null;
         refreshLibrary({ silent: true });
         refreshPending();
-        if (u.result?.folderMissing) navigate(folderId || '__unfiled__');
+        if (res.indexed === false) {
+          toast('上传完成，但目录索引不可用：文件在未分档，未设置自动删除');
+          navigate('__unfiled__');
+        } else if (res.folderMissing) {
+          toast('上传完成，但目标目录已不存在：文件在未分档');
+          navigate(folderId || '__unfiled__');
+        } else {
+          const expiry = res.expiresAt ? fmtExpiry(res.expiresAt, Date.now()) : '手动删除';
+          toast(`已上传到「${task.targetLabel}」· ${expiry}`);
+        }
       } else if (u.state === 'failed') {
         toast(u.error || '上传失败');
       }
@@ -774,6 +789,7 @@ async function init() {
     if (currentId.value && currentId.value !== '__unfiled__' && !res.folders.some((f) => f.id === currentId.value)) {
       currentId.value = null;
     }
+    try { legacyNoticeDismissed.value = localStorage.getItem('fb-legacy-notice') === '1'; } catch { /* 隐私模式 */ }
     await loadFiles();
     await refreshPending();
   } catch (err) {
@@ -861,6 +877,11 @@ onBeforeUnmount(() => {
         <div v-if="httpsUrl" class="banner">
           当前是 HTTP 兼容模式，加解密会慢一个数量级。改用 <a :href="httpsUrl">HTTPS 地址</a> 可大幅提速（首次需信任自签证书）。
         </div>
+        <div v-if="currentId === null && legacyUnfiledCount && !legacyNoticeDismissed" class="banner">
+          旧上传已归到「未分档」，原链接和下载次数不变。
+          <button class="linkbtn" @click="navigate('__unfiled__')">去整理</button>
+          <button class="linkbtn" @click="dismissLegacyNotice">知道了</button>
+        </div>
         <div v-if="error" class="banner danger">{{ error }} <button class="linkbtn" @click="refreshLibrary()">重试</button></div>
         <div v-if="manifestError" class="banner danger">部分文件名读取失败：{{ manifestError }} <button class="linkbtn" @click="loadFiles()">重试</button></div>
 
@@ -897,7 +918,7 @@ onBeforeUnmount(() => {
                   <Folder :size="20" class="row-icon folder-icon" />
                   <span class="name ellipsis">{{ row.folder.name }}</span>
                   <span class="meta">
-                    {{ row.folder.count || 0 }} 个文件 · {{ fmtSize(row.folder.size || 0) }}
+                    {{ row.folder.count || 0 }} 个文件 · {{ fmtSize(row.folder.size || 0) }} · {{ dlText(row.folder.downloads || 0) }}
                     <span v-if="row.folder.earliestExpiresAt" :class="expiryClass(row.folder.earliestExpiresAt, now)">· {{ fmtExpiry(row.folder.earliestExpiresAt, now) }}</span>
                     <span v-else class="muted">· 手动删除</span>
                   </span>

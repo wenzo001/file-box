@@ -43,9 +43,12 @@
 │   └── transfer.js      # 无痕传输服务端
 ├── docs/
 │   ├── transfer.md      # 无痕传输
-│   └── library.md       # 目录 / TTL / 任务 / 构建与部署
+│   ├── library.md       # 目录 / TTL / 任务 / 构建与部署
+│   └── deploy.md        # 安装、构建、发布、备份、反代、排障
 ├── test/                # node --test + test/lab 真浏览器台架
-├── scripts/pack.js      # npm run pack：先 build，再收 dist-web + 生产依赖闭包
+├── scripts/
+│   ├── setup.js         # npm run setup / release：安装 + 构建（+ 打包）
+│   └── pack.js          # npm run pack：收 dist-web + 生产依赖闭包
 ├── vite.config.mjs
 ├── dist/                # 发布产物（npm run pack 生成，不入库）
 ├── uploads/             # 上传文件（密文）存放处，启动时自动创建
@@ -222,6 +225,7 @@ env: {
 > - `STORAGE_LIMIT_GB`：存储总量上限（GB），默认 `10`。达到上限后上传会被拒绝，并提示清理
 > - `LIBRARY_DIR`：目录索引（NeDB）所在目录，默认 `<uploads 父目录>/.library`。**不要放进 uploads**，备份时随 uploads 一起备份
 > - `TTL_SWEEP_MS`：批次 TTL 扫描间隔（毫秒），默认 `60000`
+> - `MAX_FOLDERS`：目录数量保护上限，默认 `10000`；无认证环境防止无限建目录，超过返回 507
 > - `UPLOAD_TTL_HOURS`：未完成批次（断点续传的暂存）保留小时数，默认 `48`（2 天）。超时自动回收，下次上传从头再来
 > - `TRUST_PROXY`：反向代理部署时设为 `1`（或 Express trust proxy 配置串），`req.ip` 才是真实客户端地址；无痕传输的限流按 IP 记账，不设的话反代后所有用户共享一个桶
 > - `STUN_PORT`：无痕传输内置 STUN 的 UDP 端口，默认 `3478`。**局域网直连靠它**（Chrome 的 host 候选是 mDNS 名，跨机器常常解析不了）。设 `0` 关掉，改用自建 `STUN_URLS`
@@ -243,6 +247,7 @@ env: {
 | `POST /api/upload/init` + `PUT /api/upload/part` | 把任意文件加密后塞满你的磁盘（直到 10GB 上限） |
 | `GET /api/library` / `GET /api/list` | 看到所有批次的时间、密文文件名、大小，以及**目录名与目录结构**（目录名是明文；真实文件名仍在加密清单里） |
 | `GET /api/uploads` | 看到未完成上传的文件数、字节数与已收块数（不含真实文件名） |
+| `DELETE /api/uploads/:id` | 取消别人未完成的上传并清掉暂存 |
 | `GET /api/download/*` / `/api/archive/*` | 下载任何密文（无密钥解不开，但密文本身会泄露文件量级与元数据） |
 | `DELETE /api/folder/*` / `DELETE /api/folders/*` | **无确认直接删除批次或整个目录** —— 服务端已限定只能删本服务创建的日期批次/索引目录，越界与软链接都进不来，但你的文件照样能被清空 |
 | `PATCH /api/folders/*` / `PATCH /api/batches/*` | 改目录名、移动目录或批次；没有权限校验 |
@@ -289,7 +294,7 @@ server {
 
 ### 下载次数
 
-- 每个文件行显示「下载 N 次」；一次都没被取走时写「未下载」而不是留空 —— 空着分不清"没人取过"和"这版没做统计"
+- 每个文件行显示「下载 N 次」；目录行显示按子树汇总的下载次数。一次都没被取走时写「未下载」而不是留空 —— 空着分不清"没人取过"和"这版没做统计"
 - 口径：单文件下载算一次；Range 续传（起点 > 0）不重复计数；旧 `/api/archive` 整包归档让该目录每个文件各 +1。前端拉 `manifest.enc` 不计数 —— 否则这个数字就成了"被点开的次数"。404 与被闸门拒绝的请求不计数
 - 账本在 uploads **之外**：默认 `<uploads 的父目录>/.stats/downloads.json`（可用 `DOWNLOADS_FILE` 指定）。放进 uploads 就会被归档打包出去、被下载接口吐出去、被用量算进去
 - 重启不丢（内存累加 + 2 秒去抖原子落盘，最坏丢最后 2 秒的增量）；目录被删时它的条目一并清掉

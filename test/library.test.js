@@ -85,6 +85,22 @@ test('目录：重命名、移动、禁止移入自身 / 后代、深度上限',
   );
 });
 
+test('目录数量保护：超过 maxFolders 拒绝，防止无认证环境无限建目录', async () => {
+  const capped = await createLibrary({
+    libraryDir: path.join(dir, 'cap'), backupDelayMs: 5, maxFolders: 2,
+  }).init();
+  try {
+    await capped.createFolder({ name: 'cap-1', parentId: null });
+    await capped.createFolder({ name: 'cap-2', parentId: null });
+    await assert.rejects(
+      () => capped.createFolder({ name: 'cap-3', parentId: null }),
+      expectCode('FOLDER_LIMIT'),
+    );
+  } finally {
+    await capped.close();
+  }
+});
+
 test('批次：归属、清单哈希、批量移动、旧批次补条目、TTL 到期查询', async () => {
   const a = await lib.createFolder({ name: '批次-A', parentId: null });
   const b = await lib.createFolder({ name: '批次-B', parentId: null });

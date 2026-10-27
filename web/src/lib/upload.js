@@ -1,4 +1,4 @@
-// 上传任务：复用旧页面的分块规划 / 批次指纹 / 加密 / CRC 语义，只把 DOM 换成 Vue 状态。
+// 上传任务：复用原上传引擎的分块规划 / 批次指纹 / 加密 / CRC 语义，只把 DOM 换成 Vue 状态。
 import { api } from './api.js';
 
 export const UPLOAD_TTL_OPTIONS = [1, 4, 8, 48, 72, 120, 240, 2160];

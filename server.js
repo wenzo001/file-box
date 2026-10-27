@@ -27,7 +27,8 @@ const LIBRARY_DIR = process.env.LIBRARY_DIR
   ? path.resolve(process.env.LIBRARY_DIR)
   : path.join(path.dirname(UPLOAD_DIR), '.library');
 const TTL_SWEEP_MS = Number(process.env.TTL_SWEEP_MS) || 60 * 1000;
-const library = createLibrary({ libraryDir: LIBRARY_DIR, log: console });
+const MAX_FOLDERS = Number(process.env.MAX_FOLDERS) || 10000;
+const library = createLibrary({ libraryDir: LIBRARY_DIR, log: console, maxFolders: MAX_FOLDERS });
 let libraryReady = false;
 
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -121,7 +122,8 @@ function resolveFolder(name) {
 /** 目录内的真实文件路径：同样拒链接——链接目录里放一个指出去的软链接也是读界外的口子 */
 function resolveFile(folderReal, name) {
   const safe = safeName(name);
-  if (!folderReal || !safe) return null;
+  // 清单替换在跨盘时会用 manifest.enc.tmp；它是内部临时文件，不能出现在下载/列表/归档里
+  if (!folderReal || !safe || safe === 'manifest.enc.tmp') return null;
   const p = path.join(folderReal, safe);
   try {
     if (!fs.lstatSync(p).isFile()) return null;
@@ -422,6 +424,7 @@ function scanUploadBatches() {
       const rec = downloads[d.name] || {};
       const files = fs
         .readdirSync(dir)
+        .filter((f) => f !== 'manifest.enc.tmp')
         .map((f) => ({ name: f, size: fs.statSync(path.join(dir, f)).size, downloads: rec[f] || 0 }))
         .sort((a, b) => BATCH_COLLATOR.compare(a.name, b.name));
       return {
@@ -809,6 +812,7 @@ function uploadStagingList() {
 }
 
 app.get('/api/uploads', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.json({ uploads: uploadStagingList() });
 });
 
@@ -834,6 +838,7 @@ app.delete('/api/uploads/:id', (req, res) => {
 
 // ---- 文件列表（旧页面 / 旧缓存兼容：按时间倒序） ----
 app.get('/api/list', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const folders = scanUploadBatches();
   const used = folders.reduce((s, f) => s + f.size, 0);
   res.json({
@@ -845,6 +850,7 @@ app.get('/api/list', (req, res) => {
 
 // ---- 新界面的目录树 + 批次视图 ----
 app.get('/api/library', asyncHandler(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.json(await buildLibraryPayload());
 }));
 
@@ -977,6 +983,10 @@ app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyn
   }
 
   const current = readManifestBytes(dir);
+  // 已有清单时必须带 CAS 值，避免匿名/旧客户端拿一份过期清单把文件“写丢”
+  if (current && !data.expectedManifestHash) {
+    return res.status(400).json({ error: '有加密清单时必须带 expectedManifestHash' });
+  }
   if (data.expectedManifestHash) {
     if (!current || hashBytes(current) !== data.expectedManifestHash) {
       return res.status(409).json({ error: '清单已变化，请重新加载后重试' });
@@ -1017,7 +1027,7 @@ app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyn
 
   let remaining;
   try {
-    remaining = fs.readdirSync(dir).filter((name) => name !== MANIFEST);
+    remaining = fs.readdirSync(dir).filter((name) => name !== MANIFEST && name !== 'manifest.enc.tmp');
   } catch {
     return res.status(500).json({ error: '读取目录失败' });
   }
@@ -1180,7 +1190,7 @@ app.get('/api/archive/:folder', async (req, res) => {
   try {
     parts = fs
       .readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile())
+      .filter((d) => d.isFile() && d.name !== 'manifest.enc.tmp')
       .map((d) => ({ name: d.name, size: fs.statSync(path.join(dir, d.name)).size }));
   } catch {
     return res.status(404).json({ error: '目录不存在' });

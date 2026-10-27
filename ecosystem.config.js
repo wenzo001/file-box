@@ -9,6 +9,7 @@ module.exports = {
         STORAGE_LIMIT_GB: 10,
         LIBRARY_DIR: './.library', // 目录索引（NeDB），不要放进 uploads
         TTL_SWEEP_MS: 60000,       // 批次 TTL 扫描间隔
+        MAX_FOLDERS: 10000,        // 无认证环境的目录数量保护上限
         UPLOAD_TTL_HOURS: 48, // 未完成的断点续传批次留 2 天，超时回收
         // ---- 无痕传输（详见 docs/transfer.md）----
         TRANSFER_DIR: './.transfer', // 密文中转区，必须与 uploads 分开（与 server.js 默认值一致）

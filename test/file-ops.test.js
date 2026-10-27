@@ -126,6 +126,29 @@ test('旧数据无清单：允许直接删密文，删空整批消失', async ()
   assert.strictEqual(fs.existsSync(path.join(srv.dir, 'uploads', out.folder)), false);
 });
 
+test('有加密清单却缺 expectedManifestHash：拒绝写入，文件不动', async () => {
+  const { out, mf } = await bundleWithManifest();
+  const next = manifest([{ name: 'b.txt', size: 4, enc: 'b.enc' }]);
+  const r = await post(`/api/batches/${out.folder}/file-delete`, {
+    file: 'a.enc',
+    manifest: b64(next),
+  });
+  assert.strictEqual(r.status, 400);
+  assert.ok(fs.existsSync(path.join(srv.dir, 'uploads', out.folder, 'a.enc')), '缺 CAS 时不能动文件');
+  assert.ok(fs.readFileSync(path.join(srv.dir, 'uploads', out.folder, 'manifest.enc')).equals(mf));
+});
+
+test('清单临时文件不进列表、不能下载', async () => {
+  const { out } = await bundleWithManifest();
+  const temp = path.join(srv.dir, 'uploads', out.folder, 'manifest.enc.tmp');
+  fs.writeFileSync(temp, 'internal temp');
+  const row = (await list()).folders.find((f) => f.name === out.folder);
+  assert.ok(row);
+  assert.strictEqual(row.files.some((f) => f.name === 'manifest.enc.tmp'), false);
+  const dl = await fetch(`${srv.base}/api/download/${out.folder}/manifest.enc.tmp`);
+  assert.strictEqual(dl.status, 404);
+});
+
 test('删除路径闸门：manifest.enc / 路径分隔符 / 有清单却不交新清单一律拒', async () => {
   const { out, mf } = await bundleWithManifest();
   const batch = out.folder;

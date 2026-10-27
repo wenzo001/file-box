@@ -1,4 +1,4 @@
-// 相对站点根目录拼 API：页面在 / 或 /next/、反向代理在 /box/ 下都能用。
+// 相对站点根目录拼 API：页面在 / 或反向代理子路径 /box/ 下都能用。
 const API_ROOT = new URL('../api/', document.baseURI).href;
 
 async function request(path, options = {}) {
