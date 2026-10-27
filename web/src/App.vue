@@ -19,6 +19,7 @@ import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from '
 import { UploadTask, relPath, sortSelected } from './lib/upload.js';
 import { clearDownload, downloadFile, saveBlob } from './lib/download.js';
 import { createZipJob } from './lib/zip.js';
+import { bindColumnDnd } from './lib/dnd.js';
 import {
   collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
 } from './lib/format.js';
@@ -147,6 +148,119 @@ const columns = computed(() => columnIds.value.map((id) => {
 }));
 // 当前路径上的每一级（含当前这一级自己）：所在栏的那一行要亮成选中态
 const pathIds = computed(() => new Set(columnIds.value.slice(1)));
+
+// ---- 拖拽移动：目录行拖进别的目录 = 换父级；文件行拖进别的目录 = 把这一条拆出批次搬走 ----
+let dndBusy = false;
+let dndDragging = false;
+let dndTimer = null;
+let dndObserver = null;
+
+function dndRows(col) {
+  const rows = [
+    ...col.folders.map((f) => ({ kind: 'folder', id: f.id, name: f.name, system: Boolean(f.system) })),
+    ...col.files.map((r) => ({ kind: 'file', id: r.key, batch: r.batch, enc: r.enc, name: r.name })),
+  ];
+  // 空栏也渲染了一个占位元素：库按"值与子元素一一对应"配对，条数不一致会在拖放时读到 undefined
+  return rows.length ? rows : [{ kind: 'placeholder', id: `${col.key}-empty` }];
+}
+
+function bindDnd() {
+  if (dndBusy || dndDragging || pointerOnRow) return; // 按住或拖拽在飞时重建绑定，会把这次拖拽掐死在起点
+  // 按 DOM 顺序取容器，与 columns 一一对齐；v-for 里的数组 ref 顺序没有保证，错位会让库把值和子元素配错
+  const els = columnsEl.value ? [...columnsEl.value.querySelectorAll('.col-list')] : [];
+  const lists = els.map((el, i) => ({
+    el,
+    folderId: columns.value[i]?.id ?? null,
+    rows: () => dndRows(columns.value[i] || { folders: [], files: [] }),
+  }));
+  if (lists.length) bindColumnDnd({ lists, onMove: onDndMove, onDragState: setDndDragging });
+}
+
+function setDndDragging(value) {
+  dndDragging = value;
+  if (!value) scheduleBind(); // 拖完再对齐一次：重绘产生的新行必须让库重新认识
+}
+
+// 库按"值与子元素一一对应"配对：Vue 重绘出的新行它并不认识，hover 到就会读到 undefined 而抛错，
+// 所以 DOM 一变就要重新登记。但库是在 pointerdown 时才把 draggable 打开的 ——
+// 按下到 dragstart 之间重绑一次，等于把这次拖拽掐死在起点（实测 onDragstart 整条不触发），
+// 所以按住期间和拖拽在飞期间都不许重绑。
+let pointerOnRow = false;
+
+function scheduleBind() {
+  if (dndDragging || dndBusy || pointerOnRow) return;
+  clearTimeout(dndTimer);
+  dndTimer = setTimeout(bindDnd, 120);
+}
+
+function watchColumnsDom() {
+  if (!columnsEl.value || dndObserver) return;
+  dndObserver = new MutationObserver(scheduleBind);
+  dndObserver.observe(columnsEl.value, { childList: true, subtree: true });
+  document.addEventListener('pointerdown', (e) => { pointerOnRow = Boolean(e.target?.closest?.('.col-row')); }, true);
+  document.addEventListener('pointerup', () => { pointerOnRow = false; scheduleBind(); }, true);
+  document.addEventListener('pointercancel', () => { pointerOnRow = false; }, true);
+  scheduleBind();
+}
+
+async function moveFileRowTo(row, toFolderId) {
+  const rec = manifestState.value.get(row.batch);
+  if (!rec) throw new Error(`「${row.name}」是旧数据，没有加密清单，请用「⋯」里的「移动这批上传到…」`);
+  const entry = (rec.data.files || []).find((f) => f.enc === row.enc);
+  if (!entry) throw new Error(`清单里找不到「${row.name}」`);
+  const keep = (rec.data.files || []).filter((f) => f.enc !== row.enc);
+  const [source, target] = await Promise.all([
+    encodeManifest({ ...rec.data, files: keep }),
+    encodeManifest({ ...rec.data, files: [entry] }),
+  ]);
+  await api.moveFile(row.batch, {
+    file: row.enc,
+    to: toFolderId,
+    sourceManifest: source.b64,
+    targetManifest: target.b64,
+    expectedManifestHash: rec.hash,
+  });
+  forgetBatchManifest(row.batch);
+}
+
+async function onDndMove({ dragged, toFolderId }) {
+  if (dndBusy) return; // 一次落点只执行一遍，重复触发不能把移动做两次
+  const unfiled = toFolderId === '__unfiled__';
+  const to = toFolderId && !unfiled ? toFolderId : null;
+  // 落点只带 kind/id（从 DOM 的 data-dnd-* 读），其余字段回数据里取，不在拖拽层复制一份状态
+  const rows = (dragged || [])
+    .map((r) => (r.kind === 'folder'
+      ? { kind: 'folder', id: r.id, system: Boolean(folderMap.value.get(r.id)?.system) }
+      : { kind: 'file', row: itemByKey.value.get(r.id)?.file }))
+    .filter((r) => (r.kind === 'folder' ? Boolean(folderMap.value.get(r.id)) : Boolean(r.row)))
+    .filter((r) => !(r.kind === 'folder' && r.id === to));
+  if (!rows.length) return;
+  if (rows.some((r) => r.kind === 'folder' && r.system)) {
+    error.value = '「未分档」是系统目录，不能移动';
+    return;
+  }
+  if (unfiled && rows.some((r) => r.kind === 'folder')) {
+    error.value = '未分档只放没归档的文件；目录请拖到别的文件夹或「全部文件」那一栏';
+    return;
+  }
+  dndBusy = true;
+  try {
+    for (const r of rows) {
+      if (r.kind === 'folder') await api.patchFolder(r.id, { parentId: to });
+      else await moveFileRowTo(r.row, unfiled ? '__unfiled__' : to);
+    }
+    const where = unfiled ? '未分档' : (to ? folderMap.value.get(to)?.name || '目标目录' : '顶级');
+    toast(`已移动 ${rows.length} 项到「${where}」`);
+    // 锁要跨过这次刷新：刷新会重绘分栏，锁先放开就会在回弹里被再触发一次
+    await refreshLibrary({ silent: true });
+  } catch (err) {
+    error.value = `移动失败：${err.message}`;
+  } finally {
+    dndBusy = false;
+  }
+}
+
+watch(columns, () => nextTick(watchColumnsDom), { flush: 'post' });
 
 const folderPathText = (id) => {
   if (!id) return '全部文件';
@@ -545,10 +659,13 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
 }
 
 function onColumnDragOver(event, col) {
+  // 只认领「从系统里拖文件进来」这一类；栏内拖拽移动交给 dnd 库，这里不许抢 dropEffect
+  if (!event.dataTransfer?.types?.includes('Files')) return;
   event.preventDefault();
-  event.stopPropagation();
+  // 库把 dragover/drop 处理器挂在同一个 .col-list 上，stopPropagation 拦不住同元素的其他监听
+  event.stopImmediatePropagation();
   dragTargetKey.value = col.key;
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  event.dataTransfer.dropEffect = 'copy';
 }
 
 function onColumnDragLeave(event, col) {
@@ -556,11 +673,11 @@ function onColumnDragLeave(event, col) {
 }
 
 function onColumnDrop(event, col) {
-  event.preventDefault();
-  event.stopPropagation();
-  dragTargetKey.value = '';
   const files = Array.from(event.dataTransfer?.files || []);
-  if (!files.length) return;
+  if (!files.length) return; // 栏内拖拽移动的落点交给 dnd 库（它的 drop 就挂在同一个元素上）
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  dragTargetKey.value = '';
   const folderId = !col.id || col.id === '__unfiled__' ? null : col.id;
   addUpload(files, { folderId });
 }
@@ -1277,6 +1394,8 @@ onBeforeUnmount(() => {
   clearInterval(pollTimer);
   clearTimeout(toastTimer);
   clearTimeout(pulseTimer);
+  clearTimeout(dndTimer);
+  if (dndObserver) dndObserver.disconnect();
   window.removeEventListener('popstate', onPop);
   window.removeEventListener('click', closeMenu);
   window.removeEventListener('scroll', closeMenu, true);
@@ -1457,6 +1576,8 @@ onBeforeUnmount(() => {
                   v-for="folder in col.folders"
                   :key="folder.id"
                   class="col-row folder-row"
+                  data-dnd-kind="folder"
+                  :data-dnd-id="folder.id"
                   :class="{
                     selected: isSelected(`folder:${folder.id}`),
                     current: pathIds.has(folder.id),
@@ -1489,6 +1610,8 @@ onBeforeUnmount(() => {
                   v-for="row in col.files"
                   :key="row.key"
                   class="col-row file-row"
+                  data-dnd-kind="file"
+                  :data-dnd-id="row.key"
                   :class="{
                     selected: isSelected(row.key),
                     shared: sharedFileKeys.has(row.key),

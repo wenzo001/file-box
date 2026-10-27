@@ -18,6 +18,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@formkit/drag-and-drop": "^0.6.1",
     "@seald-io/nedb": "^4.1.2",
     "express": "^4.21.2",
     "selfsigned": "^5.5.0",

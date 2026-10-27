@@ -25,7 +25,7 @@ const tmp = (name) => path.join(os.tmpdir(), name);
   await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: srv.base });
   const page = await ctx.newPage();
   const errs = [];
-  page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}`));
+  page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}\n${(e.stack || '').split('\n').slice(1, 5).join('\n')}`));
   page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
   const readClip = () => page.evaluate(() => navigator.clipboard.readText());
   const fileRow = (name) => page.locator('.file-row', { hasText: name });
@@ -271,6 +271,61 @@ const tmp = (name) => path.join(os.tmpdir(), name);
       () => [...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('拖拽.txt')),
       { timeout: 30000 },
     );
+
+    // ---- 拖拽移动（真鼠标，落点由 @formkit/drag-and-drop 决定）：放在最后，避免改动前面几条的夹具 ----
+    for (const name of ['拖拽去处', '拖拽载体']) {
+      await page.locator('.column').first().getByRole('button', { name: '新建文件夹' }).click();
+      await page.locator('.dialog .input').fill(name);
+      await page.locator('.dialog .btn-primary').click();
+      await page.waitForSelector(`.folder-row:has-text("${name}")`);
+    }
+    const rowOf = (name) => page.locator('.col-row', { hasText: name }).first();
+
+    // 文件行拖到别的目录行：只搬这一条，同批另一条留在原批次
+    const before = await (await fetch(`${srv.base}/api/library`)).json();
+    const src = before.batches.find((b) => b.count === 2);
+    const toFolder = before.folders.find((f) => f.name === '拖拽去处');
+    assert.ok(src && toFolder, '夹具里没有两文件的批次或目标目录，后面判据无从比对');
+    await rowOf('fb-library-甲.txt').dragTo(rowOf('拖拽去处'));
+    await page.waitForFunction(async (id) => {
+      const l = await (await fetch(`${location.origin}/api/library`)).json();
+      return l.batches.some((b) => b.folderId === id && b.count === 1);
+    }, toFolder.id, { timeout: 20000 });
+    lib = await (await fetch(`${srv.base}/api/library`)).json();
+    const landed = lib.batches.filter((b) => b.folderId === toFolder.id);
+    assert.strictEqual(landed.length, 1, `拖进来的这条没有单独成批: `
+      + `去处=${toFolder.id} 全部批次=${JSON.stringify(lib.batches.map((b) => [b.name, b.folderId, b.count]))} `
+      + `目录=${JSON.stringify(lib.folders.map((f) => [f.name, f.id]))}`);
+    assert.strictEqual(landed[0].count, 1, '拖一条不该把同批另一条也带走');
+    assert.strictEqual(lib.batches.find((b) => b.name === src.name).count, 1, '源批次没剩下那一条');
+
+    // 目录行拖到别的目录行（同一栏内）：换父级。前置断言必须有：否则"夹具本来就把它放那儿"会伪装成拖拽成功
+    let pre = await (await fetch(`${srv.base}/api/library`)).json();
+    const preTarget = pre.folders.find((f) => f.name === '拖拽去处');
+    const preKid = pre.folders.find((f) => f.name === '拖拽载体');
+    assert.notStrictEqual(preKid.parentId, preTarget.id, '拖之前「拖拽载体」就已经在目标目录里，这条判据是空的');
+    // 只断"父级变了"不够：那件事可能不是这次调用干的。要同时抓到这次 PATCH 真的发出去了。
+    const patched = [];
+    const spy = (req) => { if (req.method() === 'PATCH' && req.url().includes('/api/folders/')) patched.push(req.url()); };
+    page.on('request', spy);
+    await rowOf('拖拽载体').dragTo(rowOf('拖拽去处'));
+    await page.waitForFunction(async () => {
+      const l = await (await fetch(`${location.origin}/api/library`)).json();
+      const target = l.folders.find((f) => f.name === '拖拽去处');
+      const kid = l.folders.find((f) => f.name === '拖拽载体');
+      return Boolean(kid.parentId && kid.parentId === target.id);
+    }, null, { timeout: 20000 });
+    page.off('request', spy);
+    assert.ok(patched.length >= 1, '拖拽目录行没有发出改父级的 PATCH —— 父级变化不能归因于这次拖拽');
+
+    // 系统目录不许被拖走，且要给一句具名的拒绝
+    await rowOf('未分档').dragTo(rowOf('拖拽去处'));
+    await page.waitForFunction(
+      () => Boolean(document.querySelector('.banner.danger')?.textContent.includes('系统目录')),
+      null, { timeout: 10000 },
+    );
+    lib = await (await fetch(`${srv.base}/api/library`)).json();
+    assert.strictEqual(lib.folders.find((f) => f.name === '未分档').parentId, null, '未分档被拖拽改动了父级');
 
     // 窄屏：当前栏必须自动滚到视野内
     await page.setViewportSize({ width: 390, height: 844 });
