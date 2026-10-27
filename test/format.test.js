@@ -67,6 +67,15 @@ test('右键菜单三态与触摸档 44pt 必须在 CSS 里真声明（静态守
   assert.match(css, /\.context-menu \.menu-item:disabled/, '右键菜单项没有禁用态');
 });
 
+test('file-move 端点一旦被界面调用，台面就必须有真浏览器拖拽判据（防"后端有、界面悄悄上"）', () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'App.vue'), 'utf8');
+  const lab = fs.readFileSync(path.join(__dirname, '..', 'test', 'lab', 'library-smoke.js'), 'utf8');
+  const uiCalls = /api\.moveFile\(/.test(app);
+  const hasJudge = /dragTo\(/.test(lab);
+  assert.strictEqual(uiCalls && !hasJudge, false,
+    `界面已在调用 file-move（uiCalls=${uiCalls}）但台面无拖拽判据（hasJudge=${hasJudge}）——要么补判据，要么别接`);
+});
+
 test('到期状态类不许复用元素名：CSS 里任何 display:none 的规则都不能点到它', async () => {
   // 事故口径：状态类曾返回裸 'expiry'，被旧表格的窄屏规则 .file-row > .expiry 命中，
   // 第三行（倒计时）在手机上去掉——文字判据抓不到，只有量渲染几何才看得见。

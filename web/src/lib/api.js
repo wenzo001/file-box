@@ -41,6 +41,7 @@ export const api = {
 
   deleteFile: (batch, body) => json(`batches/${q(batch)}/file-delete`, 'POST', body),
   renameFile: (batch, body) => json(`batches/${q(batch)}/file-rename`, 'POST', body),
+  moveFile: (batch, body) => json(`batches/${q(batch)}/file-move`, 'POST', body),
 
   uploadInit: (body) => json('upload/init', 'POST', body),
   uploadFinish: (uploadId) => json('upload/finish', 'POST', { uploadId }),
