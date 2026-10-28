@@ -140,6 +140,8 @@ export class UploadTask {
     this.key = '';
     this.plan = null;
     this.have = new Set();
+    this.fileTotal = null; // 每个文件的分块数（影子行按文件报进度）
+    this.fileDone = null;
     this.total = 0;
     this.doneBytes = 0;
     this.error = '';
@@ -163,6 +165,9 @@ export class UploadTask {
       uploadId: this.uploadId,
       error: this.error,
       result: this.result,
+      fileProgress: this.fileDone
+        ? this.fileDone.map((d, i) => (this.fileTotal[i] ? d / this.fileTotal[i] : 0))
+        : this.files.map(() => 0),
     });
   }
 
@@ -189,6 +194,10 @@ export class UploadTask {
     });
     this.uploadId = r.uploadId;
     this.have = new Set(r.have.map((p) => `${p.f}-${p.c}`));
+    this.fileTotal = this.plan.layout.map((l) => l.chunks.length);
+    this.fileDone = this.plan.layout.map((l, fi) => l.chunks.reduce(
+      (n, _, ci) => n + (this.have.has(`${fi}-${ci}`) ? 1 : 0), 0,
+    ));
     this.total = r.total;
     this.doneBytes = this.bytesOfHave();
     this.meta = r;
@@ -225,6 +234,7 @@ export class UploadTask {
     if (this.paused || this.cancelled) return;
     await this.putChunk(fi, ci, body, crc);
     this.have.add(`${fi}-${ci}`);
+    if (this.fileDone) this.fileDone[fi] += 1;
     this.doneBytes += spec.chunks[ci];
     this.emit();
   }

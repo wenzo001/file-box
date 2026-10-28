@@ -646,6 +646,30 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .col-row.drop-here .col-name { color: var(--accent); font-weight: 600; }
 .column.drop-here { outline: 2px dashed color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: -3px; }
+/* 上传中的影子行：虚线框 + 淡图标 + 第三行进度条；完成后由真实文件行接管。
+   只给图标降透明度 —— 整行 opacity 会把文字对比度一起拉下去。 */
+.pending-row {
+  outline: 1px dashed color-mix(in srgb, var(--text3) 55%, transparent);
+  outline-offset: -2px;
+  background: var(--fill);
+  cursor: default;
+  pointer-events: none;
+}
+.pending-row .row-icon { opacity: .45; }
+.pending-track {
+  grid-column: 3;
+  grid-row: 3;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--fill2);
+  overflow: hidden;
+}
+.pending-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
 .col-size { color: var(--text); font-weight: 600; }
 .tag.hot { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
 .tag.share-tag { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }

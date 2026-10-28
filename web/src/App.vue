@@ -23,6 +23,7 @@ import WipeDialog from './components/WipeDialog.vue';
 import SettingsSheet from './components/SettingsSheet.vue';
 import { tierLabel } from './lib/capability.mjs';
 import { bindColumnDnd } from './lib/dnd.js';
+import { pendingRows } from './lib/pending.mjs';
 import {
   collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
 } from './lib/format.js';
@@ -147,6 +148,8 @@ const columns = computed(() => columnIds.value.map((id) => {
     folder,
     folders: childrenOf(id),
     files: id ? filesForFolder(id) : [],
+    // 「未分档」栏与 null 批次是同一个桶（同 filesForFolder 的口径）；顶端那栏只列目录
+    pending: id ? pendingRows(tasks.value, id === '__unfiled__' ? null : id) : [],
   };
 }));
 // 当前路径上的每一级（含当前这一级自己）：所在栏的那一行要亮成选中态
@@ -169,6 +172,8 @@ let dndObserver = null;
 function dndRows(col) {
   const rows = [
     ...col.folders.map((f) => ({ kind: 'folder', id: f.id, name: f.name, system: Boolean(f.system) })),
+    // 影子行也是这一栏的子元素：库按"值与子元素一一对应"配对，漏掉它们会让后面的行错位
+    ...(col.pending || []).map((p) => ({ kind: 'pending', id: p.key })),
     ...col.files.map((r) => ({ kind: 'file', id: r.key, batch: r.batch, enc: r.enc, name: r.name })),
   ];
   // 空栏也渲染了一个占位元素：库按"值与子元素一一对应"配对，条数不一致会在拖放时读到 undefined
@@ -348,7 +353,9 @@ function colMeta(col) {
   const folder = col.folder;
   if (!folder) return '';
   const updated = Number.isFinite(folder.lastUpdatedAt) ? `最后更新 ${fmtAgo(folder.lastUpdatedAt, now.value)}` : '还没有文件';
-  return `${folder.count || 0} 个文件 · ${updated}`;
+  // 影子行不计入"N 个文件"（还没提交），单独说一句，免得表头写着"还没有文件"下面却有一行
+  const uploading = (col.pending || []).length ? ` · ${col.pending.length} 个上传中` : '';
+  return `${folder.count || 0} 个文件 · ${updated}${uploading}`;
 }
 
 function folderRowMeta(folder) {
@@ -656,6 +663,11 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
     title: files.length === 1 ? relPath(files[0]) : `${relPath(files[0])} 等 ${files.length} 个文件`,
     state: 'queued', done: 0, total: 0, doneBytes: 0, error: '', result: null, note: '',
     targetLabel: target ? (folderMap.value.get(target)?.name || '目录') : '未分档',
+    // 影子行：进行中的文件要立刻出现在目标目录那栏里
+    folderId: target,
+    names: files.map(relPath),
+    sizes: files.map((f) => f.size),
+    fileProgress: files.map(() => 0),
     ttlHours,
   });
   const up = new UploadTask(files, {
@@ -1751,6 +1763,30 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div
+                  v-for="p in col.pending"
+                  :key="p.key"
+                  class="col-row pending-row"
+                  aria-busy="true"
+                  :aria-label="`${p.name} ${p.paused ? '已暂停' : '上传中'}，${Math.round(p.progress * 100)}%`"
+                >
+                  <span class="check-hit"></span>
+                  <File :size="20" class="row-icon file-icon" />
+                  <span class="col-name"><span class="name-text">{{ p.name }}</span>
+                    <span class="tag">{{ p.paused ? '已暂停' : '上传中' }}</span>
+                  </span>
+                  <span class="col-meta">{{ fmtSize(p.size) }} · {{ Math.round(p.progress * 100) }}%</span>
+                  <span
+                    class="pending-track"
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    :aria-valuenow="Math.round(p.progress * 100)"
+                  >
+                    <span class="pending-fill" :style="{ width: `${Math.round(p.progress * 100)}%` }"></span>
+                  </span>
+                </div>
+
+                <div
                   v-for="row in col.files"
                   :key="row.key"
                   class="col-row file-row"
@@ -1787,7 +1823,7 @@ onBeforeUnmount(() => {
                   <button class="icon-btn col-more" title="更多操作" aria-label="更多操作" @click.stop="showMenuFor($event, fileMenuItems(row))">⋯</button>
                 </div>
 
-                <div v-if="!col.folders.length && !col.files.length" class="col-empty">
+                <div v-if="!col.folders.length && !col.pending.length && !col.files.length" class="col-empty">
                   <Folder :size="28" />
                   <p>{{ col.id === '__unfiled__' ? '未分档还没有文件' : '空文件夹' }}</p>
                   <p class="muted">右键可新建文件夹，或把文件拖到这里上传</p>
