@@ -504,10 +504,24 @@ async function loadFiles({ force = false } = {}) {
 async function refreshLibrary({ silent = false, force = false } = {}) {
   try {
     const res = await api.library();
+    // 当前目录被删了（自己删的、别的标签页删的、从上层把整棵删掉都一样）：
+    // 退回它**还活着的最深一级上级**，别一路重置回根 —— 删掉子目录后用户还在同一个项目里。
+    // 上级链路取自刷新前的树：刷新后的树里已经没有它了，算不出来。
+    const prevFolders = data.value.folders;
     data.value = res;
     if (!settingsSaving.value) settingsTtl.value = res.settings?.defaultTtlHours ?? 1;
     if (currentId.value && currentId.value !== '__unfiled__' && !res.folders.some((f) => f.id === currentId.value)) {
-      currentId.value = null;
+      const alive = new Set(res.folders.map((f) => f.id));
+      const prevById = new Map(prevFolders.map((f) => [f.id, f]));
+      const seen = new Set();
+      let fallback = null;
+      let cursor = prevById.get(currentId.value)?.parentId ?? null;
+      while (cursor && !seen.has(cursor)) {
+        seen.add(cursor);
+        if (alive.has(cursor)) { fallback = cursor; break; }
+        cursor = prevById.get(cursor)?.parentId ?? null;
+      }
+      currentId.value = fallback;
       replaceUrl();
     }
     await loadFiles({ force });
