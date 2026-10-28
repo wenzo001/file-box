@@ -436,6 +436,36 @@ const tmp = (name) => path.join(os.tmpdir(), name);
       '顶栏没显示历史累计下载',
     );
 
+    // ---- 清空的回执丢了（服务在重启 / 网络掐了）：界面不许只甩一句"失败" ----
+    // ① 请求根本没到服务器 → 仍报错，但要报"服务器上还有几个文件"；② 服务端做完了、回执丢了 → 自己去核对真实状态并按已清空收掉
+    await page.locator('input[type=file]').setInputFiles([f1]);
+    await page.waitForFunction(() => document.querySelectorAll('.file-row').length >= 1, null, { timeout: 30000 });
+    let wipeMode = 'block';
+    await page.route('**/api/maintenance/wipe', async (route) => {
+      if (wipeMode === 'block') return route.abort('failed');
+      await route.fetch(); // 真发到服务端（它会删干净），再把客户端这一掐断
+      await route.abort('failed');
+    });
+    const errsBeforeWipeProbe = errs.length;
+    await page.locator('.wipe-open').click();
+    await page.locator('.dialog .input').fill(libBefore.wipeConfirm);
+    await page.locator('.dialog .btn-danger').click();
+    await page.waitForFunction(() => /服务器上还有 1 个文件/.test(document.querySelector('.dialog .dialog-error')?.textContent || ''), null, { timeout: 15000 });
+    console.log('[library-smoke] 回执丢失①：', await page.locator('.dialog .dialog-error').innerText());
+    wipeMode = 'lost';
+    await page.locator('.dialog .btn-danger').click();
+    await page.waitForFunction(() => /连接中断，但服务器已确认清空/.test(document.querySelector('.toast')?.textContent || ''), null, { timeout: 10000 });
+    await page.waitForSelector('.dialog', { state: 'detached', timeout: 20000 });
+    const libLost = await readLib();
+    assert.strictEqual(libLost.batches.length, 0, '回执丢失②：弹层自己核对后仍没清干净');
+    await page.unroute('**/api/maintenance/wipe');
+    await page.waitForTimeout(600); // 掐断产生的 console 错误要等它落地，再按"故意掐的"收走
+    // 这两发是台架故意掐的：掐出来的 console 报错逐条核对，别让它替真错误挡枪
+    const provoked = errs.splice(errsBeforeWipeProbe);
+    // 只放行"连接被掐断"这一种（404/500 之类的真错误不许在这里被吞掉）
+    assert.ok(provoked.length > 0 && provoked.every((e) => /net::ERR_FAILED/.test(e)),
+      `故意掐断清空请求带出了没预料到的错误：\n${provoked.join('\n')}`);
+
     assert.deepStrictEqual(errs, [], `浏览器有 console/page 错误:\n${errs.join('\n')}`);
     console.log('[library-smoke] 通过');
     console.log('[library-smoke] 截图:', SHOT('fb-library-desktop.png'), SHOT('fb-library-mobile.png'));

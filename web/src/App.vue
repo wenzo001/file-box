@@ -712,6 +712,26 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
   up.run().finally(() => document.removeEventListener('visibilitychange', onVis));
 }
 
+// 粘贴上传：剪贴板里带文件（截图 / 从资源管理器复制）就传到当前目录；文本粘贴和输入框里的粘贴一律不碰
+function onPaste(event) {
+  const el = event.target;
+  if (el && el.closest && el.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]')) return;
+  if (document.querySelector('.dialog')) return; // 弹层开着时不做后台动作
+  const dt = event.clipboardData;
+  if (!dt) return;
+  const files = Array.from(dt.files || []);
+  if (!files.length) {
+    for (const item of Array.from(dt.items || [])) {
+      if (item.kind !== 'file') continue;
+      const f = item.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (!files.length) return; // 纯文本粘贴：交回浏览器
+  event.preventDefault();
+  addUpload(files, { folderId: uploadTargetId.value });
+}
+
 function onColumnDragOver(event, col) {
   // 只认领「从系统里拖文件进来」这一类；栏内拖拽移动交给 dnd 库，这里不许抢 dropEffect
   if (!event.dataTransfer?.types?.includes('Files')) return;
@@ -1251,7 +1271,9 @@ const wipeStats = computed(() => ({
 }));
 async function onWiped(receipt) {
   tasks.value = []; // 任务列表里每一项都指向刚被删掉的批次，留着只会显示一堆失败
-  toast(`已清空：${receipt.removed.batches} 个批次 · ${fmtSize(receipt.removed.bytes)}；历史累计下载 ${receipt.kept.downloadTotal} 次`);
+  // 回执丢了但服务器已清空（连接中断 / 服务重启）：只报确认到的事实，不编批次数
+  if (receipt.recovered) toast(`连接中断，但服务器已确认清空；历史累计下载保留（${receipt.kept.downloadTotal} 次）`);
+  else toast(`已清空：${receipt.removed.batches} 个批次 · ${fmtSize(receipt.removed.bytes)}；历史累计下载 ${receipt.kept.downloadTotal} 次`);
   await refreshLibrary();
 }
 
@@ -1531,6 +1553,7 @@ onMounted(() => {
   window.addEventListener('scroll', closeMenu, true);
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('resize', onResize);
+  document.addEventListener('paste', onPaste);
 });
 onBeforeUnmount(() => {
   clearInterval(pollTimer);
@@ -1543,6 +1566,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('scroll', closeMenu, true);
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('resize', onResize);
+  document.removeEventListener('paste', onPaste);
 });
 </script>
 

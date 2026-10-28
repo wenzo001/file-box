@@ -43,7 +43,22 @@ async function submit() {
     emit('done', receipt);
     emit('update:open', false);
   } catch (err) {
-    error.value = err.message || '清空失败';
+    // 网络层失败（连接被重置 / 服务正好在重启）不等于没清：服务端可能已经做完了。
+    // 报错前先问一次真实状态 —— 否则用户看到"失败"，再点一次还可能扑空。
+    if (err.status) {
+      error.value = err.message;
+      return;
+    }
+    const state = await api.library().catch(() => null);
+    const left = state ? state.batches.reduce((n, b) => n + (b.count || 0), 0) : null;
+    if (left === 0) {
+      emit('done', { recovered: true, kept: { downloadTotal: state.downloadsTotal || 0 } });
+      emit('update:open', false);
+      return;
+    }
+    error.value = left === null
+      ? '连接中断，也没能确认服务器状态：请刷新页面看文件是否还在'
+      : `连接中断，服务器上还有 ${left} 个文件：请重试`;
   } finally {
     busy.value = false;
   }
