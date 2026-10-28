@@ -114,8 +114,8 @@ test('手机档守机制：界面层不许钉顶、卡片要有高度地板、44
 // 或 res.download()（express 自己会带 attachment）。少了这一句，就是同源存储型 XSS 的口子。
 // 静态扫源码（真正的头验证在 pathgate 与 transfer 的行为测试里），注释先剥掉——
 // 注释里写 attachment 不算声明。
-// 标记只认"把字节写给响应"的四种写法：读盘拼装（pipeline(createReadStream, createWriteStream)）不算；
-// res.write( 是因为归档路由手写帧、没有用 pipe。SSE 那条的 write 在 sseOpen() 里、不是文件字节，扫不到也不该扫。
+// 标记只认"把字节写给响应"的五种写法：读盘拼装（pipeline(createReadStream, createWriteStream)）不算；
+// res.write( / res.end( 是因为归档手写帧、没有 pipe；SSE 那条的 write 在 sseOpen() 里、不是文件字节，扫不到也不该扫。
 function fileEgressRoutes(src) {
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
@@ -147,7 +147,7 @@ function fileEgressRoutes(src) {
     // 括号配对失败就按"没声明"记：仪器没法界定这条路由时必须失败，不能默默放行
     if (!span) { out.push({ route: mark.route, safe: false, bounded: false }); continue; }
     const block = code.slice(span.start, span.end);
-    if (!/\.pipe\(res\)|res\.download\(|res\.sendFile\(|res\.write\(/.test(block)) continue;
+    if (!/\.pipe\(res\)|res\.download\(|res\.sendFile\(|res\.write\(|res\.end\(/.test(block)) continue;
     const safe = /Content-Disposition/.test(block)
       || /application\/octet-stream/.test(block)
       || /res\.download\(/.test(block);
