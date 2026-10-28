@@ -181,4 +181,3 @@ export async function downloadFile(file, { onUpdate = () => {}, signal, memCapBy
   return { name, size: decrypted.size };
 }
 
-export { MEM_MAX_BYTES };

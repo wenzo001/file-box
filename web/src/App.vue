@@ -19,6 +19,7 @@ import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from '
 import { UploadTask, relPath, sortSelected } from './lib/upload.js';
 import { clearDownload, downloadFile, saveBlob } from './lib/download.js';
 import { createZipRunner, zipPlan } from './lib/zip.js';
+import WipeDialog from './components/WipeDialog.vue';
 import { tierLabel } from './lib/capability.mjs';
 import { bindColumnDnd } from './lib/dnd.js';
 import {
@@ -396,7 +397,7 @@ function taskPct(task) {
 
 function taskMeta(task) {
   if (task.kind === 'download' && task.note) return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.note}`;
-  if (task.kind === 'upload') return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}`;
+  if (task.kind === 'upload') return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}${task.note ? ` · ${task.note}` : ''}`;
   if (task.kind === 'folder-delete') return `已完成 ${task.index || 0}/${task.items?.length || 0} 项`;
   if (task.kind === 'zip') return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.files || 0} 个文件${task.tier ? ` · ${tierLabel(task.tier)}` : ''}`;
   return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)}`;
@@ -641,7 +642,7 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
     id: `task-${++taskSeq}`,
     kind: 'upload',
     title: files.length === 1 ? relPath(files[0]) : `${relPath(files[0])} 等 ${files.length} 个文件`,
-    state: 'queued', done: 0, total: 0, doneBytes: 0, error: '', result: null,
+    state: 'queued', done: 0, total: 0, doneBytes: 0, error: '', result: null, note: '',
     targetLabel: target ? (folderMap.value.get(target)?.name || '目录') : '未分档',
     ttlHours,
   });
@@ -676,8 +677,15 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
   task.cancel = () => up.cancel();
   task.remove = () => { tasks.value = tasks.value.filter((t) => t !== task); };
   task.openResult = () => navigate(task.result?.folderId || '__unfiled__');
+  // 手机上切到后台时告诉用户一句：持了 Web Lock 但系统仍可能节流
+  const onVis = () => {
+    if (['running', 'finishing'].includes(task.state)) {
+      task.note = document.hidden ? '页面在后台，系统可能把上传暂停' : '';
+    }
+  };
+  document.addEventListener('visibilitychange', onVis);
   tasks.value.unshift(task);
-  up.run();
+  up.run().finally(() => document.removeEventListener('visibilitychange', onVis));
 }
 
 function onColumnDragOver(event, col) {
@@ -1203,27 +1211,17 @@ function openDeleteSelected() {
   openConfirm('delete-selected', '删除选中的内容？', `将永久删除选中的 ${selectedItems.value.length} 项，不能撤销。`, null, selectedItems.value);
 }
 
-// 确认词由服务端下发（/api/library 的 wipeConfirm），界面不另存一份
+// 一键清空：确认词由服务端下发（/api/library 的 wipeConfirm），弹层在 components/WipeDialog.vue
+const wipeOpen = ref(false);
 const wipeConfirm = computed(() => data.value.wipeConfirm || '清空全部文件');
-
-/** 一键清空：要人亲手把确认词打一遍才放行（没有登录，这个动作只能靠"故意"来防） */
-function openWipe() {
-  const files = data.value.folders.reduce((s, f) => s + (f.count || 0), 0);
-  const bytes = data.value.folders.reduce((s, f) => s + (f.size || 0), 0);
-  Object.assign(dialog, {
-    open: true,
-    kind: 'wipe',
-    mode: 'prompt',
-    title: '清空服务器上的所有文件？',
-    message: `会删掉 ${files} 个文件（${fmtSize(bytes)}）、所有未完成的上传与无痕传输的残留密文，不能撤销。`,
-    value: '',
-    error: '',
-    busy: false,
-    destructive: true,
-    confirmText: '清空所有文件',
-    target: null,
-    items: [],
-  });
+const wipeStats = computed(() => ({
+  files: data.value.folders.reduce((s, f) => s + (f.count || 0), 0),
+  bytes: data.value.folders.reduce((s, f) => s + (f.size || 0), 0),
+}));
+async function onWiped(receipt) {
+  tasks.value = []; // 任务列表里每一项都指向刚被删掉的批次，留着只会显示一堆失败
+  toast(`已清空：${receipt.removed.batches} 个批次 · ${fmtSize(receipt.removed.bytes)}；历史累计下载 ${receipt.kept.downloadTotal} 次`);
+  await refreshLibrary();
 }
 
 function selectedDeleteItems() {
@@ -1286,11 +1284,6 @@ async function submitDialog() {
       if (!items.length) throw new Error('没有可删除的内容');
       startDeleteTask(`删除选中的 ${items.filter((x) => x.kind === 'folder').length || selectedItems.value.length} 项`, items);
       toast('已开始删除，进度在任务中心');
-    } else if (dialog.kind === 'wipe') {
-      if (value !== wipeConfirm.value) throw new Error(`确认词不对：请完整输入「${wipeConfirm.value}」`);
-      const receipt = await api.wipeLibrary(value);
-      tasks.value = []; // 任务列表里每一项都指向刚被删掉的批次，留着只会显示一堆失败
-      toast(`已清空：${receipt.removed.batches} 个批次 · ${fmtSize(receipt.removed.bytes)}；历史累计下载 ${receipt.kept.downloadTotal} 次`);
     }
     dialog.open = false;
     selected.value = [];
@@ -1558,7 +1551,7 @@ onBeforeUnmount(() => {
       </select>
       <span class="config-hint" v-if="!libraryNotReady" :title="`当前：新上传的文件会在「${ttlLabel(settingsTtl)}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。`">当前：新上传的文件会在「{{ ttlLabel(settingsTtl) }}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。</span>
       <span class="config-hint" v-else>目录索引暂不可用，自动删除设置暂时不能修改。</span>
-      <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="openWipe"><Trash2 :size="15" aria-hidden="true" /><span class="wipe-label">清空所有文件…</span></button>
+      <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="wipeOpen = true"><Trash2 :size="15" aria-hidden="true" /><span class="wipe-label">清空所有文件…</span></button>
     </div>
 
     <div class="layout">
@@ -1860,20 +1853,15 @@ onBeforeUnmount(() => {
         <DialogContent class="dialog">
           <DialogTitle as-child><h3>{{ dialog.title }}</h3></DialogTitle>
           <DialogDescription as-child><p v-if="dialog.message">{{ dialog.message }}</p></DialogDescription>
-          <ul v-if="dialog.kind === 'wipe'" class="wipe-keep">
-            <li>删掉：所有已上传的文件、未传完的暂存分块、无痕传输的中转密文</li>
-            <li>保留：文件夹结构、全局自动删除设置、历史累计下载次数</li>
-            <li>不动：别的程序放进 uploads/ 的目录（只删本服务自己建的「日期_时间」批次）</li>
-          </ul>
           <input
             v-if="dialog.mode === 'prompt'"
             v-model="dialog.value"
             class="input"
             :maxlength="dialogLimit"
-            :placeholder="dialog.kind === 'rename-file' ? '新文件名' : dialog.kind === 'wipe' ? wipeConfirm : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
+            :placeholder="dialog.kind === 'rename-file' ? '新文件名' : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
             @keyup.enter="submitDialog"
           >
-          <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file' && dialog.kind !== 'wipe'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
+          <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
             {{ dialogCharCount }}/{{ FOLDER_NAME_MAX }}
           </div>
           <select v-if="dialog.mode === 'move'" v-model="dialog.value" class="input">
@@ -1889,5 +1877,13 @@ onBeforeUnmount(() => {
         </DialogContent>
       </DialogPortal>
     </DialogRoot>
+
+    <WipeDialog
+      v-model:open="wipeOpen"
+      :confirm-word="wipeConfirm"
+      :files="wipeStats.files"
+      :bytes="wipeStats.bytes"
+      @done="onWiped"
+    />
   </div>
 </template>

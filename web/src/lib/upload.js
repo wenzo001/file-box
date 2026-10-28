@@ -113,6 +113,21 @@ async function encryptChunk(spec, file, ci) {
   return { body: concat(parts), crc: FBCrypto.crcDone(c).toString(16).padStart(8, '0') };
 }
 
+/** 上传期间持一把共享 Web Lock：Chrome 的 Page Lifecycle 写明「持锁的页面不会被冻结」，
+ *  手机上切到后台/锁屏时上传不会整个停住（没有 Web Locks 的浏览器照旧，只节流，不影响功能）。
+ *  用 shared：同时开几个上传互不阻塞；名字固定，页面关掉浏览器自己回收。 */
+function holdAwake() {
+  const locks = typeof navigator !== 'undefined' ? navigator.locks : null;
+  if (!locks || typeof locks.request !== 'function') return () => {};
+  let release = null;
+  let done = false;
+  const held = new Promise((resolve) => { release = resolve; });
+  try {
+    locks.request('filebox-upload', { mode: 'shared' }, () => held).catch(() => { done = true; });
+  } catch { done = true; }
+  return () => { if (!done) { done = true; try { release(); } catch { /* 已经放过 */ } } };
+}
+
 export class UploadTask {
   constructor(files, { folderId = null, ttlHours = null, onUpdate = () => {} } = {}) {
     this.files = files;
@@ -216,6 +231,7 @@ export class UploadTask {
 
   async run() {
     if (this.cancelled || this.state === 'done') return;
+    const releaseLock = holdAwake();
     this.paused = false;
     this.state = 'running';
     this.error = '';
@@ -255,6 +271,7 @@ export class UploadTask {
       this.emit();
     } finally {
       this.abort = null;
+      releaseLock();
     }
   }
 

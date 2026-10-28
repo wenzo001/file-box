@@ -159,6 +159,26 @@ test('清空之后：逐文件账本清掉（同名新批次不继承旧账）�
   }
 });
 
+test('扫描缓存罩着的那 1.5 秒里，刚下载的计数也要立刻看得见', async () => {
+  const srv = await startServer({ SCAN_CACHE_MS: '1500' }, null, 59);
+  try {
+    const up = await uploadBundle(srv, hexKey(40), [{ enc: 'now.enc', chunks: [64] }]);
+    const lib = async () => (await (await fetch(`${srv.base}/api/library`)).json());
+    await lib(); // 预热扫描缓存
+    const dl = await fetch(`${srv.base}/api/download/${up.folder}/now.enc`);
+    assert.strictEqual(dl.status, 200);
+    await dl.arrayBuffer();
+    const after = await lib();
+    const batch = after.batches.find((b) => b.name === up.folder);
+    assert.strictEqual(batch.files.find((f) => f.name === 'now.enc').downloads, 1,
+      '缓存窗内刚下载的文件计数还是 0（计数要立刻可见，不能滞后 1.5 秒）');
+    assert.strictEqual(batch.downloads, 1, '目录汇总也要立刻更新');
+    assert.strictEqual(after.downloadsTotal >= 1, true);
+  } finally {
+    await srv.stop();
+  }
+});
+
 test('真实上传链路也要能记上次数（前端走的就是这条路）', async () => {
   const srv = await startServer({}, null, 56);
   try {

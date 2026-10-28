@@ -103,6 +103,3 @@ export function createZipRunner({ items, tier, filename, onProgress = () => {} }
 
   return { total: job.total, tier, prepare, run, dispose };
 }
-
-export { TIER, tierLabel } from './capability.mjs';
-export { capMessage } from './capability.mjs';

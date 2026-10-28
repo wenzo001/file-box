@@ -126,8 +126,3 @@ export function createZipJob(items, opts = {}) {
 
   return { total, run, get index() { return index; } };
 }
-
-/** 一次性用法（测试 / 不需要暂停的场景） */
-export function buildZip(items, opts = {}) {
-  return createZipJob(items, opts).run({ signal: opts.signal });
-}

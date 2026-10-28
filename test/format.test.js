@@ -140,6 +140,9 @@ function fileEgressRoutes(src) {
     }
     return null;
   };
+  const MARK = /\.pipe\(res\)|res\.download\(|res\.sendFile\(|res\.write\(|res\.end\(/;
+  // text/event-stream 也算安全声明：SSE 只会被当成事件流读，浏览器不会把它渲染成页面
+  const SAFE = /Content-Disposition|application\/octet-stream|text\/event-stream|res\.download\(/;
   const out = [];
   for (const mark of marks) {
     const open = code.indexOf('(', mark.at);
@@ -147,11 +150,34 @@ function fileEgressRoutes(src) {
     // 括号配对失败就按"没声明"记：仪器没法界定这条路由时必须失败，不能默默放行
     if (!span) { out.push({ route: mark.route, safe: false, bounded: false }); continue; }
     const block = code.slice(span.start, span.end);
-    if (!/\.pipe\(res\)|res\.download\(|res\.sendFile\(|res\.write\(|res\.end\(/.test(block)) continue;
-    const safe = /Content-Disposition/.test(block)
-      || /application\/octet-stream/.test(block)
-      || /res\.download\(/.test(block);
-    out.push({ route: mark.route, safe });
+    if (!MARK.test(block)) continue;
+    out.push({ route: mark.route, safe: SAFE.test(block) });
+  }
+  // 处理函数被搬到 lib/ 里时（egress 就是这么搬的），按名扫函数体：const x = (req,res) => {...} / function x(req,res) {...}
+  const braceSpan = (openAt) => {
+    let depth = 0;
+    for (let i = openAt; i < code.length; i++) {
+      const ch = code[i];
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const q = ch;
+        for (i++; i < code.length && code[i] !== q; i++) { if (code[i] === '\\') i++; }
+        continue;
+      }
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (!depth) return { start: openAt, end: i + 1 }; }
+    }
+    return null;
+  };
+  const FN = /(?:const\s+(\w+)\s*=\s*(?:async\s*)?|function\s+(\w+)\s*)\(\s*req\s*,\s*res\s*\)\s*(?:=>\s*)?\{/g;
+  let fm;
+  while ((fm = FN.exec(code))) {
+    const name = fm[1] || fm[2];
+    const open = fm.index + fm[0].length - 1;
+    const span = braceSpan(open);
+    if (!span) { out.push({ route: name, safe: false, bounded: false }); continue; }
+    const block = code.slice(span.start, span.end);
+    if (!MARK.test(block)) continue;
+    out.push({ route: name, safe: SAFE.test(block) });
   }
   return out;
 }
@@ -171,15 +197,22 @@ test('往外吐文件字节的路由必须声明 attachment 或 octet-stream（�
     [{ route: '/api/c', safe: false }],
     '注释里写 attachment 不算声明',
   );
+  assert.deepStrictEqual(
+    fileEgressRoutes("const leak = (req, res) => { res.end(Buffer.from('x')); };"),
+    [{ route: 'leak', safe: false }],
+    '扫描器看不见"搬到 lib/ 里的具名处理函数"',
+  );
 
   const seen = [];
-  for (const f of ['server.js', 'lib/transfer.js']) {
+  for (const f of ['server.js', 'lib/egress.js', 'lib/transfer.js']) {
     const src = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
     for (const it of fileEgressRoutes(src)) seen.push({ file: f, ...it });
   }
-  // 下限 + 点名：这几条必须真的被扫到，少一条说明判据对它空着
-  for (const r of ['/api/download/:folder/:file', '/api/archive/:folder', '/api/xfer/seg']) {
-    assert.ok(seen.some((s) => s.route === r), `没扫到 ${r}（只扫到 ${seen.map((s) => s.route).join(', ')}）`);
+  // 下限 + 点名：这几处必须真的被扫到，少一条说明判据对它空着
+  const must = [['lib/egress.js', 'download'], ['lib/egress.js', 'archive'], ['lib/transfer.js', '/api/xfer/seg']];
+  for (const [file, name] of must) {
+    assert.ok(seen.some((s) => s.file === file && s.route === name),
+      `没扫到 ${file} 的 ${name}（只扫到 ${seen.map((s) => `${s.file}:${s.route}`).join(', ')}）`);
   }
   const unsafe = seen.filter((s) => !s.safe);
   assert.deepStrictEqual(unsafe, [], `这些路由会把文件字节吐出去却没有 attachment / octet-stream：\n${JSON.stringify(unsafe)}`);

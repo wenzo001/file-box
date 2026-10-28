@@ -149,8 +149,8 @@ export async function decryptToStore(o) {
   await plainStore.clear();
   const writer = await plainStore.openWriter({ append: false });
   const q = queueOf(typeof src.stream === 'function' ? src.stream() : src);
-  // 上传时明文是**向上补到 64KiB 的**：清单里的 size 才是真实大小。
-  // 所以这里只能"多出来的裁掉、少了才报错"，判"严格相等"会把所有带填充的文件当成损坏。
+  // 上传时明文向上补到 64KiB，清单里的 size 才是真实大小：只能"多的裁掉、少了才报错"。
+  // shortcut: 没有清单的旧文件不知道真实大小，会带 ≤64KiB 零填充；补清单或迁移旧数据后移除。
   let plainTotal = 0;
   let decryptedTotal = 0;
   try {

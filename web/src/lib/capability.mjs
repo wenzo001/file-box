@@ -29,12 +29,6 @@ export function zipBytes(items) {
   return (items || []).reduce((sum, it) => sum + (it.dir ? 0 : (n(it.plainSize) || n(it.cipherSize))), 0);
 }
 
-/** 内存兜底的上限话术（单文件与打包共用一套） */
-export function capMessage(capBytes) {
-  const mb = Math.round((Number(capBytes) || 0) / 1024 / 1024);
-  return `这台设备的浏览器不支持断点续存（OPFS），大于 ${mb}MB 的下载传不完：请用电脑，或让发送方走「无痕传输」`;
-}
-
 /** 阶梯的可读标签（界面/日志用，别在别处再抄一份） */
 export function tierLabel(tier) {
   return {

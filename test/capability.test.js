@@ -20,7 +20,6 @@ test('没有 OPFS：小文件进内存，超上限的单文件直接给话术，
 
   const big = cap.pickTier({ kind: 'file', opfs: false, bytes: 700 * MB, capBytes: 50 * MB });
   assert.strictEqual(big.tier, 'memory', '单文件没有更低的一档：仍标 memory，由调用方按话术拒掉');
-  assert.ok(cap.capMessage(50 * MB).includes('50MB'));
 
   const bigZip = cap.pickTier({ kind: 'zip', opfs: false, bytes: 700 * MB, capBytes: 50 * MB });
   assert.strictEqual(bigZip.tier, 'per-file', '大包在无 OPFS 的端上要降级成逐个文件，而不是整包失败');

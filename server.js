@@ -10,6 +10,22 @@ const { createLibrary, LibraryError, TTL_HOURS } = require('./lib/library');
 const { commitStaging } = require('./lib/staging');
 const { createMaintenance, WIPE_CONFIRM } = require('./lib/maintenance');
 const { folderIdOrUnfiled, ttlHours, schemas } = require('./lib/schemas');
+// ---- 文件库侧的限速 ----
+// 这两个接口最贵（init 会扫过期批次、library 会扫盘），匿名者按任意频率打就是自伤式 DoS。
+// 桶与无痕传输那边同形；默认值都留足正常用量（一个人 10 秒轮询一次 = 6/分；一次上传 1 次 init）。
+const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS) || 60 * 1000;
+const INIT_PER_WINDOW = Number(process.env.INIT_PER_WINDOW) || 60;
+const LIBRARY_PER_WINDOW = Number(process.env.LIBRARY_PER_WINDOW) || 240;
+const { createRateLimiter } = require('./lib/rate-limit');
+const initLimiter = createRateLimiter({ limit: INIT_PER_WINDOW, windowMs: RATE_WINDOW_MS });
+const libraryLimiter = createRateLimiter({ limit: LIBRARY_PER_WINDOW, windowMs: RATE_WINDOW_MS });
+function gateRate(limiter, label) {
+  return (req, res, next) => {
+    if (limiter.hit(req.ip || '?')) return next();
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(RATE_WINDOW_MS / 1000))));
+    res.status(429).json({ error: `${label}太频繁，请稍后再试` });
+  };
+}
 
 const app = express();
 // 反代部署时设 TRUST_PROXY=1（或 express 支持的 trust proxy 配置串），
@@ -209,6 +225,14 @@ function countDownload(folder, file) {
   rec[file] = (rec[file] || 0) + 1;
   downloads[folder] = rec;
   downloads[LEDGER_TOTAL] = downloadTotal() + 1; // 逐文件账本会被"清空"清掉，这一格不会
+  // 扫盘结果缓存 1.5 秒，但"刚下载的"这件事要立刻看得见：命中缓存时就把那一条就地加一
+  const cached = scanCache.value;
+  const batch = cached && cached.find((b) => b.name === folder);
+  const row = batch && batch.files.find((f) => f.name === file);
+  if (row) {
+    row.downloads = (row.downloads || 0) + 1;
+    batch.downloads = (batch.downloads || 0) + 1;
+  }
   scheduleFlush();
 }
 /** 目录被删（手动）后账本条目要跟着走：否则它一直占着一格，还可能被以后同名的目录继承 */
@@ -599,7 +623,7 @@ async function buildLibraryPayload() {
 }
 
 // 1) 申请批次：同一指纹（同一批文件）会拿回同一个批次和已传的块，用于断点续传
-app.post('/api/upload/init', express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
+app.post('/api/upload/init', gateRate(initLimiter, '开始上传'), express.json({ limit: '2mb' }), asyncHandler(async (req, res) => {
   const { key, files } = req.body || {};
   if (typeof key !== 'string' || !/^[a-f0-9]{16,64}$/.test(key)) {
     return res.status(400).json({ error: '批次标识不合法' });
@@ -911,7 +935,7 @@ app.get('/api/list', (req, res) => {
 });
 
 // ---- 新界面的目录树 + 批次视图 ----
-app.get('/api/library', asyncHandler(async (req, res) => {
+app.get('/api/library', gateRate(libraryLimiter, '刷新列表'), asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json(await buildLibraryPayload());
 }));
@@ -1291,106 +1315,15 @@ app.delete('/api/folder/:folder', asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ---- 下载单个文件（密文，前端收到后自动解密；支持 Range 续传） ----
-app.get('/api/download/:folder/:file', (req, res) => {
-  const folderReal = resolveFolder(req.params.folder);
-  const fp = resolveFile(folderReal, req.params.file);
-  if (!fp) return res.status(404).json({ error: '文件不存在' }); // 不区分"名字不合法/不在界内/不存在"，不给探测者反馈
-  const folderName = path.basename(folderReal);
-  const fileName = path.basename(fp);
-  res.setHeader('Accept-Ranges', 'bytes');
-
-  const range = req.headers.range;
-  if (range) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range));
-    if (m && (m[1] !== '' || m[2] !== '')) {
-      let stat;
-      try { stat = fs.statSync(fp); } catch { return res.status(404).json({ error: '文件不存在' }); }
-      let start = m[1] === '' ? null : Number(m[1]);
-      let end = m[2] === '' ? null : Number(m[2]);
-      if (start === null) {
-        start = Math.max(0, stat.size - end);
-        end = stat.size - 1;
-      } else if (end === null || end >= stat.size) {
-        end = stat.size - 1;
-      }
-      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end || start >= stat.size) {
-        res.status(416).setHeader('Content-Range', `bytes */${stat.size}`);
-        return res.end();
-      }
-      // 续传请求（起点 > 0）不重复计下载次数；只有真正从头取才 +1
-      if (start === 0) countDownload(folderName, fileName);
-      res.status(206);
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
-      res.setHeader('Content-Length', String(end - start + 1));
-      res.setHeader('Content-Type', 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-      const stream = fs.createReadStream(fp, { start, end });
-      stream.on('error', () => {
-        if (!res.headersSent) res.status(500).end();
-        else res.destroy();
-      });
-      stream.pipe(res);
-      return;
-    }
-  }
-
-  countDownload(folderName, fileName); // 走到这里才算是"开始吐字节"
-  res.download(fp, fileName);
+// ---- 下载 / 归档（并发名额、Range 续传、归档分帧都在 lib/egress.js 里） ----
+const { createEgress } = require('./lib/egress');
+const egress = createEgress({
+  resolveFolder, resolveFile, countDownload,
+  manifest: MANIFEST,
+  maxInFlight: Number(process.env.MAX_EGRESS) || 32,
 });
-
-// ---- 归档下载：把整个目录的密文拼成一条流（纯聚合，不压缩） ----
-// 帧格式：[2B 名长][文件名 UTF-8][8B 数据长(大端)][数据]
-// manifest.enc 放在最前，客户端先解出真实文件名，再按序还原其余文件
-app.get('/api/archive/:folder', async (req, res) => {
-  const dir = resolveFolder(req.params.folder);
-  if (!dir) return res.status(404).json({ error: '目录不存在' });
-  let parts;
-  try {
-    parts = fs
-      .readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile() && d.name !== 'manifest.enc.tmp')
-      .map((d) => ({ name: d.name, size: fs.statSync(path.join(dir, d.name)).size }));
-  } catch {
-    return res.status(404).json({ error: '目录不存在' });
-  }
-  if (!parts.length) return res.status(404).json({ error: '目录为空' });
-  // 归档 = 整包被取走一次：每个文件各记一次（清单文件仍不记），目录级汇总就是它们的和
-  parts.forEach((p) => countDownload(path.basename(dir), p.name));
-  parts.sort((a, b) =>
-    a.name === MANIFEST ? -1 : b.name === MANIFEST ? 1 : a.name.localeCompare(b.name));
-
-  const total = parts.reduce((s, p) => s + 10 + Buffer.byteLength(p.name) + p.size, 0);
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', String(total));
-  res.setHeader('Cache-Control', 'no-store');
-
-  let body = null; // 当前正在读的文件流，客户端断开时要关掉
-  res.on('close', () => body && body.destroy());
-  const write = (b) =>
-    res.write(b) ? Promise.resolve(true) : new Promise((r) => res.once('drain', () => r(!res.writableEnded)));
-
-  try {
-    for (const p of parts) {
-      const nameB = Buffer.from(p.name, 'utf8');
-      const head = Buffer.alloc(10 + nameB.length);
-      head.writeUInt16BE(nameB.length, 0);
-      head.writeBigUInt64BE(BigInt(p.size), 2);
-      nameB.copy(head, 10);
-      if (!(await write(head))) return;
-      body = fs.createReadStream(path.join(dir, p.name), { highWaterMark: 1024 * 1024 });
-      for await (const chunk of body) if (!(await write(chunk))) break;
-      body.destroy();
-      body = null;
-      if (res.writableEnded) return;
-    }
-    res.end();
-  } catch {
-    if (body) body.destroy();
-    if (!res.headersSent) res.status(500).json({ error: '打包失败' });
-    else res.destroy();
-  }
-});
+app.get('/api/download/:folder/:file', egress.gate, egress.download);
+app.get('/api/archive/:folder', egress.gate, egress.archive);
 
 // ---- 无痕传输：一次性会话 + 密文中转（独立模块，与上面的文件库完全分开） ----
 const { createTransferApi } = require('./lib/transfer');

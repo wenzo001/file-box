@@ -154,15 +154,15 @@ npm run pack       # 依赖已装好时只 build + 出包
   不能排除的：库在 drop 时把 DOM 挪了位置，而某个我们没想到的地方把它当成了真移动。
   这一格现在由两条判据共同守着（PATCH 调用边 + 父级结果），**别把"结果对了"当成机制清楚了**；下次接手先在这行 PATCH 的 request 监听里打 `req.postData()`，看它是谁发的。
 - 手机档的**真机验证仍欠着**：`test/lab/mobile-smoke.js` 跑的是 Chromium 触摸仿真（390 / 360 / 320 三档、`hasTouch` + `isMobile`），能证明命中区、iOS 缩放阈值、裁切、对比度和"触摸点得动"，但证明不了 iPhone Safari 上的两件真事：① 长按拖动（`@formkit/drag-and-drop` 的触摸档要长按才起拖，仿真里没做这条腿）；② `env(safe-area-inset-*)` 在真有刘海和 home 指示条的机器上的实际让位量（仿真里 env() 恒为 0）。这两条要么上真机，要么留在这格，别当成已验。
-- **审计留下、本版没修的几格**（都写成了可证伪的读法，不是"注意一下"）：
-  - 文件库侧**仍没有速率限制**：`/api/library`、`/api/upload/init`、下载与归档都可以被匿名者按任意频率打（无痕传输有 create / join-fail / probe 三套桶）。扫描本身已经加了一层 1.5 秒缓冲（`SCAN_CACHE_MS`，`forgetUsage()` 会让它立刻失效），所以"并发 N 个页面轮询"这一族的放大已经压到最多每 1.5 秒一次扫描；**剩下的**是"单机被刷"这一类。证伪方式：60 秒内打 200 次 `/api/upload/init` 与 50 次归档，看有没有 429、fd 数是否持续上涨。修法方向：给文件库侧加一套和无痕传输同形的限流桶。
-  - 文件库侧的下载与归档没有并发上限（`/api/download`、`/api/archive`）；无痕传输有 `MAX_INFLIGHT`。证伪方式：并发 200 个归档请求量 fd 数与错误率。
-  - 没有 `X-Content-Type-Options: nosniff`，也没有 CSP / `frame-ancestors`。上传一个 `evil.html`（客户端可以随便声明文件名）再由 `/api/download` 取回：**现在不会执行**，因为下载与 Range 两条路都带 `Content-Disposition: attachment`、归档是 `application/octet-stream`。但这条不变量没有判据守着，改动下载路径时很容易被拆掉 —— 加安全头之前，先补一条"任何吐文件的响应都必须带 attachment 或 octet-stream"的静态判据。
-  - 文件库用一把部署内置密钥（见 §9），**混进页面就能解开**；要真隔离只能走无痕传输。这条是本版有意不做的（改动会牵动分享、搜索、打包），不当漏洞处理，但别在文档/对外说明里叫它端到端。
+- **审计那几格现在的状态**（都留了可证伪的读法）：
+  - **限速与并发：已修**。`/api/upload/init`、`/api/library` 各有一个按 IP 的固定窗口桶（`INIT_PER_WINDOW` 默认 60、`LIBRARY_PER_WINDOW` 默认 240、`RATE_WINDOW_MS` 默认 60 秒）；`/api/download` 与 `/api/archive` 共用 `MAX_EGRESS`（默认 32）个名额，满了回 429 + `Retry-After`，名额在响应结束/断开时归还。判据：`test/rate-limit.test.js`、`test/egress-limit.test.js`（含"占满后 429、腾出来立刻恢复""别的 JSON 接口不受牵连"；两把刀：路由不挂桶 / 第三个并发不挡）。
+  - **仍欠**：没有 `X-Content-Type-Options: nosniff`，也没有 CSP / `frame-ancestors`。上传 `.html` 目前不会执行（下载带 attachment、归档与无痕分段是 octet-stream、SSE 是 text/event-stream），这三条由静态门（扫 `server.js` + `lib/*.js` 的吐字节函数/路由）与行为腿（四条路读真响应头）守着；加安全头属于纵深防御，本版没做。
+  - **有意不做**：文件库用一把部署内置密钥（见 §9），混进页面就能解开 —— 要真隔离只能走无痕传输。
+- **没有加密清单的旧文件，下载/打包会带 ≤64KiB 的零填充**：上传时明文向上补到 64KiB 的整数倍（"看不出精确大小"那条特性），真实大小只记在加密清单里；没有清单就没有真相。代码里以 `shortcut:` 标注，补清单或迁移旧数据后移除。
 - 目录名加密（当前明文；文件内容/真实文件名仍加密）。
 - 跨标签页任务同步、任务记录跨刷新持久化（未完成上传和下载 partial 的恢复见 §6）。
 - 全局搜索由浏览器拉取并解密所有清单后完成；清单数量极大时首次搜索需要等待「正在读取文件名」，没有服务端明文索引（那会让服务器看见真实文件名，破坏「服务器只见密文」的边界）。
-- 目录 / 多选 zip 在浏览器内解密后组装，服务端没有明文，也不能替客户端拼 zip；超大目录会受浏览器内存限制，建议分批打包。
+- 目录 / 多选 zip 在浏览器内解密后组装，服务端没有明文，也不能替客户端拼 zip。能写 OPFS 的端是边解密边写盘（不受大小限制），没有 OPFS 且超上限的会降级成逐个文件下载；**暂停后继续是从头重新打包**（顺序流续不了，但密文 partial 复用、不重新下载）。
 
 ## 11 验证记录（2026-10-27）
 
@@ -208,5 +208,13 @@ npm run pack       # 依赖已装好时只 build + 出包
   - **这轮抓到一个我自己造的真回归**：产品里明文是**向上补到 64KiB** 的，清单里的 `size` 才是真实大小；我在新写 `decryptToStore` 时判"严格相等"，把所有带填充的文件都判成"数据不完整"（桌面台面直接红在「文件长度与清单不符」）。改成"多出来的裁掉、少了才报错"，并补一条**带填充的**单测（64KiB 密文 + 声明 11 字节 → 输出恰好 11 字节）。教训：夹具必须造出产品的真实形状（补位），否则新判据在真实数据上第一条就炸。
   - 真浏览器腿 `test/lab/zip-fallback.js`：把 `navigator.storage` 掐掉、`MEM_DOWNLOAD_MAX_MB=1`，两个 600KB 文件的目录打包 → **逐个下载**出两个 614400 字节的文件，任务行写着「逐个文件」。`library-smoke` 的目录 zip 与多选 zip 现在走磁盘档，仍逐个解开核对内容。
   - 仍欠：暂停后继续是**从头重新打包**（zip 是顺序流，半截条目没法续；密文 partial 会复用，所以不重新下载）；`showSaveFilePicker`（桌面直接写用户选的文件）没做；iPhone 上超大文件的最终保存仍要真机验。
+- 审计整改（同日第八批）：`npm test` 在最终树 **211/211** 通过（204 → 211：并发上限 2 条、限速 4 条、计数可见性 1 条）。
+  - **并发上限**：`/api/download` 与 `/api/archive` 共用 `MAX_EGRESS`（默认 32）个名额，满了 429 + `Retry-After`，`finish`/`close` 归还。判据用裸 `http` 客户端故意不读 body 占住名额（`test/egress-limit.test.js`）；刀：不挂闸门 → 「第三个并发下载没被挡（200）」。
+  - **限速**：`lib/rate-limit.js`（固定窗口 + 键上界，跟传输那三套桶同形），`init` 与 `library` 各一个桶。三条单测（窗口/键上界/只挤最老的）+ 一条真服务腿（第 3 次 429、窗口过了恢复、`/api/settings` 与 `/api/uploads` 不受牵连）；刀：`library` 不挂桶 → 「第 3 次 library 该被限速」。
+  - **上传后台保护**：`UploadTask.run()` 期间持一把 `shared` 模式的 Web Lock（`filebox-upload`），Chrome 的 Page Lifecycle 下持锁页面不被冻结；同时开多个上传互不阻塞。台面 `test/lab/upload-lock.js` 把 `navigator.locks.request` 换成记录器：读到 `{name:"filebox-upload",mode:"shared",state:"released"}`；刀：不持锁 → 「上传期间没有申请 Web Lock」。
+  - **下载计数不再滞后**：扫描缓存 1.5 秒内命中时，`countDownload` 把缓存里那一条就地加一（文件行 + 目录汇总），所以下载完立刻刷新就能看到。判据在 `test/downloadstats.test.js`（缓存窗内计数必须是 1）。
+  - **死代码**：删掉 `zip-core.buildZip`（0 引用）、`zip.js` 的三行 re-export、`download.js` 的 `MEM_MAX_BYTES` re-export、`lib/transfer.js` 里定义了却没人用的 `stopSweeper` / `inRanges`，以及和 `memoryCapProblem` 重复的那份上限话术（`capability.capMessage`）。
+  - **拆分**：下载/归档整块搬进 `lib/egress.js`（工厂注入 `resolveFolder`/`resolveFile`/`countDownload`，行为一字没改，路径闸门那 16 条行为判据全绿）；维护弹层从 `App.vue` 拆成 `web/src/components/WipeDialog.vue`（`library-smoke` 的清空腿仍绿）。**静态门随之改到新位置**：现在扫 `server.js` + `lib/egress.js` + `lib/transfer.js`，并同时认"内联路由"和"具名处理函数"两种形状 —— 不这么改，门口那条 1.5 万行的搬家会让门直接变瞎（红了才发现）。刀：内联泄漏路由 → 点名 `/api/leak`；具名泄漏函数 → 仪器自检那条直接覆盖。
+  - **旧文件填充**：代码里按 `shortcut:` 标注（没有清单就没有真实大小，会带 ≤64KiB 零填充），文档 §10 也写了。
 - **历史未查明（不当已通过）**：在 151 条版本的一次串行全量里出现 `150/151`，失败在 `test/xfer-channel.test.js` 的“收尾被一直拒收”，错误是 `api/xfer/create` 400；单跑该文件 `30/30` 通过，随后 151 条全量通过，未能复现。154 条版本连跑两遍通过；157 条版本通过一次；本轮**在 168 条那棵树**（加手机档静态门之前）第一遍 167/168，红的是同一文件另一条腿「卡住之后自己恢复了：要跑完，并且不许留着旧的"卡住了"吓用户」，断言读数 `进度已 sent=17/17 ack=17` 而界面仍挂「写入分段失败」，且台架自报 `refuse=0 hang=0` 收尾请求 `http200`（即收尾没被拒，红在"文案没跟着恢复收掉"——与 151 版那条"一直拒收"不是同一个形状，不能并成一条）；紧接着单跑该文件 `30/30` 通过，同一棵树再跑全量 `168/168` 通过；补上手机档静态门后的最终树（169 条）全量通过一次，未再复现。这条历史红（现在有两种签名）仍按未查明登记，不当已通过。
 - `npm test` 现在带 `--test-concurrency=1`，并在 `pretest` 先执行 `npm run build`；直接 `node --test` 前也要先构建 `dist-web`。
