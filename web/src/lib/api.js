@@ -25,7 +25,6 @@ const q = (value) => encodeURIComponent(String(value));
 export const api = {
   library: () => request('library'),
   uploads: () => request('uploads'),
-  settings: () => request('settings'),
   saveSettings: (settings) => json('settings', 'PUT', settings),
 
   createFolder: (name, parentId) => json('folders', 'POST', { name, parentId }),
@@ -33,7 +32,6 @@ export const api = {
   deleteFolder: (id, mode) => request(`folders/${q(id)}${mode === 'empty' ? '?mode=empty' : ''}`, { method: 'DELETE' }),
 
   moveBatch: (batch, folderId) => json(`batches/${q(batch)}`, 'PATCH', { folderId }),
-  moveBatches: (names, folderId) => json('batches', 'PATCH', { names, folderId }),
   deleteBatch: (batch, expectFolder) => {
     const expect = expectFolder === undefined ? '' : `?expectFolder=${q(expectFolder ?? '__unfiled__')}`;
     return request(`folder/${q(batch)}${expect}`, { method: 'DELETE' });

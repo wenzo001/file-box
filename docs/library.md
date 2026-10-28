@@ -216,5 +216,10 @@ npm run pack       # 依赖已装好时只 build + 出包
   - **死代码**：删掉 `zip-core.buildZip`（0 引用）、`zip.js` 的三行 re-export、`download.js` 的 `MEM_MAX_BYTES` re-export、`lib/transfer.js` 里定义了却没人用的 `stopSweeper` / `inRanges`，以及和 `memoryCapProblem` 重复的那份上限话术（`capability.capMessage`）。
   - **拆分**：下载/归档整块搬进 `lib/egress.js`（工厂注入 `resolveFolder`/`resolveFile`/`countDownload`，行为一字没改，路径闸门那 16 条行为判据全绿）；维护弹层从 `App.vue` 拆成 `web/src/components/WipeDialog.vue`（`library-smoke` 的清空腿仍绿）。**静态门随之改到新位置**：现在扫 `server.js` + `lib/egress.js` + `lib/transfer.js`，并同时认"内联路由"和"具名处理函数"两种形状 —— 不这么改，门口那条 1.5 万行的搬家会让门直接变瞎（红了才发现）。刀：内联泄漏路由 → 点名 `/api/leak`；具名泄漏函数 → 仪器自检那条直接覆盖。
   - **旧文件填充**：代码里按 `shortcut:` 标注（没有清单就没有真实大小，会带 ≤64KiB 零填充），文档 §10 也写了。
+- 全功能审计（同日第九批）：`npm test` **211/211**；**八条**浏览器台面全绿（library / mobile / download-resume / zip-fallback / upload-lock / folder-delete-nav / feature-sweep / ui-smoke）。
+  - 补上了"只有端点判据、没有界面判据"的四条主路径（`test/lab/feature-sweep.js`）：文件行 ⋯ → 重命名（甲.txt → 乙.txt，同批另一份不受影响）、文件行 ⋯ → 删除（最后一个文件删掉后批次整个消失）、文件 ⋯ → 移动这批上传到…（批次 `folderId` 真的换到目标目录）、下载 **暂停 → 继续**（把那一发请求扣住 → 点暂停读到「已暂停」→ 点继续 → 放到完成）。台面读到的第一版两处仪器错：任务行的类只有 `.task` + 状态类（我写了 `.task.download`，压根匹配不到）；下载事件在失败时是 unhandled rejection，先崩后才看到真错。
+  - 前端→后端接线：`api.js` 的方法与调用点做了一次双向差集，发现两个"定义了没人用"的客户端包装（`settings`、`moveBatches`），已删；服务端端点保留（有判据、文档里也有）。
+  - **"没人用的导出"清单要带自检**：第一版扫描器在 Windows 上按 `/lib/` 匹配正斜杠路径，一个文件都没扫到却打印"没有无人使用的导出"——典型"0 条 ≠ 检查过"。重写成按路径段判断 + 注入假名字自检后，扫到 29 个文件 / 85 个导出，其中 26 个导出生产代码不引用（多数是测试缝或成对保留的常量，没动；只删了上面两个确定死的客户端包装）。
+  - 审计确认没变的两处：无痕传输只在本机跑过（`SMOKE PASS` + 引擎腿），真直连 / TURN 仍未验；手机真机仍未验。
 - **历史未查明（不当已通过）**：在 151 条版本的一次串行全量里出现 `150/151`，失败在 `test/xfer-channel.test.js` 的“收尾被一直拒收”，错误是 `api/xfer/create` 400；单跑该文件 `30/30` 通过，随后 151 条全量通过，未能复现。154 条版本连跑两遍通过；157 条版本通过一次；本轮**在 168 条那棵树**（加手机档静态门之前）第一遍 167/168，红的是同一文件另一条腿「卡住之后自己恢复了：要跑完，并且不许留着旧的"卡住了"吓用户」，断言读数 `进度已 sent=17/17 ack=17` 而界面仍挂「写入分段失败」，且台架自报 `refuse=0 hang=0` 收尾请求 `http200`（即收尾没被拒，红在"文案没跟着恢复收掉"——与 151 版那条"一直拒收"不是同一个形状，不能并成一条）；紧接着单跑该文件 `30/30` 通过，同一棵树再跑全量 `168/168` 通过；补上手机档静态门后的最终树（169 条）全量通过一次，未再复现。这条历史红（现在有两种签名）仍按未查明登记，不当已通过。
 - `npm test` 现在带 `--test-concurrency=1`，并在 `pretest` 先执行 `npm run build`；直接 `node --test` 前也要先构建 `dist-web`。

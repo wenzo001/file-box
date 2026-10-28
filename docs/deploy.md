@@ -188,6 +188,7 @@ npm run release
 npm test
 node test/lab/library-smoke.js       # 真浏览器：多栏目录 / 全局 TTL / 分享高亮 / zip / 搜索 / 窄屏
 node test/lab/mobile-smoke.js        # 真浏览器触摸档：390/360/320 的 44pt 命中区、iOS 缩放、裁切、浏览区高度、对比度
+node test/lab/feature-sweep.js       # 真浏览器主路径扫查：文件重命名 / 文件删除 / 移动到… / 下载暂停继续
 SMOKE_MB=2 node test/lab/ui-smoke.js # 真浏览器：无痕传输
 ```
 
