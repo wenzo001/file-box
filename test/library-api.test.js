@@ -230,3 +230,32 @@ test('启动 TTL 扫描：过期批次物理删除、索引删除、目录保留
     await ttlSrv.stop();
   }
 });
+
+// 每个打开的页面每 10 秒拉一次 /api/library，而它是全量扫盘（每个文件一次 stat）。
+// 缓存只罩住"扫盘结果"，不罩 now / 目录树；任何本地改动都必须立刻让它失效。
+test('library 扫描缓存：缓冲窗内不重扫、到点重扫；本地改动立刻失效', async () => {
+  const cacheSrv = await startServer({ SCAN_CACHE_MS: '1500' }, null, 8);
+  try {
+    const read = async () => (await jget(`${cacheSrv.base}/api/library`)).body;
+    const name = '20260202_1010';
+    const dir = path.join(cacheSrv.dir, 'uploads', name);
+
+    const first = await read(); // 预热缓存
+    await new Promise((r) => setTimeout(r, 40));
+    const warm = await read();
+    assert.ok(warm.now > first.now + 25, `now 必须每帧重算，不能跟着扫描结果一起被缓存（${first.now} → ${warm.now}）`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'x.enc'), 'X');
+    assert.strictEqual((await read()).batches.some((b) => b.name === name), false,
+      '缓冲窗内不该重扫（要么缓存没生效，要么窗口太长）');
+
+    await new Promise((r) => setTimeout(r, 1700));
+    assert.strictEqual((await read()).batches.some((b) => b.name === name), true, '过了 TTL 必须重扫到');
+
+    assert.strictEqual((await fetch(`${cacheSrv.base}/api/folder/${name}`, { method: 'DELETE' })).status, 200);
+    assert.strictEqual((await read()).batches.some((b) => b.name === name), false,
+      '走 API 的改动必须立刻可见，不能等缓存过期');
+  } finally {
+    await cacheSrv.stop();
+  }
+});

@@ -434,7 +434,8 @@ function usedBytes() {
   }
   return usageCache.bytes;
 }
-const forgetUsage = () => { usageCache.at = 0; }; // 提交/删除后立刻失效，别让缓存骗人
+// 提交/删除/清空/回收之后立刻失效：占用与扫描两份缓存都不许再骗人
+const forgetUsage = () => { usageCache.at = 0; scanCache = { at: 0, value: null }; };
 
 // 启动回收放在占用统计可用之后（sweepStaging 要调 forgetUsage，提前调会踩到未初始化的缓存）
 reclaimStagingOnBoot();
@@ -444,9 +445,17 @@ const BATCH_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'ba
 const FOLDER_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
 
 /** 只扫本服务创建的日期批次；文件名/大小来自磁盘，下载次数来自 .stats */
+// 每个打开的页面每 10 秒拉一次 /api/library，而它是全量扫盘（每个文件一次 stat）：
+// 这里只缓存"扫盘结果"，不缓存 now / 目录树 / 设置；任何本地改动都要 forgetUsage() 让它立刻失效。
+// SCAN_CACHE_MS=0 可关掉（测试夹具就是这么用的：它们默认"盘上一变就能看见"）。
+const SCAN_CACHE_MS = Number.isFinite(Number(process.env.SCAN_CACHE_MS))
+  ? Number(process.env.SCAN_CACHE_MS)
+  : 1500;
+let scanCache = { at: 0, value: null };
 function scanUploadBatches() {
+  if (scanCache.value && Date.now() - scanCache.at < SCAN_CACHE_MS) return scanCache.value;
   ensureUploadDir();
-  return fs
+  const scanned = fs
     .readdirSync(UPLOAD_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory() && isFolderName(d.name))
     .map((d) => {
@@ -466,6 +475,8 @@ function scanUploadBatches() {
       };
     })
     .sort((a, b) => BATCH_COLLATOR.compare(b.name, a.name));
+  scanCache = { at: Date.now(), value: scanned };
+  return scanned;
 }
 
 /** 旧批次的展示时间：只用于 uploadedAt 兜底，不参与清理 */

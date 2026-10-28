@@ -60,6 +60,9 @@ async function boot(dir, PORT, extra) {
     LIBRARY_DIR: path.join(dir, 'library'),
     TTL_SWEEP_MS: '60000',
     STORAGE_LIMIT_GB: '1',
+    // 夹具默认关掉 1.5 秒扫描缓存：多数测试是"往盘上写一笔就要立刻看见"，
+    // 缓存本身由 library-api 里那条专门的腿按 1500ms 验。
+    SCAN_CACHE_MS: '0',
     // 每个测试进程都去抢同一个 UDP 3478 没有意义（也没法并行跑）。默认关掉内置 STUN，
     // 只有 stun / 配置相关的腿自己显式指定端口。
     STUN_PORT: '0',
