@@ -94,21 +94,48 @@ async function uploadWithManifest(srv, files) {
     await page.locator('.dialog .btn').first().click(); // 取消
     await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
 
-    // 1) 文件重命名：行 ⋯ → 重命名 → 输入 → 确定，行上的名字立刻换
+    // 回车提交，但"焦点在别的键上"时不许抢那颗键
+    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.waitForSelector('.dialog', { state: 'visible' });
+    await page.locator('.dialog .input').fill('回车新建');
+    await page.locator('.dialog .input').press('Tab'); // 走到「取消」那颗键
+    assert.strictEqual(await page.evaluate(() => document.activeElement?.textContent?.trim()), '取消',
+      `Tab 没停在「取消」上：读到 ${JSON.stringify(await page.evaluate(() => document.activeElement?.textContent?.trim()))}`);
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
+    assert.strictEqual(await page.locator('.folder-row', { hasText: '回车新建' }).count(), 0,
+      '焦点在「取消」上时回车抢了那颗键：目录被建出来了');
+    LOG('回车不抢键：焦点在「取消」上时那一下就是取消');
+
+    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.waitForSelector('.dialog', { state: 'visible' });
+    await page.locator('.dialog .input').fill('回车新建');
+    await page.keyboard.press('Enter');
+    await page.locator('.folder-row', { hasText: '回车新建' }).first().waitFor({ timeout: 10000 });
+    LOG('回车提交：新建目录没点「确定」就建好了');
+
+    // 1) 文件重命名：行 ⋯ → 重命名 → 输入 → 回车提交（弹层里回车就是确定）
     await page.locator('.file-row', { hasText: '甲.txt' }).locator('.col-more').click();
     await page.locator('.context-menu .menu-item', { hasText: '重命名' }).click();
+    await page.waitForFunction(() => document.activeElement?.classList?.contains('input'), null, { timeout: 8000 });
     await page.locator('.dialog .input').fill('乙.txt');
-    await page.locator('.dialog .btn-primary').click();
+    await page.keyboard.press('Enter');
     await page.waitForFunction(() => [...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('乙.txt')), null, { timeout: 15000 });
-    LOG('重命名：甲.txt → 乙.txt 已在界面上');
+    LOG('重命名：甲.txt → 乙.txt，回车就提交了（没点确定）');
     let lib = await (await fetch(`${srv.base}/api/library`)).json();
     assert.ok(lib.batches[0].files.some((f) => f.name === 'big.bin.enc'), '大文件那份不该被改名影响');
     const before = lib.batches.reduce((n, b) => n + b.count, 0);
 
-    // 2) 文件删除：删掉的那个真的从服务端消失，同批次其余文件不受牵连
+    // 2) 文件删除：纯确认框里回车 = 按那颗「删除」（焦点已放在主键上，不是「取消」）
     await page.locator('.file-row', { hasText: '乙.txt' }).locator('.col-more').click();
     await page.locator('.context-menu .menu-item', { hasText: '删除' }).first().click();
-    await page.locator('.dialog .btn-danger').click();
+    await page.waitForSelector('.dialog', { state: 'visible' });
+    assert.strictEqual(
+      await page.evaluate(() => document.activeElement?.classList?.contains('dialog-primary')),
+      true,
+      '确认框打开后焦点没落在主键上：回车会成了"取消"',
+    );
+    await page.keyboard.press('Enter');
     await page.waitForFunction(() => ![...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('乙.txt')), null, { timeout: 15000 });
     lib = await (await fetch(`${srv.base}/api/library`)).json();
     const left = lib.batches.reduce((n, b) => n + b.count, 0);

@@ -392,7 +392,10 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.setViewportSize({ width: 1400, height: 950 });
     await page.locator('.wipe-open').click();
     await page.waitForSelector('.dialog', { state: 'visible' });
-    await page.locator('.dialog .btn-danger').click(); // 空确认词
+    // 回车 = 按「清空所有文件」：这里空着确认词按下去，必须被挡住而不是静默
+    assert.strictEqual(await page.evaluate(() => document.activeElement?.classList?.contains('input')), true,
+      '清空弹层打开后焦点不在确认词输入框里');
+    await page.keyboard.press('Enter');
     await page.waitForSelector('.dialog .dialog-error');
     await page.screenshot({ path: SHOT('fb-wipe-dialog.png') });
     // 危险键悬停时不许变隐形：.btn:hover 是 (0,2,0)，没有自己的 hover 规则时红底会被换成 --fill，白字压在浅灰上

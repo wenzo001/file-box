@@ -6,6 +6,7 @@ import {
   DialogClose, DialogContent, DialogDescription, DialogOverlay, DialogPortal, DialogRoot, DialogTitle,
 } from 'reka-ui';
 import { api } from '../lib/api.js';
+import { enterSubmits } from '../lib/dialog-enter.js';
 import { fmtSize } from '../lib/format.js';
 
 const props = defineProps({
@@ -63,13 +64,16 @@ async function submit() {
     busy.value = false;
   }
 }
+
+// 回车 = 按「清空所有文件」那颗键（规则见 lib/dialog-enter.js；确认词不对时 submit 自己会挡）
+const onEnter = enterSubmits(submit);
 </script>
 
 <template>
   <DialogRoot :open="open" @update:open="emit('update:open', $event)">
     <DialogPortal>
       <DialogOverlay class="dialog-overlay" />
-      <DialogContent class="dialog">
+      <DialogContent class="dialog" @keydown.enter="onEnter">
         <DialogTitle as-child><h3>清空服务器上的所有文件？</h3></DialogTitle>
         <DialogDescription as-child><p>{{ message }}</p></DialogDescription>
         <ul class="wipe-keep">
@@ -77,7 +81,7 @@ async function submit() {
           <li>保留：文件夹结构、全局自动删除设置、历史累计下载次数</li>
           <li>不动：别的程序放进 uploads/ 的目录（只删本服务自己建的「日期_时间」批次）</li>
         </ul>
-        <input v-model="value" class="input" :maxlength="64" :placeholder="confirmWord" @keyup.enter="submit">
+        <input v-model="value" class="input" :maxlength="64" :placeholder="confirmWord">
         <div v-if="error" class="dialog-error">{{ error }}</div>
         <div class="dialog-actions">
           <DialogClose as-child><button class="btn">取消</button></DialogClose>

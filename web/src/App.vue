@@ -23,6 +23,7 @@ import WipeDialog from './components/WipeDialog.vue';
 import SettingsSheet from './components/SettingsSheet.vue';
 import { tierLabel } from './lib/capability.mjs';
 import { bindColumnDnd } from './lib/dnd.js';
+import { enterSubmits } from './lib/dialog-enter.js';
 import { pendingRows } from './lib/pending.mjs';
 import {
   collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
@@ -1299,6 +1300,20 @@ function selectedDeleteItems() {
   return items;
 }
 
+// 弹层里回车 = 按那颗主键（规则见 lib/dialog-enter.js）
+const onDialogEnter = enterSubmits(submitDialog);
+
+// 打开弹层时把焦点放在"该敲回车的地方"：有输入框放框里，纯确认框放主键上。
+// 库默认停在第一颗可聚焦元素 =「取消」，那样回车就成了取消，与用户预期相反。
+watch(() => dialog.open, async (v) => {
+  if (!v) return;
+  await nextTick();
+  const box = document.querySelector('.dialog');
+  if (!box) return;
+  const target = box.querySelector('input, select') || box.querySelector('.dialog-primary');
+  target?.focus();
+});
+
 async function submitDialog() {
   if (dialog.busy) return;
   dialog.busy = true;
@@ -1930,7 +1945,7 @@ onBeforeUnmount(() => {
     <DialogRoot :open="dialog.open" @update:open="dialog.open = $event">
       <DialogPortal>
         <DialogOverlay class="dialog-overlay" />
-        <DialogContent class="dialog">
+        <DialogContent class="dialog" @keydown.enter="onDialogEnter">
           <DialogTitle as-child><h3>{{ dialog.title }}</h3></DialogTitle>
           <DialogDescription as-child><p v-if="dialog.message">{{ dialog.message }}</p></DialogDescription>
           <input
@@ -1939,7 +1954,6 @@ onBeforeUnmount(() => {
             class="input"
             :maxlength="dialogLimit"
             :placeholder="dialog.kind === 'rename-file' ? '新文件名' : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
-            @keyup.enter="submitDialog"
           >
           <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
             {{ dialogCharCount }}/{{ FOLDER_NAME_MAX }}
@@ -1950,7 +1964,7 @@ onBeforeUnmount(() => {
           <div v-if="dialog.error" class="dialog-error">{{ dialog.error }}</div>
           <div class="dialog-actions">
             <DialogClose as-child><button class="btn">取消</button></DialogClose>
-            <button class="btn" :class="dialog.destructive ? 'btn-danger' : 'btn-primary'" :disabled="dialog.busy" @click="submitDialog">
+            <button class="btn dialog-primary" :class="dialog.destructive ? 'btn-danger' : 'btn-primary'" :disabled="dialog.busy" @click="submitDialog">
               {{ dialog.busy ? '处理中…' : dialog.confirmText }}
             </button>
           </div>
