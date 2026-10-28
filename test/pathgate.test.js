@@ -2,6 +2,7 @@
 // 且不能顺着链接走出去。这里用真服务 + 真磁盘 + 真链接验，不用假想载荷。
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -110,4 +111,49 @@ test('同一分钟内的序号目录（20260923_1430_2）也算本服务创建�
   const list = await (await fetch(`${srv.base}/api/list`)).json();
   assert.ok(list.folders.some((f) => f.name === name), 'commitStaging 生成的带序号目录必须被认下来');
   assert.strictEqual(await status(`/api/folder/${name}`, 'DELETE'), 200);
+});
+
+// 静态门只能证明"这一块里有声明"，抓不住"同一条路由里有一支漏了"（比如 Range 续传那一支）。
+// 这里读真响应头：文件名是客户端声明的，叫 evil.html 也必须让浏览器下载而不是当页面渲染。
+test('吐文件的四条路都带安全声明：attachment 或 octet-stream', async () => {
+  const batch = '20260923_1444';
+  const dir = path.join(up, batch);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'evil.html'), '<script>alert(1)</script>');
+
+  const plain = await fetch(`${srv.base}/api/download/${batch}/evil.html`);
+  assert.strictEqual(plain.status, 200);
+  assert.match(plain.headers.get('content-disposition') || '', /attachment/, '普通下载没有 attachment');
+  await plain.arrayBuffer();
+
+  const ranged = await fetch(`${srv.base}/api/download/${batch}/evil.html`, { headers: { Range: 'bytes=0-10' } });
+  assert.strictEqual(ranged.status, 206);
+  assert.match(ranged.headers.get('content-disposition') || '', /attachment/, 'Range 续传那一支没有 attachment');
+  await ranged.arrayBuffer();
+
+  const archived = await fetch(`${srv.base}/api/archive/${batch}`);
+  assert.strictEqual(archived.status, 200);
+  assert.strictEqual(archived.headers.get('content-type'), 'application/octet-stream', '归档没有 octet-stream');
+  await archived.arrayBuffer();
+
+  // 无痕分段：接收方凭 proof 取密文，同样不许让浏览器把它当页面
+  const sid = Array.from({ length: 8 }, () => 'abcdefghjkmnpqrstuvwxyz123456789'[crypto.randomInt(31)]).join('');
+  const proof = crypto.randomBytes(32).toString('hex');
+  const created = await (await fetch(`${srv.base}/api/xfer/create`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid, proof, frames: 2, totalBytes: 2048 }),
+  })).json();
+  const joined = await fetch(`${srv.base}/api/xfer/join`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid, proof }),
+  });
+  assert.strictEqual(joined.status, 200, '前置：配对要成功');
+  assert.strictEqual((await fetch(`${srv.base}/api/xfer/seg?sid=${sid}&i=0`, {
+    method: 'PUT',
+    headers: { 'X-Xfer-Sender': created.token, 'Content-Type': 'application/octet-stream' },
+    body: Buffer.alloc(256, 7),
+  })).status, 200, '前置：密文要先落盘');
+  const seg = await fetch(`${srv.base}/api/xfer/seg?sid=${sid}&i=0`, { headers: { 'X-Xfer-Proof': proof } });
+  assert.strictEqual(seg.status, 200);
+  assert.strictEqual(seg.headers.get('content-type'), 'application/octet-stream', '无痕分段没有 octet-stream');
+  await seg.arrayBuffer();
 });

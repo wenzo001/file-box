@@ -107,3 +107,80 @@ test('手机档守机制：界面层不许钉顶、卡片要有高度地板、44
   const wraps = (app.match(/class="check-hit"/g) || []).length;
   assert.ok(wraps >= 3, `勾选入口的命中区包装层只有 ${wraps} 处，应为 3（栏头全选 / 目录行 / 文件行）`);
 });
+
+// ---- 吐文件的路由：必须有一句能生效的安全声明 ----
+// 上传的文件名是客户端随便声明的（可以叫 evil.html），所以"把文件字节吐回去"的每一条路由
+// 都得让浏览器**下载**而不是**当页面渲染**：Content-Disposition: attachment、application/octet-stream，
+// 或 res.download()（express 自己会带 attachment）。少了这一句，就是同源存储型 XSS 的口子。
+// 静态扫源码（真正的头验证在 pathgate 与 transfer 的行为测试里），注释先剥掉——
+// 注释里写 attachment 不算声明。
+// 标记只认"把字节写给响应"的四种写法：读盘拼装（pipeline(createReadStream, createWriteStream)）不算；
+// res.write( 是因为归档路由手写帧、没有用 pipe。SSE 那条的 write 在 sseOpen() 里、不是文件字节，扫不到也不该扫。
+function fileEgressRoutes(src) {
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1 ');
+  const ROUTE = /app\.(get|post|put|patch|delete)\(\s*(['"`])([^'"`]+)\2/g;
+  const marks = [];
+  let m;
+  while ((m = ROUTE.exec(code))) marks.push({ at: m.index, route: m[3] });
+  // 块边界按"这条路由自己的那次调用"取：从 app.xxx( 的左括号起配对到右括号。
+  // 之前按"切到下一条路由"取，最后一条路由会把文件末尾的 application/octet-stream 借来当自己的声明（假绿）。
+  const callSpan = (openAt) => {
+    let depth = 0;
+    for (let i = openAt; i < code.length; i++) {
+      const ch = code[i];
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const q = ch;
+        for (i++; i < code.length && code[i] !== q; i++) if (code[i] === '\\') i++;
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') { depth--; if (!depth) return { start: openAt, end: i + 1 }; }
+    }
+    return null;
+  };
+  const out = [];
+  for (const mark of marks) {
+    const open = code.indexOf('(', mark.at);
+    const span = open === -1 ? null : callSpan(open);
+    // 括号配对失败就按"没声明"记：仪器没法界定这条路由时必须失败，不能默默放行
+    if (!span) { out.push({ route: mark.route, safe: false, bounded: false }); continue; }
+    const block = code.slice(span.start, span.end);
+    if (!/\.pipe\(res\)|res\.download\(|res\.sendFile\(|res\.write\(/.test(block)) continue;
+    const safe = /Content-Disposition/.test(block)
+      || /application\/octet-stream/.test(block)
+      || /res\.download\(/.test(block);
+    out.push({ route: mark.route, safe });
+  }
+  return out;
+}
+test('往外吐文件字节的路由必须声明 attachment 或 octet-stream（同源 XSS 的最后一道门）', () => {
+  // 仪器自检：三条假源码必须给出预期答案，否则"0 条不安全"只是扫描器瞎了
+  assert.deepStrictEqual(
+    fileEgressRoutes("app.get('/api/leak', (req, res) => { res.setHeader('Content-Type', 'text/html'); fs.createReadStream(p).pipe(res); });"),
+    [{ route: '/api/leak', safe: false }],
+    '扫描器看不见"没有安全声明的吐文件路由"',
+  );
+  assert.deepStrictEqual(
+    fileEgressRoutes("app.get('/api/ok', (req, res) => { res.setHeader('Content-Type', 'application/octet-stream'); fs.createReadStream(p).pipe(res); });"),
+    [{ route: '/api/ok', safe: true }],
+  );
+  assert.deepStrictEqual(
+    fileEgressRoutes("app.get('/api/c', (req, res) => { /* Content-Disposition: attachment */ fs.createReadStream(p).pipe(res); });"),
+    [{ route: '/api/c', safe: false }],
+    '注释里写 attachment 不算声明',
+  );
+
+  const seen = [];
+  for (const f of ['server.js', 'lib/transfer.js']) {
+    const src = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
+    for (const it of fileEgressRoutes(src)) seen.push({ file: f, ...it });
+  }
+  // 下限 + 点名：这几条必须真的被扫到，少一条说明判据对它空着
+  for (const r of ['/api/download/:folder/:file', '/api/archive/:folder', '/api/xfer/seg']) {
+    assert.ok(seen.some((s) => s.route === r), `没扫到 ${r}（只扫到 ${seen.map((s) => s.route).join(', ')}）`);
+  }
+  const unsafe = seen.filter((s) => !s.safe);
+  assert.deepStrictEqual(unsafe, [], `这些路由会把文件字节吐出去却没有 attachment / octet-stream：\n${JSON.stringify(unsafe)}`);
+});
