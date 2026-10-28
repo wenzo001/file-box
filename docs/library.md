@@ -66,7 +66,7 @@ uploads/20261027_1431/          ← 批次目录（日期名，路径闸门仍�
 
 | 方法与路径 | 作用 |
 |---|---|
-| `GET /api/library` | 目录树 + 批次归属 + TTL + 目录汇总（含 `lastUpdatedAt`）+ 用量 + `downloadsTotal`（历史累计下载）+ `wipeConfirm`（清空确认词，界面不另存一份）+ `ttlOptions` + `settings` + `now` |
+| `GET /api/library` | 目录树 + 批次归属 + TTL + 目录汇总（含 `lastUpdatedAt`）+ 用量 + `downloadsTotal`（历史累计下载）+ `wipeConfirm`（清空确认词，界面不另存一份）+ `memDownloadMaxBytes`（无 OPFS 时单文件的内存上限，由 `MEM_DOWNLOAD_MAX_MB` 下发）+ `ttlOptions` + `settings` + `now` |
 | `GET /api/settings` | 读取公共设置（`defaultTtlHours`） |
 | `PUT /api/settings` | 修改公共设置 `{defaultTtlHours}`；白名单外 400 |
 | `POST /api/folders` | 新建目录 `{name,parentId}`；名长 20 字、层级不限 |

@@ -31,32 +31,40 @@
 
 ```
 .
-├── server.js            # Express：/api + 托管 dist-web
-├── web/                 # Vue 源码（App.vue / lib / styles）
+├── server.js            # Express 接线：上传 / 目录 / 维护 / 静态托管（下载与归档在 lib/egress.js）
+├── web/                 # Vue 源码
 │   ├── index.html
 │   └── src/
-│       ├── App.vue
-│       ├── lib/         # api / manifest / upload / download / zip / format
+│       ├── App.vue      # 分栏浏览 + 任务中心
+│       ├── components/WipeDialog.vue  # 一键清空弹层
+│       ├── lib/         # api / manifest / upload / download(+download-core) / zip(+zip-core)
+│       │                # byte-queue / capability / dnd / format
 │       └── styles/app.css
-├── public/              # 静态源：crypto.js / dec-worker.js / transfer.html / xfer-*.js
+├── public/              # 静态源：crypto.js / dec-worker.js / progress-strip.css / transfer.html / xfer-*.js
 ├── dist-web/            # Vite 构建产物（npm run build 生成，不入库，由 Express 托管）
 ├── lib/
 │   ├── library.js       # NeDB 目录索引：目录树 / 批次归属 / TTL / 公共设置 / 备份恢复
 │   ├── schemas.js       # Zod 请求校验与目录命名规则（20 字上限）
-│   └── transfer.js      # 无痕传输服务端
+│   ├── egress.js        # 下载 / 归档：Range、归档分帧、并发名额池
+│   ├── staging.js       # 暂存区 → uploads 的搬运（含跨盘 EXDEV 兜底）
+│   ├── maintenance.js   # 一键清空的编排（先校验、按轮重扫、清不干净就报错）
+│   ├── rate-limit.js    # 文件库侧按 IP 的固定窗口桶
+│   ├── transfer.js      # 无痕传输服务端（一次性会话 + 密文中转）
+│   └── stun.js          # 极简 STUN（局域网直连用）
 ├── docs/
 │   ├── transfer.md      # 无痕传输
-│   ├── library.md       # 目录 / TTL / 任务 / 构建与部署
+│   ├── library.md       # 目录 / TTL / 任务 / 安全边界 / 验证记录
 │   └── deploy.md        # 安装、构建、发布、备份、反代、排障
-├── test/                # node --test + test/lab 真浏览器台架
+├── test/                # node --test；test/lab 是真浏览器台面（见 docs/deploy.md §11）
 ├── scripts/
 │   ├── setup.js         # npm run setup / release：安装 + 构建（+ 打包）
 │   └── pack.js          # npm run pack：收 dist-web + 生产依赖闭包
+├── .qoder/              # ponytail 技能与项目规则（MIT，见 .qoder/skills）
 ├── vite.config.mjs
 ├── dist/                # 发布产物（npm run pack 生成，不入库）
 ├── uploads/             # 上传文件（密文）存放处，启动时自动创建
 ├── .library/            # NeDB 目录索引 + 公共设置（运行生成，不入库；随 uploads 备份）
-├── .stats/              # 下载次数账本（运行生成，不入库）
+├── .stats/              # 下载次数账本（逐文件计数 + 只增不减的 __total__；运行生成）
 ├── .transfer/           # 无痕传输中转区
 ├── .uploading/          # 未完成的分块批次暂存（超过 2 天自动回收）
 ├── .certs/              # HTTPS 自签证书
