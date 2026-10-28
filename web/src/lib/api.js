@@ -46,6 +46,9 @@ export const api = {
   uploadInit: (body) => json('upload/init', 'POST', body),
   uploadFinish: (uploadId) => json('upload/finish', 'POST', { uploadId }),
   cancelUpload: (id) => request(`uploads/${q(id)}`, { method: 'DELETE' }),
+
+  /** 一键清空：confirm 必须是确认词，服务端比对不过就 400 且不动任何文件 */
+  wipeLibrary: (confirm) => json('maintenance/wipe', 'POST', { confirm }),
   uploadPart: (uploadId, fi, ci, body, crc, signal) => fetch(
     new URL(`upload/part?u=${q(uploadId)}&f=${fi}&c=${ci}`, API_ROOT),
     {

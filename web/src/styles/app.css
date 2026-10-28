@@ -161,6 +161,9 @@ a { color: var(--accent); }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .btn-primary:hover { filter: brightness(1.06); background: var(--accent); }
 .btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
+/* .btn:hover 是 (0,2,0)，比 .btn-danger (0,1,0) 权重高：不给危险键自己的 hover，
+   悬停/触摸点过之后底色会被换成 --fill，白字压在浅灰上＝看不见 */
+.btn-danger:hover { background: var(--red); border-color: var(--red); color: #fff; filter: brightness(1.08); }
 .linkbtn {
   border: 0;
   background: transparent;
@@ -396,7 +399,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   /* toast 只是播报，不许吃掉底下那一行的点击（窄屏上它正好压在列表最后一行） */
   pointer-events: none;
   bottom: calc(28px + env(safe-area-inset-bottom));
-  z-index: 70;
+  /* 压到弹层（60/61）下面：窄屏弹层贴底，toast 会正好盖住"确定/取消"那两颗键 */
+  z-index: 55;
   transform: translateX(-50%);
   max-width: calc(100vw - 32px);
   padding: 9px 16px;
@@ -458,6 +462,9 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .config-label { color: var(--text); font-weight: 600; }
 /* 配置说明在浅蓝色条上原本只有 4.12:1，小字读不清；压深到 ≥4.5 */
 .config-hint { color: color-mix(in srgb, var(--text) 22%, var(--text2)); font-size: 12px; }
+/* 一键清空：配置条右端（danger 文字色），弹层里再要求手打确认词 */
+.wipe-open { margin-left: auto; flex: none; font-size: 12px; }
+.wipe-keep { margin: 8px 0 0; padding-left: 18px; color: var(--text2); font-size: 13px; line-height: 1.7; text-align: left; }
 .ttl-global {
   height: 34px;
   font-size: 16px;
@@ -772,7 +779,11 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .tool-btn { width: 44px; height: 44px; justify-content: center; padding: 0; }
   .tool-btn .tool-label { display: none; }
   .config-strip { padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
-  .config-hint { flex: 1 1 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 提示与「清空」共用一行：各占一行会多出 50px 固定界面层，320 档浏览区掉到 36% */
+  .config-hint { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 手机上只留图标（带文字要 101px，会把提示压成 12px）；margin-left:auto 在可换行 flex 里会把它顶到新一行 */
+  .wipe-label { display: none; }
+  .wipe-open { width: 44px; min-width: 44px; padding: 0; margin-left: 0; justify-content: center; }
 }
 
 /* 复选框是勾选的唯一入口，15px 在手机上点不中：外面那层 label 撑到 44×44 当命中区，原生方框仍画 22px */

@@ -8,6 +8,7 @@ const express = require('express');
 const selfsigned = require('selfsigned');
 const { createLibrary, LibraryError, TTL_HOURS } = require('./lib/library');
 const { commitStaging } = require('./lib/staging');
+const { createMaintenance, WIPE_CONFIRM } = require('./lib/maintenance');
 const { folderIdOrUnfiled, ttlHours, schemas } = require('./lib/schemas');
 
 const app = express();
@@ -159,13 +160,27 @@ const STATS_FLUSH_MS = 2000;
 let flushTimer = null;
 
 /** 账本结构：{ "20260923_1430": { "f_xxx.enc": 3 } }。读不回来就当没有过（一次都没下载） */
+// 另一个键 __total__ 是只增不减的历史累计：一键清空会把逐文件账本全清掉，
+// 但"这台服务器一共被下载过多少次"要留下来。批次名形状是 8 位日期_4 位时间，
+// 永远不可能等于 __total__，所以两种数据能共用一个文件、共用一条落盘路径。
+const LEDGER_TOTAL = '__total__';
 function loadDownloads() {
+  let raw;
   try {
-    const raw = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
-    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  } catch { return {}; }
+    raw = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+  } catch { return { [LEDGER_TOTAL]: 0 }; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { [LEDGER_TOTAL]: 0 };
+  // 老账本没有 __total__：用现有逐文件计数之和回填，升级后历史不丢
+  if (!Number.isFinite(raw[LEDGER_TOTAL])) {
+    raw[LEDGER_TOTAL] = Object.entries(raw).reduce((sum, [k, v]) => {
+      if (k === LEDGER_TOTAL || !v || typeof v !== 'object') return sum;
+      return sum + Object.values(v).reduce((s, n) => s + (Number(n) || 0), 0);
+    }, 0);
+  }
+  return raw;
 }
 const downloads = loadDownloads();
+const downloadTotal = () => Number(downloads[LEDGER_TOTAL]) || 0;
 
 function flushDownloads() {
   flushTimer = null;
@@ -190,6 +205,7 @@ function countDownload(folder, file) {
   const rec = downloads[folder] && typeof downloads[folder] === 'object' ? downloads[folder] : {};
   rec[file] = (rec[file] || 0) + 1;
   downloads[folder] = rec;
+  downloads[LEDGER_TOTAL] = downloadTotal() + 1; // 逐文件账本会被"清空"清掉，这一格不会
   scheduleFlush();
 }
 /** 目录被删（手动）后账本条目要跟着走：否则它一直占着一格，还可能被以后同名的目录继承 */
@@ -293,6 +309,23 @@ function sweepStaging(maxAgeMs = UPLOAD_TTL_MS) {
   }
   if (removed) forgetUsage(); // 腾出的空间立刻反映到上限判断，别让 30 秒缓存报高
   return removed;
+}
+
+/** 一键清空里的"暂存区"那一半：先给正在合并的批次打取消旗，再把整个暂存区删空。
+ *  正在合并的收尾循环每拼一块都会看这面旗；它自己的失败分支还会再删一次目录，所以这里先删也安全。 */
+function wipeStaging() {
+  for (const id of assembling) cancelRequested.add(id);
+  ensureStagingDir();
+  let batches = 0;
+  let bytes = 0;
+  for (const name of fs.readdirSync(STAGING_DIR)) {
+    const p = path.join(STAGING_DIR, name);
+    try { bytes += dirSize(p); } catch { /* 读不到就算了 */ }
+    fs.rmSync(p, { recursive: true, force: true });
+    if (isUploadId(name)) batches++;
+  }
+  forgetUsage();
+  return { batches, bytes };
 }
 
 /** 启动时：上个进程留下的 .tmp 是写一半的（.bin 都是写完才改名的），只清这些，
@@ -540,6 +573,10 @@ async function buildLibraryPayload() {
     httpsPort: HTTPS_PORT,
     ttlOptions: TTL_HOURS,
     settings: libraryReady ? await library.getSettings() : { defaultTtlHours: 1 },
+    // 历史累计下载（只增不减，一键清空也不归零）；逐文件的次数在每个 batch / folder 的 downloads 里
+    downloadsTotal: downloadTotal(),
+    // 确认词只在服务端定义一份，界面拿它做校验与占位：两边各写一份迟早会对不上
+    wipeConfirm: WIPE_CONFIRM,
     folders,
     batches,
   };
@@ -1361,6 +1398,45 @@ const transferApi = createTransferApi({
 });
 transferApi.register(app);
 transferApi.bootReclaim();
+
+// ---- 一键清空：删掉服务器上所有"文件盒子自己建的文件"，保留目录树 / 全局设置 / 历史下载累计 ----
+// 删除动作全部走已有那条路径（scanUploadBatches + deleteBatchPhysical：名字闸门、逐批清账本、
+// 失效占用缓存都在里面）。编排（先校验、按轮重扫竞态、清不干净就报错）在 lib/maintenance.js。
+const maintenance = createMaintenance({
+  listBatches: async () => scanUploadBatches().map((b) => ({ name: b.name, count: b.count, size: b.size })),
+  dropBatch: async (name) => {
+    deleteBatchPhysical(name);
+    if (libraryReady) await library.removeBatch(name);
+  },
+  clearStaging: async () => wipeStaging(),
+  purgeTransfer: async () => transferApi.purgeAll(),
+  downloadTotal,
+});
+
+app.post('/api/maintenance/wipe', express.json({ limit: '4kb' }), asyncHandler(async (req, res) => {
+  const data = parseBody(res, schemas.wipe, req.body);
+  if (!data) return;
+  let receipt;
+  try {
+    receipt = await maintenance.wipe({ confirm: data.confirm });
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message, code: err.code, remaining: err.remaining });
+    }
+    throw err;
+  }
+  // 编排层只认"批次"，暂存与中转在这里自证：说清空了就得查得到空
+  const leftUploads = scanUploadBatches().map((b) => b.name);
+  const leftStaging = fs.readdirSync(STAGING_DIR);
+  const leftTransfer = Number(receipt.removed.transfer && receipt.removed.transfer.leftovers) || 0;
+  if (leftUploads.length || leftStaging.length || leftTransfer) {
+    return res.status(409).json({
+      error: `清空后仍有残留：批次 ${leftUploads.length} 个、暂存 ${leftStaging.length} 项、中转 ${leftTransfer} 个`,
+      remaining: leftUploads.slice(0, 5),
+    });
+  }
+  res.json({ ok: true, ...receipt, verified: { ...receipt.verified, stagingEmpty: true, transferEmpty: true } });
+}));
 
 // ---- 前端静态页 ----
 // ---- 前端静态页（Vue + Vite 构建产物） ----

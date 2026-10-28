@@ -228,6 +228,19 @@ const MEASURE = () => {
       const itemH = await page.locator('.context-menu .menu-item').first().evaluate((el) => Math.round(el.getBoundingClientRect().height));
       assert.ok(itemH >= 44, `${tag}: 菜单项只有 ${itemH}px，触摸档要 ≥44`);
       await page.keyboard.press('Escape');
+
+      // 确认词没填就点，报错但不许删（红底被 hover 换掉那条腿在触摸档复现不了，见 library-smoke）
+      const beforeWipe = await (await fetch(`${srv.base}/api/library`)).json();
+      await tap('.wipe-open', '打开清空弹层');
+      await page.waitForSelector('.dialog', { state: 'visible' });
+      await page.locator('.dialog .btn-danger').tap(); // 空确认词：报错，但不许删
+      await page.waitForSelector('.dialog .dialog-error');
+      // 触摸档没有 hover（(hover:hover) 不成立），所以"红底被 hover 换掉"那条腿在 library-smoke 里验
+      const afterTry = await (await fetch(`${srv.base}/api/library`)).json();
+      assert.strictEqual(afterTry.batches.length, beforeWipe.batches.length, `${tag}: 确认词没填就把文件删了`);
+      await page.locator('.dialog .btn').first().tap(); // 取消
+      await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
+
       assert.deepStrictEqual(errs, [], `${tag}: 浏览器报错\n${errs.join('\n')}`);
       await page.screenshot({ path: SHOT(`fb-mob-${tag}.png`) });
     } catch (err) {

@@ -1113,6 +1113,29 @@ function openDeleteSelected() {
   openConfirm('delete-selected', '删除选中的内容？', `将永久删除选中的 ${selectedItems.value.length} 项，不能撤销。`, null, selectedItems.value);
 }
 
+// 确认词由服务端下发（/api/library 的 wipeConfirm），界面不另存一份
+const wipeConfirm = computed(() => data.value.wipeConfirm || '清空全部文件');
+
+/** 一键清空：要人亲手把确认词打一遍才放行（没有登录，这个动作只能靠"故意"来防） */
+function openWipe() {
+  const files = data.value.folders.reduce((s, f) => s + (f.count || 0), 0);
+  const bytes = data.value.folders.reduce((s, f) => s + (f.size || 0), 0);
+  Object.assign(dialog, {
+    open: true,
+    kind: 'wipe',
+    mode: 'prompt',
+    title: '清空服务器上的所有文件？',
+    message: `会删掉 ${files} 个文件（${fmtSize(bytes)}）、所有未完成的上传与无痕传输的残留密文，不能撤销。`,
+    value: '',
+    error: '',
+    busy: false,
+    destructive: true,
+    confirmText: '清空所有文件',
+    target: null,
+    items: [],
+  });
+}
+
 function selectedDeleteItems() {
   const items = [];
   const seenBatches = new Set();
@@ -1173,6 +1196,11 @@ async function submitDialog() {
       if (!items.length) throw new Error('没有可删除的内容');
       startDeleteTask(`删除选中的 ${items.filter((x) => x.kind === 'folder').length || selectedItems.value.length} 项`, items);
       toast('已开始删除，进度在任务中心');
+    } else if (dialog.kind === 'wipe') {
+      if (value !== wipeConfirm.value) throw new Error(`确认词不对：请完整输入「${wipeConfirm.value}」`);
+      const receipt = await api.wipeLibrary(value);
+      tasks.value = []; // 任务列表里每一项都指向刚被删掉的批次，留着只会显示一堆失败
+      toast(`已清空：${receipt.removed.batches} 个批次 · ${fmtSize(receipt.removed.bytes)}；历史累计下载 ${receipt.kept.downloadTotal} 次`);
     }
     dialog.open = false;
     selected.value = [];
@@ -1419,7 +1447,7 @@ onBeforeUnmount(() => {
         <input v-model="query" type="search" placeholder="搜索全部文件夹和文件" aria-label="全局搜索文件夹和文件">
       </label>
       <div class="toolbar-actions">
-        <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB</span>
+        <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB；累计下载 ${data.downloadsTotal || 0} 次`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB · 累计下载 {{ data.downloadsTotal || 0 }} 次</span>
         <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> <span class="lbl-full">上传到「{{ uploadTargetLabel }}」</span><span class="lbl-short">上传</span></button>
         <a class="btn" href="../transfer.html"><span class="lbl-full">无痕传输</span><span class="lbl-short">传输</span></a>
       </div>
@@ -1440,6 +1468,7 @@ onBeforeUnmount(() => {
       </select>
       <span class="config-hint" v-if="!libraryNotReady" :title="`当前：新上传的文件会在「${ttlLabel(settingsTtl)}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。`">当前：新上传的文件会在「{{ ttlLabel(settingsTtl) }}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。</span>
       <span class="config-hint" v-else>目录索引暂不可用，自动删除设置暂时不能修改。</span>
+      <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="openWipe"><Trash2 :size="15" aria-hidden="true" /><span class="wipe-label">清空所有文件…</span></button>
     </div>
 
     <div class="layout">
@@ -1741,15 +1770,20 @@ onBeforeUnmount(() => {
         <DialogContent class="dialog">
           <DialogTitle as-child><h3>{{ dialog.title }}</h3></DialogTitle>
           <DialogDescription as-child><p v-if="dialog.message">{{ dialog.message }}</p></DialogDescription>
+          <ul v-if="dialog.kind === 'wipe'" class="wipe-keep">
+            <li>删掉：所有已上传的文件、未传完的暂存分块、无痕传输的中转密文</li>
+            <li>保留：文件夹结构、全局自动删除设置、历史累计下载次数</li>
+            <li>不动：别的程序放进 uploads/ 的目录（只删本服务自己建的「日期_时间」批次）</li>
+          </ul>
           <input
             v-if="dialog.mode === 'prompt'"
             v-model="dialog.value"
             class="input"
             :maxlength="dialogLimit"
-            :placeholder="dialog.kind === 'rename-file' ? '新文件名' : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
+            :placeholder="dialog.kind === 'rename-file' ? '新文件名' : dialog.kind === 'wipe' ? wipeConfirm : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
             @keyup.enter="submitDialog"
           >
-          <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
+          <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file' && dialog.kind !== 'wipe'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
             {{ dialogCharCount }}/{{ FOLDER_NAME_MAX }}
           </div>
           <select v-if="dialog.mode === 'move'" v-model="dialog.value" class="input">

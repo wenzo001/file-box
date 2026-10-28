@@ -342,6 +342,58 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.match(await expiryCell.innerText(), /小时后删除/, '窄屏倒计时文字不对');
     await page.screenshot({ path: SHOT('fb-library-mobile.png') });
 
+    // ---- 一键清空：确认词不对不许动，打对了要真删光，但目录树与历史累计留着 ----
+    const readLib = () => fetch(`${srv.base}/api/library`).then((r) => r.json());
+    const libBefore = await readLib();
+    assert.ok(libBefore.batches.length > 0, '前置：清空前要有批次');
+    assert.ok(libBefore.downloadsTotal >= 1, '前置：前面几条腿下载过，累计不该是 0');
+    assert.ok(libBefore.wipeConfirm, '前置：确认词要由服务端下发（界面不再自己存一份）');
+    await page.locator('.wipe-open').click();
+    await page.waitForSelector('.dialog', { state: 'visible' });
+    await page.locator('.dialog .btn-danger').click(); // 空确认词
+    await page.waitForSelector('.dialog .dialog-error');
+    await page.screenshot({ path: SHOT('fb-wipe-dialog.png') });
+    // 危险键悬停时不许变隐形：.btn:hover 是 (0,2,0)，没有自己的 hover 规则时红底会被换成 --fill，白字压在浅灰上
+    const dangerBtn = page.locator('.dialog .btn-danger');
+    const bgIdle = await dangerBtn.evaluate((el) => getComputedStyle(el).backgroundColor);
+    await dangerBtn.hover();
+    const bgHover = await dangerBtn.evaluate((el) => getComputedStyle(el).backgroundColor);
+    assert.strictEqual(bgHover, bgIdle,
+      `危险键悬停后底色变了（${bgIdle} → ${bgHover}）：.btn:hover 的权重比 .btn-danger 高，白字会压在浅灰上`);
+    // "看得清"单独量一遍：底色要按 alpha 逐层合成（rgba(0,0,0,.045) 不是黑）
+    const dangerContrast = await dangerBtn.evaluate((el) => {
+      const nums = (s) => (s.match(/[\d.]+/g) || []).map(Number);
+      const lum = (c) => c.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; })
+        .reduce((a, v, i) => a + v * [0.2126, 0.7152, 0.0722][i], 0);
+      let acc = [255, 255, 255];
+      for (let n = el; n; n = n.parentElement) {
+        const c = nums(getComputedStyle(n).backgroundColor);
+        if (!c.length || (c.length === 4 && c[3] === 0)) continue;
+        const a = c.length === 4 ? c[3] : 1;
+        acc = c.slice(0, 3).map((v, i) => v * a + acc[i] * (1 - a));
+        if (a >= 1) break;
+      }
+      const fg = lum(nums(getComputedStyle(el).color).slice(0, 3));
+      const bg = lum(acc);
+      return Number(((Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05)).toFixed(2));
+    });
+    assert.ok(dangerContrast >= 4.5, `危险键悬停后文字对比度只有 ${dangerContrast}:1（底色 ${bgHover}）`);
+    const stillThere = await readLib();
+    assert.strictEqual(stillThere.batches.length, libBefore.batches.length, '确认词没打对就把文件删了');
+    await page.locator('.dialog .input').fill(libBefore.wipeConfirm);
+    await page.locator('.dialog .btn-danger').click();
+    await page.waitForSelector('.dialog', { state: 'detached', timeout: 20000 });
+    const libAfter = await readLib();
+    assert.strictEqual(libAfter.batches.length, 0, '清空后索引里还有批次');
+    assert.strictEqual(libAfter.folders.length, libBefore.folders.length, '目录树必须原样保留');
+    assert.strictEqual(libAfter.downloadsTotal, libBefore.downloadsTotal, '历史累计下载不许被清空');
+    assert.strictEqual(await page.locator('.file-row').count(), 0, '清空后界面上还看得见文件行');
+    assert.match(
+      await page.locator('.topbar-usage').first().evaluate((el) => el.textContent || ''),
+      /累计下载 \d+ 次/,
+      '顶栏没显示历史累计下载',
+    );
+
     assert.deepStrictEqual(errs, [], `浏览器有 console/page 错误:\n${errs.join('\n')}`);
     console.log('[library-smoke] 通过');
     console.log('[library-smoke] 截图:', SHOT('fb-library-desktop.png'), SHOT('fb-library-mobile.png'));

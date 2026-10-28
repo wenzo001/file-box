@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const { startServer, uploadBundle, hexKey } = require('./helpers');
+const { WIPE_CONFIRM } = require('../lib/maintenance');
 
 const list = async (s) => (await (await fetch(`${s.base}/api/list`)).json());
 const folderOf = async (s, name) => (await list(s)).folders.find((f) => f.name === name);
@@ -99,6 +100,59 @@ test('重启后计数还在；目录被手动删除时账本就跟着清掉', as
       await new Promise((r) => setTimeout(r, 100));
     }
     assert.ok(!('20260923_1430' in raw2), `删掉的目录还在账本里: ${JSON.stringify(raw2)}`);
+  } finally {
+    await srv.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test('历史累计要跨版本、跨清空活下来：老账本启动时回填，之后每次下载继续加', async () => {
+  const dir = fs.mkdtempSync(require('os').tmpdir() + '/fbdl-');
+  // 老部署的账本形状：只有逐文件计数，没有 __total__
+  fs.mkdirSync(path.join(dir, '.stats'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.stats', 'downloads.json'),
+    JSON.stringify({ '20260923_1430': { 'a.enc': 3, 'b.enc': 1 } }));
+  const srv = await oneShot({}, dir, 57);
+  try {
+    const lib = async () => (await (await fetch(`${srv.base}/api/library`)).json());
+    assert.strictEqual((await lib()).downloadsTotal, 4, '老账本没有 __total__ 时要用逐文件之和回填');
+    await get(srv, '/api/download/20260923_1430/a.enc');
+    assert.strictEqual((await lib()).downloadsTotal, 5, '回填之后每次下载都要继续累加');
+  } finally {
+    await srv.stop();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test('清空之后：逐文件账本清掉（同名新批次不继承旧账），历史累计还在', async () => {
+  const dir = fs.mkdtempSync(require('os').tmpdir() + '/fbdl-');
+  const srv = await oneShot({}, dir, 58);
+  const ledger = path.join(dir, '.stats', 'downloads.json');
+  const readLedger = () => { try { return JSON.parse(fs.readFileSync(ledger, 'utf8')); } catch { return null; } };
+  try {
+    await get(srv, '/api/download/20260923_1430/a.enc');
+    await get(srv, '/api/download/20260923_1430/a.enc');
+    const t0 = Date.now();
+    while (!readLedger() && Date.now() - t0 < 6000) await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(readLedger().__total__, 2, `前置：累计要先记上：${JSON.stringify(readLedger())}`);
+
+    const w = await fetch(`${srv.base}/api/maintenance/wipe`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: WIPE_CONFIRM }),
+    });
+    assert.strictEqual(w.status, 200, JSON.stringify(await w.json()));
+
+    const t1 = Date.now();
+    let raw = readLedger();
+    while (raw && raw['20260923_1430'] && Date.now() - t1 < 6000) {
+      await new Promise((r) => setTimeout(r, 100));
+      raw = readLedger();
+    }
+    assert.ok(!('20260923_1430' in raw), `删光文件后逐文件账本要跟着走（否则同名新批次会继承旧账）：${JSON.stringify(raw)}`);
+    assert.strictEqual(raw.__total__, 2, '历史累计不清零');
+    const lib = await (await fetch(`${srv.base}/api/library`)).json();
+    assert.strictEqual(lib.downloadsTotal, 2);
+    assert.strictEqual(lib.batches.length, 0);
   } finally {
     await srv.stop();
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
