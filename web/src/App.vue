@@ -374,6 +374,12 @@ function toast(message) {
 }
 
 function stateText(task) {
+  // 下载分三段：拉密文（可续）、解密（写本地）、交给浏览器保存——三段都要说清在哪
+  if (task.kind === 'download' && task.state === 'running') {
+    if (task.phase === 'decrypt') return '解密中';
+    if (task.phase === 'save') return '保存中';
+    if (task.phase === 'waiting') return '重连中';
+  }
   return {
     queued: '排队', running: '进行中', finishing: '正在合并', paused: '已暂停',
     failed: '失败', done: '已完成', canceled: '已取消',
@@ -388,6 +394,7 @@ function taskPct(task) {
 }
 
 function taskMeta(task) {
+  if (task.kind === 'download' && task.note) return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.note}`;
   if (task.kind === 'upload') return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}`;
   if (task.kind === 'folder-delete') return `已完成 ${task.index || 0}/${task.items?.length || 0} 项`;
   if (task.kind === 'zip') return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.files || 0} 个文件`;
@@ -785,7 +792,7 @@ function columnMenuItems(col) {
 async function addDownload(row) {
   const task = reactive({
     id: `task-${++taskSeq}`, kind: 'download', title: row.name, state: 'running',
-    received: 0, total: row.cipherSize || 0, error: '', row,
+    received: 0, total: row.cipherSize || 0, error: '', row, phase: 'download', note: '',
   });
   let controller = new AbortController();
   let canceled = false;
@@ -796,12 +803,29 @@ async function addDownload(row) {
     try {
       await downloadFile(
         { batch: row.batch, enc: row.enc, name: row.name, size: row.cipherSize, plainSize: row.plainSize },
-        { signal: controller.signal, onUpdate: (p) => { task.received = p.received; task.total = p.total || task.total; } },
+        {
+          signal: controller.signal,
+          memCapBytes: data.value.memDownloadMaxBytes,
+          onUpdate: (p) => {
+            if (p.phase) task.phase = p.phase;
+            if (Number.isFinite(p.received)) task.received = p.received;
+            if (p.total) task.total = p.total;
+            if (p.phase === 'waiting') {
+              task.note = `网络中断，${Math.max(1, Math.round((p.retryInMs || 1000) / 1000))} 秒后从 ${fmtSize(p.received || 0)} 继续（第 ${p.attempt} 次）`;
+            } else if (p.phase === 'decrypt') task.note = '正在解密并写入本地';
+            else if (p.phase === 'save') task.note = '正在交给浏览器保存';
+            else if (p.phase === 'download') task.note = '';
+          },
+        },
       );
       task.state = 'done';
+      task.phase = 'done';
+      task.note = '';
       toast('已下载');
       refreshLibrary({ silent: true });
     } catch (err) {
+      task.note = '';
+      task.phase = 'idle';
       if (canceled) task.state = 'canceled';
       else if (err.name === 'AbortError') task.state = 'paused';
       else { task.state = 'failed'; task.error = err.message || '下载失败'; toast(task.error); }

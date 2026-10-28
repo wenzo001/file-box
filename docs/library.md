@@ -105,7 +105,7 @@ uploads/20261027_1431/          ← 批次目录（日期名，路径闸门仍�
 | 任务 | 暂停 | 继续 | 取消 | 说明 |
 |---|---|---|---|---|
 | 上传 | 停发新块，等在途块落定 | 重新 init 拿 `have`，只补缺失块 | 中止在途 + `DELETE /api/uploads/:id` | 刷新后列出服务端未完成批次，重选同一批文件续传 |
-| 下载 | abort 当前请求，保留 OPFS partial | 从 partial 长度发 `Range` 续 | abort + 清 OPFS | 无 OPFS 的浏览器退化为从头重试 |
+| 下载 | abort 当前请求，OPFS 里的密文 partial 保留；重新开始会从断点续 | 从 partial 长度发 `Range` 续（网络断了/15 秒无字节自动重连，退避 1/2/4…最大 30 秒，直到取消） | abort 并清掉密文与明文两份 partial | 密文在 OPFS 里断点续；解密**按块写进第二个 OPFS 文件**再把磁盘文件交给浏览器保存（内存只留一块）。没有可写 OPFS 的设备只能整文件进内存，默认 50MB 封顶（`MEM_DOWNLOAD_MAX_MB`） |
 | 目录 / 多选打包 | abort 当前文件请求；已写入 zip 的条目保留 | 从下一个未完成条目继续（当前文件没写完就重下这一件） | abort | 浏览器内解密，进度按明文字节；zip 状态留在任务闭包里 |
 | 目录删除 | 当前项完成后停 | 从剩余清单继续 | 停止，剩余保留 | 按“批次 → 最深子目录 → 父目录”逐项；`expectFolder` 防误删被移走的批次 |
 
@@ -193,5 +193,14 @@ npm run pack       # 依赖已装好时只 build + 出包
   - 静态门（`test/format.test.js`）：扫 `server.js` 与 `lib/transfer.js` 里"把字节写给响应"的路由（`.pipe(res)` / `res.download` / `res.sendFile` / `res.write`），每条路由自己的那次调用里必须有一句能生效的声明（`Content-Disposition: attachment` / `application/octet-stream` / `res.download` 自带的 attachment）。块边界按**括号配对**取；先剥注释。仪器自检三条：没声明的必须报红、有声明的必须放行、**注释里写 attachment 也必须报红**。下限点名 `/api/download/:folder/:file`、`/api/archive/:folder`、`/api/xfer/seg` 三条必须真被扫到。刀：往 server.js 里加一条 `app.get('/api/leak')` 直接 pipe → 读数 `{"file":"server.js","route":"/api/leak","safe":false}`。**这版判据第一稿是假绿**：块按"切到下一条路由"取，最后一条路由把文件末尾那段 `application/octet-stream` 借来当了自己的声明；改成括号配对后才有牙。
   - 行为腿（`test/pathgate.test.js`）：同一个文件名 `evil.html`（内容是 `<script>`）走四条路读**真响应头** —— 普通下载、Range 续传、归档、无痕分段，前两条必须有 `Content-Disposition: attachment`，后两条必须是 `application/octet-stream`。两把刀：摘掉 Range 那一支的 attachment、摘掉无痕分段的 octet-stream，各自红。**这把刀同时证明了静态门的边界**：只摘 Range 那一支时静态门照绿（同一条路由里 `res.download` 那支还替它背书），所以两条腿缺一不可 —— 静态守"新路由有没有声明"，行为守"每一条支路都声明了"。
   - `/api/library` 扫描缓冲：`SCAN_CACHE_MS`（默认 1500ms）只罩住"扫盘结果"，`now`、目录树、设置仍每帧重算；`forgetUsage()` 顺手清缓存，所以提交 / 删除 / 移动 / 清空 / TTL 回收之后立刻可见。判据三条：40ms 后第二次请求的 `now` 必须真的变大（防"把时间也缓存了"）、盘上直接塞一个批次目录在 1.5 秒内不该出现、过了 TTL 必须出现、走 API 删掉之后立刻消失。三把刀：缓存不读 / `forgetUsage` 不清缓存 / `now` 取缓存时间戳，各自红。夹具把 `SCAN_CACHE_MS` 设成 0（其余测试默认"盘上一变就能看见"），缓存的行为由这一条腿单独按 1500ms 验。
+- 手机弱网下载（同日第六批）：`npm test` 在最终树 **196/196** 通过（186 → 196：按块读队列 3 条、下载核心 7 条）。
+  - 先量了病灶，再动手：纯 JS GCM（内网 HTTP 下就是它）**≈7 MB/s**，700MB 要 ~2 分钟；旧 `decryptStream` 把每块 `push` 进数组再 `new Blob`，且 `readExact` 每来一个网络分片就整段重拷（4MB 块 / 64KB 分片放大 32 倍）。Chromium 实测：**16MB 文件解密时 JS 堆峰值 +173MB（10.8×），64MB +355MB（5.6×）** —— "整文件进内存"这条路的上限是几十 MB，不是设备内存。
+  - 单文件下载重写：密文断点存 OPFS（不变）→ **按块解密写进第二个 OPFS 文件**（`download-core.mjs` 的 `decryptToStore`，单次写入 ≤1 块）→ 把磁盘上的 `File` 交给保存锚点 → 30 秒后（对象 URL 撤销完）再清 partial。内存只剩一块（4MB 原生 / 512KB 纯 JS）。
+  - 断线自愈：`transferToStore` 每次从头算"已存多少"，按 `Range: bytes=<已存>-` 续；15 秒没有字节按"卡住"处理（同时掐掉这次请求）；退避 1/2/4…封顶 30 秒，**无限重试直到取消**；404/403 不重试；服务端没按 Range 回（200）时先清再写，绝不让两份密文拼在一起。
+  - 界面三段各报进度：`download` → `decrypt` → `save`；重连时写「网络中断，N 秒后从 X 继续（第 k 次）」。
+  - 判据与刀：`test/byte-queue.test.js`（跨分片拼装 / 4MB 块配 64KB 分片时缓冲有界 / 提前结束报"数据不完整"）；`test/download-core.test.js`（正常下载、断线两发请求且第二发带 `Range: bytes=<40%>-` 且拼起来与原文逐字节一致、卡住三次后第四次成、404 不重试、416+已完整视为完成、取消零请求、上限话术、解密按块写且单次 ≤1MB、长度不符报错）。刀：**续传不带 Range** → 断言红（第一版这把刀挂了 428 秒，因为断言写在假 fetch 里、失败被当成网络错误无限重试——仪器错，改成调用后断言并给重试上界）；**退避不指数** → 红；**提前结束当成功** → 红；**整文件攒完再写** → 「明文要一块一块写进 store」红。
+  - 真浏览器腿 `test/lab/download-resume.js`（真服务 + 真 OPFS + 真解密）：6MB 文件，第一次只回 40% 就断 → 断言**恰好两发请求**、第二发 `Range=bytes=2516736-`、落盘 6.00MB 且与原文逐字节一致。两条现场发现：① 我第一版按 `**/api/download/**` 拦，把 `manifest.enc` 的清单请求也打断了（按形状拦、没按文件身份）——修正为先匹配文件名；② **清 OPFS 太早会把保存取消**（`download.saveAs: canceled`），因为浏览器是异步读那个 blob 的；改成对象 URL 撤销后再清。后者的读数是"改前 canceled / 改后通过"，但它依赖时序，没做成确定性判据，别当成已守。
+  - 能力上限：没有可写 OPFS（旧 Safari / 无痕模式）时整文件进内存，默认 **50MB** 封顶（实测 64MB 要 355MB 堆），话术直接说清"传不完，请用电脑或走无痕传输"；`MEM_DOWNLOAD_MAX_MB` 由服务端下发（`/api/library` 的 `memDownloadMaxBytes`），部署可放宽。
+  - 仍欠：目录 / 多选 zip 还是"整包进内存"（同一族问题，这轮只修了单文件）；iPhone 上超大文件的最终保存行为只能在真机验（OPFS 的 `File` 是磁盘背书，但 Safari 的下载管理仍有自己的上限）。
 - **历史未查明（不当已通过）**：在 151 条版本的一次串行全量里出现 `150/151`，失败在 `test/xfer-channel.test.js` 的“收尾被一直拒收”，错误是 `api/xfer/create` 400；单跑该文件 `30/30` 通过，随后 151 条全量通过，未能复现。154 条版本连跑两遍通过；157 条版本通过一次；本轮**在 168 条那棵树**（加手机档静态门之前）第一遍 167/168，红的是同一文件另一条腿「卡住之后自己恢复了：要跑完，并且不许留着旧的"卡住了"吓用户」，断言读数 `进度已 sent=17/17 ack=17` 而界面仍挂「写入分段失败」，且台架自报 `refuse=0 hang=0` 收尾请求 `http200`（即收尾没被拒，红在"文案没跟着恢复收掉"——与 151 版那条"一直拒收"不是同一个形状，不能并成一条）；紧接着单跑该文件 `30/30` 通过，同一棵树再跑全量 `168/168` 通过；补上手机档静态门后的最终树（169 条）全量通过一次，未再复现。这条历史红（现在有两种签名）仍按未查明登记，不当已通过。
 - `npm test` 现在带 `--test-concurrency=1`，并在 `pretest` 先执行 `npm run build`；直接 `node --test` 前也要先构建 `dist-web`。

@@ -121,7 +121,9 @@ async function uploadBundle(srv, key, files, extra = {}) {
   const init = await jget(`${srv.base}/api/upload/init`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, files, ...extra }),
+    // 只声明 {enc, chunks}：夹具里的 data（密文分片）不该跟着进 init 的 JSON，
+    // 否则 6MB 的夹具会先撞上 init 的 2MB 请求体上限（413）
+    body: JSON.stringify({ key, files: files.map(({ enc, chunks }) => ({ enc, chunks })), ...extra }),
   });
   if (init.status !== 200) throw new Error(`init ${init.status}: ${JSON.stringify(init.body)}`);
   for (let fi = 0; fi < files.length; fi++) {

@@ -1,13 +1,22 @@
-// 下载任务：OPFS 存密文 partial，Range 从断点续；完成后流式解密并按清单明文大小裁剪。
+// 下载任务：密文断点续传进 OPFS → 按块解密写进第二个 OPFS 文件 → 把**磁盘上的 File** 交给保存锚点。
+// 内存只留一块（JS 引擎 512KB / 原生 4MB）；断线或卡住都从已存字节续，直到用户取消。
+// 没有可写 OPFS 的设备（旧 Safari / 无痕模式）只能整文件进内存：实测 64MB 要 355MB 堆，所以按 50MB 封顶。
 import { api } from './api.js';
+import { MEM_MAX_BYTES, decryptToStore, memoryCapProblem, transferToStore } from './download-core.mjs';
 
 const OPFS_DIR = 'fb-lib-dl';
+const PLAIN_SUFFIX = '.plain';
 
-export function saveBlob(blob, name) {  const a = document.createElement('a');
+export function saveBlob(blob, name, after) {
+  const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = String(name || 'download').replace(/[/\\]/g, '_');
   a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+  // 浏览器是异步读这个 blob 的：对象 URL 撤销之前不能删源文件，删早了保存会被取消（实测 canceled）
+  setTimeout(() => {
+    URL.revokeObjectURL(a.href);
+    if (typeof after === 'function') { try { after(); } catch { /* 清理失败下次覆盖 */ } }
+  }, 30_000);
 }
 
 async function opfsRoot() {
@@ -27,14 +36,41 @@ async function handleFor(batch, enc, create = true) {
   }
 }
 
-async function partialSize(handle) {
-  try { return (await handle.getFile()).size; } catch { return 0; }
+/** 有的浏览器有 getDirectory 但没有 createWritable（或私密模式下直接抛）：这类设备不能续存 */
+const canWrite = (h) => Boolean(h && typeof h.createWritable === 'function');
+
+/** 把一个 FileSystemFileHandle 包成 download-core 要的 store */
+function opfsStore(handle) {
+  const size = async () => { try { return (await handle.getFile()).size; } catch { return 0; } };
+  return {
+    size,
+    clear: async () => {
+      try {
+        const w = await handle.createWritable({ keepExistingData: false });
+        await w.close();
+      } catch { /* 文件本来就不在 */ }
+    },
+    openWriter: async ({ append }) => {
+      const start = append ? await size() : 0;
+      const w = await handle.createWritable({ keepExistingData: Boolean(append) });
+      if (append && start > 0) await w.seek(start);
+      return { write: (u8) => w.write(u8), close: () => w.close() };
+    },
+  };
 }
 
-function trimTo(blob, plainSize) {
-  if (!Number.isFinite(plainSize)) return blob;
-  if (blob.size < plainSize) throw new Error('文件长度与清单不符（数据不完整）');
-  return blob.size > plainSize ? blob.slice(0, plainSize) : blob;
+/** 内存兜底：只有拿不到 OPFS 可写句柄时才走，容量由 memoryCapProblem 先卡住 */
+function memStore() {
+  let parts = [];
+  return {
+    parts: () => parts,
+    size: async () => parts.reduce((s, p) => s + p.length, 0),
+    clear: async () => { parts = []; },
+    openWriter: async ({ append }) => {
+      if (!append) parts = [];
+      return { write: async (u8) => { parts.push(u8); }, close: async () => {} };
+    },
+  };
 }
 
 export async function clearDownload(batch, enc) {
@@ -43,67 +79,81 @@ export async function clearDownload(batch, enc) {
   try {
     const dir = await root.getDirectoryHandle(OPFS_DIR, { create: false });
     const bdir = await dir.getDirectoryHandle(batch, { create: false });
-    await bdir.removeEntry(enc, { recursive: false });
+    for (const name of [enc, `${enc}${PLAIN_SUFFIX}`]) {
+      try { await bdir.removeEntry(name, { recursive: false }); } catch { /* 没有就算了 */ }
+    }
     try { await dir.removeEntry(batch, { recursive: false }); } catch { /* 目录不空就算了 */ }
   } catch { /* 没有 partial 就是干净的 */ }
 }
 
-export async function downloadFile(file, { onUpdate = () => {}, signal } = {}) {
-  const { batch, enc, name, size, plainSize } = file;
-  const total = Number.isFinite(size) ? size : 0;
-  const handle = await handleFor(batch, enc);
-
-  if (handle) {
-    const offset0 = await partialSize(handle);
-    if (offset0 >= total && total > 0) {
-      // partial 已经完整，直接解密
-    } else {
-      const headers = offset0 > 0 ? { Range: `bytes=${offset0}-` } : {};
-      const res = await fetch(api.downloadUrl(batch, enc), { headers, signal });
-      let append = offset0 > 0 && res.status === 206;
-      if (res.status === 416 && offset0 >= total) {
-        append = false;
-      } else if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `下载失败 (${res.status})`);
-      } else if (offset0 > 0 && res.status !== 206) {
-        // 服务端没按 Range 回，退化为从头写，避免把两份密文拼在一起
-        append = false;
-      }
-      if (res.ok || res.status === 416) {
-        if (res.body && res.status !== 416) {
-          let offset = append ? offset0 : 0;
-          const writable = await handle.createWritable({ keepExistingData: append });
-          if (append) await writable.seek(offset);
-          const reader = res.body.getReader();
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            await writable.write(value);
-            offset += value.length;
-            onUpdate({ received: offset, total: total || offset });
-          }
-          await writable.close();
-        }
-      }
-    }
-
-    const fileOnDisk = await handle.getFile();
-    const blob = await FBCrypto.decryptStream(fileOnDisk.stream());
-    saveBlob(trimTo(blob, plainSize), name);
-    await clearDownload(batch, enc);
-    onUpdate({ received: total, total, done: true });
-    return { name, size: blob.size };
-  }
-
-  // 没有 OPFS：可取消、可重试，但不可续传
-  const res = await fetch(api.downloadUrl(batch, enc), { signal });
+async function memoryDownload(file, { total, onUpdate, signal }) {
+  const res = await fetch(api.downloadUrl(file.batch, file.enc), { signal });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || `下载失败 (${res.status})`);
   }
-  const blob = await FBCrypto.decryptStream(res.body);
-  saveBlob(trimTo(blob, plainSize), name);
-  onUpdate({ received: total, total, done: true });
-  return { name, size: blob.size };
+  const store = memStore();
+  const r = await decryptToStore({
+    cipherSource: res.body,
+    plainStore: store,
+    decryptBytes: FBCrypto.decryptBytes,
+    plainSize: file.plainSize,
+    onProgress: (p) => onUpdate({ phase: 'decrypt', received: p.decrypted, total: p.total }),
+  });
+  onUpdate({ phase: 'save', received: r.size, total: r.size });
+  saveBlob(new Blob(store.parts(), { type: 'application/octet-stream' }), file.name);
+  onUpdate({ received: total || r.size, total: total || r.size, done: true, phase: 'done' });
+  return { name: file.name, size: r.size };
 }
+
+export async function downloadFile(file, { onUpdate = () => {}, signal, memCapBytes } = {}) {
+  const { batch, enc, name, size, plainSize } = file;
+  const total = Number.isFinite(size) ? size : 0;
+  const cipher = await handleFor(batch, enc, true);
+  const plain = await handleFor(batch, `${enc}${PLAIN_SUFFIX}`, true);
+  const hasOpfs = canWrite(cipher) && canWrite(plain);
+
+  const problem = memoryCapProblem({ hasOpfs, size: total, capBytes: memCapBytes || MEM_MAX_BYTES });
+  if (problem) throw new Error(problem);
+  if (!hasOpfs) return memoryDownload(file, { total, onUpdate, signal });
+
+  const plainStore = opfsStore(plain);
+  // 上一轮已经解密完整、只是保存那一步失败：直接再存一次，不重下也不重解
+  if (Number.isFinite(plainSize) && (await plainStore.size()) === plainSize) {
+    onUpdate({ phase: 'save', received: plainSize, total: plainSize });
+    saveBlob(await plain.getFile(), name, () => clearDownload(batch, enc));
+    onUpdate({ received: total || plainSize, total: total || plainSize, done: true, phase: 'done' });
+    return { name, size: plainSize };
+  }
+
+  try {
+    await transferToStore({
+      url: api.downloadUrl(batch, enc),
+      store: opfsStore(cipher),
+      total,
+      signal,
+      onUpdate: (p) => onUpdate({ ...p, total: p.total || total }),
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    // OPFS 在私密模式 / 配额已满时会在这里抛：换成能看懂的话，别让用户看着重试转圈
+    if (/createWritable|NotSupported|QuotaExceeded|UnknownError/i.test(String(err.message))) {
+      throw new Error('这个浏览器的存储不支持断点续存（或是空间不足），换普通窗口或换设备再试');
+    }
+    throw err;
+  }
+
+  const decrypted = await decryptToStore({
+    cipherSource: await cipher.getFile(),
+    plainStore,
+    decryptBytes: FBCrypto.decryptBytes,
+    plainSize,
+    onProgress: (p) => onUpdate({ phase: 'decrypt', received: p.decrypted, total: p.total }),
+  });
+  onUpdate({ phase: 'save', received: decrypted.size, total: decrypted.size });
+  saveBlob(await plain.getFile(), name, () => clearDownload(batch, enc));
+  onUpdate({ received: total || decrypted.size, total: total || decrypted.size, done: true, phase: 'done' });
+  return { name, size: decrypted.size };
+}
+
+export { MEM_MAX_BYTES };

@@ -30,6 +30,9 @@ const LIBRARY_DIR = process.env.LIBRARY_DIR
   : path.join(path.dirname(UPLOAD_DIR), '.library');
 const TTL_SWEEP_MS = Number(process.env.TTL_SWEEP_MS) || 60 * 1000;
 const MAX_FOLDERS = Number(process.env.MAX_FOLDERS) || 10000;
+// 没有可写 OPFS 的浏览器只能把整个文件读进内存：实测 64MB 文件解密时 JS 堆峰值 +355MB，
+// 所以默认 50MB 封顶。部署里若全是内存充裕的平板，可以用这个环境变量放宽（风险自担）。
+const MEM_DOWNLOAD_MAX_MB = Number(process.env.MEM_DOWNLOAD_MAX_MB) || 50;
 const library = createLibrary({ libraryDir: LIBRARY_DIR, log: console, maxFolders: MAX_FOLDERS });
 let libraryReady = false;
 
@@ -588,6 +591,8 @@ async function buildLibraryPayload() {
     downloadsTotal: downloadTotal(),
     // 确认词只在服务端定义一份，界面拿它做校验与占位：两边各写一份迟早会对不上
     wipeConfirm: WIPE_CONFIRM,
+    // 没有 OPFS 可写时单文件能进内存的上限（字节）；界面据此决定"直接拒"还是"照下"
+    memDownloadMaxBytes: MEM_DOWNLOAD_MAX_MB * 1024 * 1024,
     folders,
     batches,
   };
