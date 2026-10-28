@@ -7,6 +7,7 @@ const { pipeline } = require('stream/promises');
 const express = require('express');
 const selfsigned = require('selfsigned');
 const { createLibrary, LibraryError, TTL_HOURS } = require('./lib/library');
+const { commitStaging } = require('./lib/staging');
 const { folderIdOrUnfiled, ttlHours, schemas } = require('./lib/schemas');
 
 const app = express();
@@ -387,19 +388,6 @@ function nextBatchDir() {
   throw new Error('同一分钟内批次过多，请稍后重试');
 }
 
-function commitStaging(stagingDir) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const { name, target } = nextBatchDir();
-    try {
-      fs.renameSync(stagingDir, target); // 同盘 rename，一步到位
-      return name;
-    } catch (err) {
-      if (err.code === 'EEXIST' || err.code === 'EPERM') continue; // 并发抢了同名目录，换下一个
-      throw err;
-    }
-  }
-  throw new Error('同一分钟内上传批次过多，请稍后重试');
-}
 
 const storageFull = () => dirSize(UPLOAD_DIR) + dirSize(STAGING_DIR) >= STORAGE_LIMIT;
 const tooLarge = (res) =>
@@ -731,7 +719,7 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
       for (const leftover of fs.readdirSync(dir)) {
         if (/^part-\d+-\d+\.(bin|tmp)$/.test(leftover)) fs.rmSync(path.join(dir, leftover), { force: true });
       }
-      const folder = commitStaging(dir); // 名字 = 完成时刻
+      const folder = commitStaging(dir, { nextBatchDir }); // 名字 = 完成时刻
       forgetUsage(); // 刚搬进 uploads，缓存里的占用已经不准了
 
       const uploadedAt = Date.now();
