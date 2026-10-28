@@ -40,10 +40,10 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     let lib = await (await fetch(`${srv.base}/api/library`)).json();
     assert.strictEqual(lib.settings.defaultTtlHours, 4, '全局 TTL 没有落到服务端');
 
-    // 目录栏头新建；输入框 20 字上限
+    // 目录栏头新建；输入框 10 字上限
     await page.locator('.column').first().getByRole('button', { name: '新建文件夹' }).click();
     const input = page.locator('.dialog .input');
-    assert.strictEqual(await input.evaluate((el) => el.maxLength), 20, '目录名输入框没有 20 字上限');
+    assert.strictEqual(await input.evaluate((el) => el.maxLength), 10, '目录名输入框没有 10 字上限');
     await input.fill('冒烟项目');
     await page.locator('.dialog .btn-primary').click();
     await page.waitForSelector('.folder-row');
@@ -388,6 +388,8 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.ok(libBefore.batches.length > 0, '前置：清空前要有批次');
     assert.ok(libBefore.downloadsTotal >= 1, '前置：前面几条腿下载过，累计不该是 0');
     assert.ok(libBefore.wipeConfirm, '前置：确认词要由服务端下发（界面不再自己存一份）');
+    // 窄屏的配置条收进了设置底表（这条腿走桌面入口）：先回到桌面档
+    await page.setViewportSize({ width: 1400, height: 950 });
     await page.locator('.wipe-open').click();
     await page.waitForSelector('.dialog', { state: 'visible' });
     await page.locator('.dialog .btn-danger').click(); // 空确认词

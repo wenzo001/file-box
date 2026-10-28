@@ -12,7 +12,7 @@ import {
 } from 'reka-ui';
 import {
   ChevronRight, Clock, Download, File, Folder, FolderPlus, HardDrive, Inbox,
-  Link2, ListChecks, Package, Pause, Play, RotateCcw, Search, Trash2, Upload, X,
+  Link2, ListChecks, Package, Pause, Play, RotateCcw, Search, Settings, Trash2, Upload, X,
 } from '@lucide/vue';
 import { api } from './lib/api.js';
 import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from './lib/manifest.js';
@@ -20,13 +20,14 @@ import { UploadTask, relPath, sortSelected } from './lib/upload.js';
 import { clearDownload, downloadFile, saveBlob } from './lib/download.js';
 import { createZipRunner, zipPlan } from './lib/zip.js';
 import WipeDialog from './components/WipeDialog.vue';
+import SettingsSheet from './components/SettingsSheet.vue';
 import { tierLabel } from './lib/capability.mjs';
 import { bindColumnDnd } from './lib/dnd.js';
 import {
   collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
 } from './lib/format.js';
 
-const FOLDER_NAME_MAX = 20;
+const FOLDER_NAME_MAX = 10;
 const TTL_FALLBACK = [1, 4, 8, 48, 72, 120, 240, 2160];
 const now = useNow({ interval: 15_000 });
 
@@ -1224,6 +1225,13 @@ function openDeleteSelected() {
 
 // 一键清空：确认词由服务端下发（/api/library 的 wipeConfirm），弹层在 components/WipeDialog.vue
 const wipeOpen = ref(false);
+const settingsOpen = ref(false);
+// 这段解释两处共用（顶部配置条 + 手机档设置底表）：改一处就够
+const ttlHint = computed(() => `当前：新上传的文件会在「${ttlLabel(settingsTtl.value)}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。`);
+function onSettingsChange(hours) {
+  settingsTtl.value = hours;
+  onTtlChange();
+}
 const wipeConfirm = computed(() => data.value.wipeConfirm || '清空全部文件');
 const wipeStats = computed(() => ({
   files: data.value.folders.reduce((s, f) => s + (f.count || 0), 0),
@@ -1544,6 +1552,7 @@ onBeforeUnmount(() => {
         <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB；累计下载 ${data.downloadsTotal || 0} 次`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB · 累计下载 {{ data.downloadsTotal || 0 }} 次</span>
         <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> <span class="lbl-full">上传到「{{ uploadTargetLabel }}」</span><span class="lbl-short">上传</span></button>
         <a class="btn" href="../transfer.html"><span class="lbl-full">无痕传输</span><span class="lbl-short">传输</span></a>
+        <button class="btn only-mobile" aria-label="设置" title="容量 / 自动删除 / 清理" @click="settingsOpen = true"><Settings :size="18" /></button>
       </div>
     </header>
 
@@ -1560,7 +1569,7 @@ onBeforeUnmount(() => {
       >
         <option v-for="h in ttlOptions" :key="h" :value="h">{{ ttlLabel(h) }}后自动删除</option>
       </select>
-      <span class="config-hint" v-if="!libraryNotReady" :title="`当前：新上传的文件会在「${ttlLabel(settingsTtl)}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。`">当前：新上传的文件会在「{{ ttlLabel(settingsTtl) }}」后自动删除，到期永久删除；文件夹不自动删除。已上传文件按各自上传时的设置，设置对所有使用者生效。</span>
+      <span class="config-hint" v-if="!libraryNotReady" :title="ttlHint">{{ ttlHint }}</span>
       <span class="config-hint" v-else>目录索引暂不可用，自动删除设置暂时不能修改。</span>
       <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="wipeOpen = true"><Trash2 :size="15" aria-hidden="true" /><span class="wipe-label">清空所有文件…</span></button>
     </div>
@@ -1731,9 +1740,8 @@ onBeforeUnmount(() => {
                     >
                   </label>
                   <Folder :size="20" class="row-icon folder-icon" />
-                  <span class="col-name" :title="folder.name">{{ folder.name }}
+                  <span class="col-name" :title="folder.name"><span class="name-text">{{ folder.name }}</span>
                     <span v-if="folder.system" class="tag">系统</span>
-                    <span v-if="isHot(folder.lastUpdatedAt, now)" class="tag hot">热乎</span>
                   </span>
                   <span class="col-meta">{{ folderRowMeta(folder) }}</span>
                   <span v-if="folder.earliestExpiresAt" :class="expiryClass(folder.earliestExpiresAt, now)" class="col-expiry">
@@ -1768,7 +1776,7 @@ onBeforeUnmount(() => {
                     >
                   </label>
                   <File :size="20" class="row-icon file-icon" />
-                  <span class="col-name" :title="row.name">{{ row.name }}
+                  <span class="col-name" :title="row.name"><span class="name-text">{{ row.name }}</span>
                     <span v-if="isHot(row.uploadedAt, now)" class="tag hot">热乎</span>
                     <span v-if="sharedFileKeys.has(row.key)" class="tag share-tag">分享</span>
                     <span v-if="row.legacy" class="tag">旧数据</span>
@@ -1889,6 +1897,31 @@ onBeforeUnmount(() => {
         </DialogContent>
       </DialogPortal>
     </DialogRoot>
+
+    <div class="action-bar">
+      <span class="action-count">{{ selected.length ? `${selected.length} 项` : '选择文件' }}</span>
+      <div class="action-items">
+        <button class="linkbtn tool-btn" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll"><ListChecks :size="18" aria-hidden="true" /></button>
+        <button class="linkbtn tool-btn" :disabled="!selectedFileCount" title="复制分享链接" aria-label="复制分享链接" @click="copySelectedShare"><Link2 :size="18" aria-hidden="true" /></button>
+        <button class="linkbtn tool-btn" :disabled="!selected.length" title="打包下载" aria-label="打包下载" @click="downloadSelectedZip"><Package :size="18" aria-hidden="true" /></button>
+        <button class="linkbtn tool-btn danger-text" :disabled="!selected.length" title="删除" aria-label="删除" @click="openDeleteSelected"><Trash2 :size="18" aria-hidden="true" /></button>
+        <button class="linkbtn tool-btn" :disabled="!selected.length" title="取消选择" aria-label="取消选择" @click="selected = []"><X :size="18" aria-hidden="true" /></button>
+      </div>
+    </div>
+
+    <SettingsSheet
+      v-model:open="settingsOpen"
+      :ttl="settingsTtl"
+      :options="data.ttlOptions || []"
+      :hint="ttlHint"
+      :used="data.usage.used"
+      :limit-gb="data.usage.limitGB"
+      :downloads-total="data.downloadsTotal || 0"
+      :not-ready="libraryNotReady"
+      :saving="settingsSaving"
+      @change="onSettingsChange"
+      @wipe="settingsOpen = false; wipeOpen = true"
+    />
 
     <WipeDialog
       v-model:open="wipeOpen"

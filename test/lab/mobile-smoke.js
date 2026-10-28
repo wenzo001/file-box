@@ -57,7 +57,11 @@ const MEASURE = () => {
     }
     return { top, bottom, left, right, w: Math.max(0, right - left), h: Math.max(0, bottom - top) };
   };
-  const shown = (el) => getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden' && Number(getComputedStyle(el).opacity) !== 0;
+  // 祖先 display:none 时自己的 computed display 还是 flex —— 必须看"有没有渲染出来的矩形"
+  const shown = (el) => {
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && el.getClientRects().length > 0;
+  };
   // 能滚到 ≠ 看得见：从里往外找第一个真把它裁住的祖先——那个祖先滚不动，才是永久够不着
   const canReveal = (n, axis) => {
     const cs = getComputedStyle(n);
@@ -93,6 +97,11 @@ const MEASURE = () => {
     if (r.height - v.h > 2) cutScrollers.push({ el: label(n), h: Math.round(r.height), visibleH: Math.round(v.h) });
   }
 
+  // 固定底栏（.action-bar）会盖住首屏底部：页面还能滚 ⇒ 用户滚得出来，不算"被吃掉"；
+  // 页面滚不动时它盖住什么就是真的够不着
+  const barEl = document.querySelector('.action-bar');
+  const barRect = barEl && getComputedStyle(barEl).display !== 'none' ? barEl.getBoundingClientRect() : null;
+  const canScroll = document.documentElement.scrollHeight > innerHeight + 4;
   const small = [];
   const zoom = [];
   const covered = [];
@@ -121,7 +130,10 @@ const MEASURE = () => {
     const cy = Math.round(v.top + v.h / 2);
     if (v.w >= 24 && v.h >= 24 && cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight) {
       const hit = document.elementFromPoint(cx, cy);
-      if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) covered.push({ ...rec, hit: label(hit) });
+      if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) {
+        const underBar = barRect && cy > barRect.top - 2 && canScroll;
+        if (!underBar) covered.push({ ...rec, hit: label(hit) });
+      }
     }
   }
   const contrast = {};
@@ -130,7 +142,8 @@ const MEASURE = () => {
     ['hint', '.config-hint'], ['placeholder', '.search input'], ['taskState', '.task-state'],
   ]) {
     const el = document.querySelector(sel);
-    if (el) contrast[role] = ratio(el);
+    if (el && shown(el)) contrast[role] = ratio(el); // 收进底表的元素在页面上是隐藏的，别量它
+
   }
   const cols = document.querySelector('.columns').getBoundingClientRect();
   const list = document.querySelector('.column:last-child .col-list');
@@ -153,6 +166,8 @@ const MEASURE = () => {
     colsInView: Math.round(Math.max(0, Math.min(cols.bottom, innerHeight) - Math.max(cols.top, 0))),
     listH: list ? Math.round(list.getBoundingClientRect().height) : null,
     chromeH: Math.round(bar.height + strip.height),
+    barH: barEl && getComputedStyle(barEl).display !== 'none' ? Math.round(barEl.getBoundingClientRect().height) : 0,
+    mainPadBottom: Math.round(parseFloat(getComputedStyle(document.querySelector('.main')).paddingBottom) || 0),
     stickyTop,
     rowsVisible: [...document.querySelectorAll('.column:last-child .col-row')]
       .filter((r) => { const v = visibleRect(r); return v.h >= 24 && v.w >= 24; }).length,
@@ -203,6 +218,9 @@ const MEASURE = () => {
       if (m.small.length) problems.push(`${tag}: ${m.small.length} 个控件命中区不足 44pt → ${JSON.stringify(m.small)}`);
       if (m.zoom.length) problems.push(`${tag}: ${m.zoom.length} 个文本输入 <16px，iOS 聚焦会放大整页 → ${JSON.stringify(m.zoom)}`);
       if (m.covered.length) problems.push(`${tag}: ${m.covered.length} 个控件中心被别的元素吃掉 → ${JSON.stringify(m.covered)}`);
+      if (m.barH && m.mainPadBottom < m.barH + 8) {
+        problems.push(`${tag}: 正文底部只留了 ${m.mainPadBottom}px，动作栏高 ${m.barH}px —— 最后一屏会压在栏下面`);
+      }
       for (const [role, v] of Object.entries(m.contrast)) {
         if (v < 4.5) problems.push(`${tag}: 「${role}」对比度 ${v}:1 < 4.5:1`);
       }
@@ -231,8 +249,33 @@ const MEASURE = () => {
 
       // 确认词没填就点，报错但不许删（红底被 hover 换掉那条腿在触摸档复现不了，见 library-smoke）
       const beforeWipe = await (await fetch(`${srv.base}/api/library`)).json();
-      await tap('.wipe-open', '打开清空弹层');
+      // 手机档：配置条整块收进「设置」底表，清空入口也跟着搬进去
+      await tap('[aria-label="设置"]', '打开设置底表');
       await page.waitForSelector('.dialog', { state: 'visible' });
+      assert.strictEqual(await page.locator('.config-strip').isVisible(), false, '手机档不该再显示顶部配置条');
+      const sheetHint = await page.locator('.dialog .config-hint').evaluate((el) => {
+        const cs = getComputedStyle(el);
+        const rgb = (str) => (str.match(/[\d.]+/g) || []).map(Number).slice(0, 3);
+        const lum = (c) => c.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; })
+          .reduce((acc, v, i) => acc + v * [0.2126, 0.7152, 0.0722][i], 0);
+        let acc = [255, 255, 255];
+        for (let n = el; n; n = n.parentElement) {
+          const bg = getComputedStyle(n).backgroundColor;
+          const nums = (bg.match(/[\d.]+/g) || []).map(Number);
+          if (!nums.length || (nums.length === 4 && nums[3] === 0)) continue;
+          const a = nums.length === 4 ? nums[3] : 1;
+          acc = nums.slice(0, 3).map((v, i) => v * a + acc[i] * (1 - a));
+          if (a >= 1) break;
+        }
+        const fg = lum(rgb(cs.color));
+        const bgc = lum(acc);
+        return Number(((Math.max(fg, bgc) + 0.05) / (Math.min(fg, bgc) + 0.05)).toFixed(2));
+      });
+      assert.ok(sheetHint >= 4.5, `设置底表里的说明对比度只有 ${sheetHint}:1`);
+      assert.strictEqual(await page.locator('.dialog .ttl-global').count(), 1, '设置底表里没有自动删除时长');
+      await page.locator('.dialog .danger-text').tap(); // 清空所有文件…
+      await page.waitForSelector('.dialog .dialog-error', { timeout: 1 }).catch(() => {});
+      await page.waitForSelector('.dialog .input', { state: 'visible' });
       await page.locator('.dialog .btn-danger').tap(); // 空确认词：报错，但不许删
       await page.waitForSelector('.dialog .dialog-error');
       // 触摸档没有 hover（(hover:hover) 不成立），所以"红底被 hover 换掉"那条腿在 library-smoke 里验
@@ -240,6 +283,24 @@ const MEASURE = () => {
       assert.strictEqual(afterTry.batches.length, beforeWipe.batches.length, `${tag}: 确认词没填就把文件删了`);
       await page.locator('.dialog .btn').first().tap(); // 取消
       await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
+
+      // 底部动作栏：拇指够得着的位置；未选中时后四颗按不动，勾上后可用
+      const bar = page.locator('.action-bar');
+      assert.strictEqual(await bar.isVisible(), true, '底部动作栏没有常驻');
+      const barBoxes = await bar.locator('.linkbtn').evaluateAll((els) => els.map((el) => {
+        const r = el.getBoundingClientRect();
+        return Math.round(Math.min(r.width, r.height));
+      }));
+      assert.ok(barBoxes.every((n) => n >= 44), `动作栏里有按钮小于 44：${JSON.stringify(barBoxes)}`);
+      // 前面几条腿留下了选中（目录行的勾选框），先按「取消」清掉，再断言未选中时的禁用态
+      await bar.locator('.linkbtn').last().tap();
+      await page.waitForFunction(() => document.querySelector('.action-bar .action-count')?.textContent.trim() === '选择文件');
+      const barDisabled = await bar.locator('.linkbtn').evaluateAll((els) => els.map((el) => el.disabled));
+      assert.deepStrictEqual(barDisabled, [false, true, true, true, true], `未选中时只该「全选」可点：${JSON.stringify(barDisabled)}`);
+      // 勾一条文件：后四颗要能用
+      await page.locator('.column:last-child .file-row .col-check').first().tap();
+      await page.waitForFunction(() => !document.querySelectorAll('.action-bar .linkbtn')[3].disabled);
+      assert.match(await bar.locator('.action-count').innerText(), /1 项/, '动作栏没显示选中数量');
 
       assert.deepStrictEqual(errs, [], `${tag}: 浏览器报错\n${errs.join('\n')}`);
       await page.screenshot({ path: SHOT(`fb-mob-${tag}.png`) });

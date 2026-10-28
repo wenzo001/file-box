@@ -84,9 +84,9 @@ test('目录：重命名、移动、禁止移入自身 / 后代、层级不设�
   assert.strictEqual(await lib.depthOf(deeper._id), 13);
 });
 
-test('目录名：20 个字为上限（按 Unicode 字符计）', async () => {
-  const exact = '一二三四五六七八九十一二三四五六七八九十';
-  assert.strictEqual(Array.from(exact).length, 20);
+test('目录名：10 个字为上限（按 Unicode 字符计）', async () => {
+  const exact = '一二三四五六七八九十';
+  assert.strictEqual(Array.from(exact).length, 10);
   const ok = await lib.createFolder({ name: exact, parentId: null });
   assert.strictEqual(ok.name, exact);
   await assert.rejects(

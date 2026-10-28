@@ -35,9 +35,12 @@ async function uploadWithManifest(srv, files) {
   try {
     const plainA = Buffer.alloc(600 * 1024, 3);
     const plainBig = Buffer.alloc(8 * MB, 9);
+    // 1400 宽的窗口里名字格约 960px：要真的截断得够长（不然这条判据是空的）
+    const longName = `${'很长很长的文件名'.repeat(12)}.txt`;
     const batch = (await uploadWithManifest(srv, [
       { enc: 'a.bin.enc', name: '甲.txt', plain: plainA },
       { enc: 'big.bin.enc', name: '大文件.bin', plain: plainBig },
+      { enc: 'long.bin.enc', name: longName, plain: plainA },
     ])).folder;
     await (await fetch(`${srv.base}/api/folders`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '目标目录' }),
@@ -56,6 +59,41 @@ async function uploadWithManifest(srv, files) {
     await page.locator('.folder-row', { hasText: '未分档' }).first().click();
     await page.waitForSelector('.file-row');
 
+    // 热乎只标文件：目录行不该有
+    assert.strictEqual(await page.locator('.folder-row .tag.hot').count(), 0, '目录行不该有「热乎」标签');
+    assert.ok(await page.locator('.file-row .tag.hot').count() >= 2, '文件行应当有「热乎」标签');
+
+    // 超长文件名：只截名字，标签必须完整留在格子里
+    const clip = await page.evaluate((name) => {
+      const row = [...document.querySelectorAll('.file-row')].find((r) => r.textContent.includes(name.slice(0, 8)));
+      if (!row) return null;
+      const cell = row.querySelector('.col-name').getBoundingClientRect();
+      const text = row.querySelector('.name-text').getBoundingClientRect();
+      const tag = row.querySelector('.tag.hot').getBoundingClientRect();
+      return {
+        cellRight: Math.round(cell.right), textRight: Math.round(text.right),
+        tagRight: Math.round(tag.right), tagW: Math.round(tag.width), cellW: Math.round(cell.width),
+        textClipped: row.querySelector('.name-text').scrollWidth > Math.ceil(text.width) + 1,
+      };
+    }, longName);
+    assert.ok(clip, '没找到长文件名那一行');
+    assert.strictEqual(clip.textClipped, true, `长名字没有被截断（${JSON.stringify(clip)}）—— 这条判据看不出"标签会不会被裁"`);
+    assert.ok(clip.tagW >= 20 && clip.tagRight <= clip.cellRight + 1,
+      `热乎标签被名字挤出去了：${JSON.stringify(clip)}`);
+
+    // 目录名上限 10 个字：输入框本身卡住第 11 个字，文案里写清上限
+    // （服务端拒绝超长的判据在 test/library.test.js —— 界面上走不到"提交 11 个字"那条路）
+    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.waitForSelector('.dialog', { state: 'visible' });
+    const nameInput = page.locator('.dialog .input');
+    assert.strictEqual(await nameInput.getAttribute('maxlength'), '10', '目录名输入框没有卡在 10 个字');
+    await nameInput.fill('一二三四五六七八九十一');
+    assert.strictEqual((await nameInput.inputValue()).length, 10, '第 11 个字没有被挡住');
+    assert.match(await page.locator('.dialog .char-count').innerText(), /10\/10/, '字数计数没有停在 10');
+    assert.match(await page.locator('.dialog p').first().innerText(), /10 个字/, '对话框里没写清上限是 10 个字');
+    await page.locator('.dialog .btn').first().click(); // 取消
+    await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
+
     // 1) 文件重命名：行 ⋯ → 重命名 → 输入 → 确定，行上的名字立刻换
     await page.locator('.file-row', { hasText: '甲.txt' }).locator('.col-more').click();
     await page.locator('.context-menu .menu-item', { hasText: '重命名' }).click();
@@ -65,16 +103,19 @@ async function uploadWithManifest(srv, files) {
     LOG('重命名：甲.txt → 乙.txt 已在界面上');
     let lib = await (await fetch(`${srv.base}/api/library`)).json();
     assert.ok(lib.batches[0].files.some((f) => f.name === 'big.bin.enc'), '大文件那份不该被改名影响');
+    const before = lib.batches.reduce((n, b) => n + b.count, 0);
 
-    // 2) 文件删除：最后一个文件删掉后，批次整个消失
+    // 2) 文件删除：删掉的那个真的从服务端消失，同批次其余文件不受牵连
     await page.locator('.file-row', { hasText: '乙.txt' }).locator('.col-more').click();
     await page.locator('.context-menu .menu-item', { hasText: '删除' }).first().click();
     await page.locator('.dialog .btn-danger').click();
     await page.waitForFunction(() => ![...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('乙.txt')), null, { timeout: 15000 });
     lib = await (await fetch(`${srv.base}/api/library`)).json();
     const left = lib.batches.reduce((n, b) => n + b.count, 0);
+    const encs = lib.batches.flatMap((b) => b.files.map((f) => f.name));
     LOG(`文件删除：界面上已消失，服务端剩 ${left} 个文件`);
-    assert.strictEqual(left, 1, `应该只剩大文件那一个，实际 ${left}`);
+    assert.strictEqual(left, before - 1, `删一个文件后服务端应当剩 ${before - 1} 个，实际 ${left}`);
+    assert.ok(encs.includes('big.bin.enc') && encs.includes('long.bin.enc'), `同批次其余文件被连带删了：${encs.join(' / ')}`);
 
     // 3) 文件「⋯ → 移动这批上传到…」：选目标目录后归属真的改了
     const batchName = lib.batches[0].name;

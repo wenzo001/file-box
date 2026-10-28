@@ -59,9 +59,9 @@ test('目录 CRUD：同名 409、非法名 400、移动 / 重命名 / 空目录�
   assert.strictEqual(child.status, 200);
   assert.strictEqual(child.body.folder.parentId, a.body.folder._id);
 
-  const renamed = await patchFolder(child.body.folder._id, { name: 'API 2026Q4-改' });
+  const renamed = await patchFolder(child.body.folder._id, { name: '2026Q4-改' });
   assert.strictEqual(renamed.status, 200);
-  assert.strictEqual(renamed.body.folder.name, 'API 2026Q4-改');
+  assert.strictEqual(renamed.body.folder.name, '2026Q4-改');
   assert.strictEqual(renamed.body.folder._id, child.body.folder._id, '改名不能换目录 ID：分享链接要稳定');
 
   const badPatch = await patchFolder(child.body.folder._id, { name: 'x', parentId: a.body.folder._id });

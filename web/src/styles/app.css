@@ -567,13 +567,15 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .col-name {
   grid-column: 3;
   grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   font-size: 14px;
 }
-.col-name .tag { margin-left: 4px; }
+/* 只让名字那一格截断：标签（热乎 / 分享 / 旧数据 / 清单缺失）永远完整 */
+.col-name .name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-name .tag { flex: none; }
 .col-meta {
   grid-column: 3;
   grid-row: 2;
@@ -761,6 +763,35 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .context-menu .menu-item { min-height: 44px; }
 }
 
+/* 只在窄屏出现 */
+.only-mobile { display: none; }
+
+/* 底部动作栏：选择类动作放拇指够得着的地方（iOS 文件管理同款位置），桌面端不出现 */
+.action-bar {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 30;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+  background: var(--hdr);
+  backdrop-filter: saturate(180%) blur(18px);
+  -webkit-backdrop-filter: saturate(180%) blur(18px);
+  border-top: 1px solid var(--sep);
+}
+.action-count { flex: 1 1 auto; min-width: 0; color: var(--text2); font-size: 13px; }
+.action-items { display: flex; align-items: center; gap: 2px; flex: none; }
+.action-bar .tool-btn { width: 44px; height: 44px; padding: 0; justify-content: center; }
+
+/* 设置底表（手机档）：容量 / 累计下载 / 全局自动删除 / 清空 */
+.sheet-sub { margin: 0 0 10px; color: var(--text2); font-size: 12px; }
+.sheet-row { display: flex; align-items: center; gap: 10px; margin: 4px 0 8px; }
+.sheet-row .ttl-global { flex: 1 1 auto; min-width: 0; }
+.sheet-hint { margin: 0 0 12px; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.6; }
+.sheet-stats { justify-content: space-between; color: var(--text2); font-size: 12px; padding-top: 8px; border-top: 1px solid var(--sep); }
+.sheet-actions { justify-content: space-between; }
+
 /* ---- 手机档（≤560）：整页走文档流，分栏卡片只给一条高度地板 ----
    顶栏 + 配置条 + 面包屑 + 工具行在手机上约吃掉 180px，568 高的屏只剩 388 给内容和任务面板。
    把两者塞进同一屏去 flex 抢高度，实测会把分栏挤到 61px：卡片是 overflow-y:hidden，
@@ -778,25 +809,39 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .crumb { order: 2; flex: 1 1 100%; overflow: hidden auto; padding: 0; }
   .search { order: 3; flex: 1 1 100%; height: 44px; min-width: 0; }
   .layout { min-height: 0; }
-  .main { padding: 10px 10px calc(16px + env(safe-area-inset-bottom)); }
+  .main { padding: 10px 10px calc(78px + env(safe-area-inset-bottom)); }
   .columns { height: calc(100vh - 330px); height: clamp(280px, calc(100dvh - 330px), 640px); min-height: 280px; }
-  .tool-row { flex-wrap: nowrap; gap: 4px; min-height: 44px; margin-bottom: 6px; }
+  .tool-row { flex-wrap: nowrap; gap: 4px; min-height: 24px; margin-bottom: 4px; }
   .tool-status { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tool-count { flex: none; }
-  .tool-actions { flex: none; gap: 0; margin-left: 0; }
+  .tool-actions { display: none; } /* 动作挪到底部动作栏：拇指够得着的地方 */
   .tool-btn { width: 44px; height: 44px; justify-content: center; padding: 0; }
   .tool-btn .tool-label { display: none; }
-  .config-strip { padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
-  /* 提示与「清空」共用一行：各占一行会多出 50px 固定界面层，320 档浏览区掉到 36% */
-  .config-hint { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  /* 手机上只留图标（带文字要 101px，会把提示压成 12px）；margin-left:auto 在可换行 flex 里会把它顶到新一行 */
-  .wipe-label { display: none; }
-  .wipe-open { width: 44px; min-width: 44px; padding: 0; margin-left: 0; justify-content: center; }
+  .only-mobile { display: inline-flex; }
+  .action-bar { display: flex; }
+  /* toast 抬到动作栏上面：它 pointer-events:none，但压着五个图标看不见 */
+  .toast { bottom: calc(84px + env(safe-area-inset-bottom)); }
+  /* 配置条整块收进设置底表：固定界面层实测 222 → 161 */
+  .config-strip { display: none; }
+}
+
+/* 320 这种窄屏再收一格：品牌 + 三个动作按钮必须挤在一行，否则顶栏多出一行 */
+@media (max-width: 360px) {
+  .brand { font-size: 15px; }
+  .toolbar-actions { gap: 6px; }
+  .toolbar-actions .btn { padding: 0 8px; }
+  /* 图标按钮没文字，收紧内边距后只剩 36px，触摸档要保 44 */
+  .toolbar-actions .btn.only-mobile { min-width: 44px; padding: 0; }
 }
 
 /* 复选框是勾选的唯一入口，15px 在手机上点不中：外面那层 label 撑到 44×44 当命中区，原生方框仍画 22px */
 @media (pointer: coarse) {
-  .col-row { grid-template-columns: 44px 22px minmax(0, 1fr) 44px; }
+  /* 行按 iOS 文件管理的列表做：更高的行、更大的图标、行间一条细分隔线 */
+  .col-row { grid-template-columns: 44px 30px minmax(0, 1fr) 44px; min-height: 58px; }
+  .col-row + .col-row { border-top: 1px solid var(--sep); }
+  .col-row .row-icon { width: 26px; height: 26px; }
+  .col-name { font-size: 15px; }
+  .col-meta { font-size: 12px; }
   .col-row .check-hit { width: 44px; height: 44px; }
   .col-row .col-check { width: 22px; height: 22px; }
   /* 栏头的"全选本栏"也是勾选入口，同样要 44 的命中区 */
