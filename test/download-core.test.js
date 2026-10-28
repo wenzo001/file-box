@@ -184,4 +184,17 @@ test('解密写盘：按块写进明文 store，内容一致、进度到总量�
     }),
     /长度与清单不符/,
   );
+
+  // 产品里明文是向上补到 64KiB 的：清单 size 比解密长度小，必须**裁掉填充**而不是报错
+  const real = bytes(11, 4);
+  const padded = Buffer.alloc(64 * 1024);
+  real.copy(padded);
+  const padCipher = new Blob([Buffer.from(await globalThis.FBCrypto.encryptBytes(new Uint8Array(padded)))]);
+  const trimmed = fakeStore();
+  const tr = await core.decryptToStore({
+    cipherFile: padCipher, plainStore: trimmed.api,
+    decryptBytes: globalThis.FBCrypto.decryptBytes, plainSize: real.length,
+  });
+  assert.strictEqual(tr.size, real.length, `补到 64KiB 的文件要裁回真实大小（现在 ${tr.size}）`);
+  assert.deepStrictEqual(trimmed.bytes(), real, '裁出来的内容不对');
 });

@@ -209,6 +209,7 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.strictEqual(await page.locator('.banner.share').count(), 1);
     assert.ok(await page.locator('.folder-row.shared').count() >= 1);
 
+    console.log('[step] 目录 zip');
     // 目录 zip：逐个解开并核对内容
     const [dl] = await Promise.all([
       page.waitForEvent('download', { timeout: 30000 }),
@@ -231,6 +232,7 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.locator('.search input').fill('');
     await page.waitForTimeout(350);
 
+    console.log('[step] 多选 zip');
     // 多选 zip
     await page.locator('.file-row .col-check').nth(0).check();
     await page.locator('.file-row .col-check').nth(1).check();
@@ -399,6 +401,8 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     console.log('[library-smoke] 截图:', SHOT('fb-library-desktop.png'), SHOT('fb-library-mobile.png'));
   } catch (err) {
     await page.screenshot({ path: SHOT('fb-library-fail.png'), fullPage: true }).catch(() => {});
+    // 失败时把任务行倒出来：卡在"等下载事件"时，真正的交代常常写在这里
+    console.error('[library-smoke] 任务行:', JSON.stringify(await page.locator('.task').allInnerTexts().catch(() => [])));
     console.error('[library-smoke] 失败:', err.message);
     console.error('[library-smoke] 错误日志:', errs.length ? errs : 'none');
     console.error('[library-smoke] 失败截图:', SHOT('fb-library-fail.png'));

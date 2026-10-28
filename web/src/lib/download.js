@@ -73,6 +73,31 @@ function memStore() {
   };
 }
 
+/** 按路径拿 OPFS 文件句柄（打包时用：[目录..., 文件名]），拿不到返回 null */
+export async function openOpfsPath(parts, create = true) {
+  const root = await opfsRoot();
+  if (!root) return null;
+  try {
+    let dir = root;
+    for (const name of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(name, { create });
+    return await dir.getFileHandle(parts[parts.length - 1], { create });
+  } catch {
+    return null;
+  }
+}
+
+export async function removeOpfsPath(parts) {
+  const root = await opfsRoot();
+  if (!root) return;
+  try {
+    let dir = root;
+    for (const name of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(name, { create: false });
+    await dir.removeEntry(parts[parts.length - 1], { recursive: false });
+  } catch { /* 本来就不在 */ }
+}
+
+export { canWrite as canWriteHandle, opfsStore as handleStore };
+
 export async function clearDownload(batch, enc) {
   const root = await opfsRoot();
   if (!root) return;

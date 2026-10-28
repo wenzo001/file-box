@@ -18,7 +18,8 @@ import { api } from './lib/api.js';
 import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from './lib/manifest.js';
 import { UploadTask, relPath, sortSelected } from './lib/upload.js';
 import { clearDownload, downloadFile, saveBlob } from './lib/download.js';
-import { createZipJob } from './lib/zip.js';
+import { createZipRunner, zipPlan } from './lib/zip.js';
+import { tierLabel } from './lib/capability.mjs';
 import { bindColumnDnd } from './lib/dnd.js';
 import {
   collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
@@ -397,7 +398,7 @@ function taskMeta(task) {
   if (task.kind === 'download' && task.note) return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.note}`;
   if (task.kind === 'upload') return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}`;
   if (task.kind === 'folder-delete') return `已完成 ${task.index || 0}/${task.items?.length || 0} 项`;
-  if (task.kind === 'zip') return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.files || 0} 个文件`;
+  if (task.kind === 'zip') return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.files || 0} 个文件${task.tier ? ` · ${tierLabel(task.tier)}` : ''}`;
   return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)}`;
 }
 
@@ -848,25 +849,58 @@ function startZipTask(title, items, filename) {
   const list = items.filter(Boolean);
   const task = reactive({
     id: `task-${++taskSeq}`, kind: 'zip', title, state: 'running',
-    received: 0, total: 0, error: '', files: list.filter((it) => !it.dir).length,
+    received: 0, total: 0, error: '', files: list.filter((it) => !it.dir).length, note: '', tier: '',
   });
-  const job = createZipJob(list, {
-    onProgress: (p) => { task.received = p.received; task.total = p.total || task.total; },
-  });
-  task.total = job.total;
   let controller = null;
   let paused = false;
   let canceled = false;
+  let runner = null;
+  let plan = null;
+
+  // 先按能力选档：磁盘流式 / 内存 / 逐个文件（降级）
+  const ensure = async () => {
+    if (!plan) plan = await zipPlan(list, data.value.memDownloadMaxBytes || 0);
+    if (plan.tier === 'per-file') return null;
+    if (!runner) {
+      runner = createZipRunner({
+        items: list, tier: plan.tier, filename,
+        onProgress: (p) => { task.received = p.received; task.total = p.total || task.total; },
+      });
+      task.total = runner.total;
+      task.tier = runner.tier;
+      task.note = plan.reason;
+    }
+    return runner;
+  };
+
   const run = async () => {
     task.state = 'running';
     task.error = '';
     paused = false;
     controller = new AbortController();
     try {
-      const { blob } = await job.run({ signal: controller.signal });
+      const r = await ensure();
+      if (!r) {
+        // 降级档：这台设备打不了大包，改成逐个文件下载（每个文件再走它自己的阶梯）
+        const files = list.filter((it) => !it.dir);
+        for (const it of files) {
+          if (canceled) break;
+          addDownload({
+            batch: it.batch, enc: it.enc,
+            name: String(it.path || it.enc).split('/').pop(),
+            cipherSize: it.cipherSize, plainSize: it.plainSize,
+          });
+        }
+        task.received = task.total = 1;
+        task.tier = 'per-file';
+        task.state = 'done';
+        task.note = plan.reason;
+        toast(`这台设备不支持大包，已改为逐个下载 ${files.length} 个文件`);
+        return;
+      }
+      await r.run({ signal: controller.signal });
       if (canceled) { task.state = 'canceled'; return; }
       if (paused) { task.state = 'paused'; return; }
-      saveBlob(blob, filename);
       task.received = task.total;
       task.state = 'done';
       toast('打包完成，浏览器已开始保存');
@@ -876,14 +910,32 @@ function startZipTask(title, items, filename) {
       else { task.state = 'failed'; task.error = err.message || '打包失败'; toast(task.error); }
     }
   };
-  task.pause = () => { if (task.state !== 'running') return; paused = true; controller?.abort(); task.state = 'paused'; };
+  task.pause = () => {
+    if (task.state !== 'running') return;
+    paused = true;
+    controller?.abort();
+    task.state = 'paused';
+    // zip 是顺序写入的流：半截压缩包不能续，下一轮从头打包（密文 partial 还在，不会重下）
+    const old = runner;
+    runner = null;
+    if (old) old.dispose().catch(() => {});
+    task.note = '继续会从头重新打包（不会重新下载）';
+  };
   task.resume = () => {
     if (task.state === 'done' || task.state === 'canceled') return;
     paused = false;
     task.state = 'running';
     run();
   };
-  task.cancel = () => { canceled = true; paused = false; controller?.abort(); task.state = 'canceled'; };
+  task.cancel = () => {
+    canceled = true;
+    paused = false;
+    controller?.abort();
+    const old = runner;
+    runner = null;
+    if (old) old.dispose().catch(() => {});
+    task.state = 'canceled';
+  };
   task.remove = () => { tasks.value = tasks.value.filter((t) => t !== task); };
   tasks.value.unshift(task);
   run();

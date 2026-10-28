@@ -1,123 +1,108 @@
-// 打包下载：浏览器内解密后按明文重新封成 zip。服务端只见过密文，
-// 所以目录 zip 只能在这里做；不压缩（store）换取速度和可中断。
-import { Zip, ZipPassThrough } from 'fflate';
+// 打包下载的浏览器接线：先按能力选档，再决定"边写盘 / 内存 / 降级成逐个文件"。
+// 纯逻辑在 zip-core.mjs（流式）与 capability.mjs（选档），这里只负责 OPFS 与保存。
 import { api } from './api.js';
+import { MEM_MAX_BYTES, transferToStore } from './download-core.mjs';
+import { TIER, pickTier, zipBytes } from './capability.mjs';
+import { createZipJob } from './zip-core.mjs';
+import { canWriteHandle, handleStore, openOpfsPath, removeOpfsPath, saveBlob } from './download.js';
 
-function safePath(input) {
-  const parts = String(input || '')
-    .replace(/\\/g, '/')
-    .split('/')
-    .map((s) => s.replace(/[\u0000-\u001f\u007f]/g, '').trim())
-    .filter((s) => s && s !== '.' && s !== '..');
-  return parts.join('/');
-}
+const ZIP_DIR = '_zips';
 
-function trimTo(blob, plainSize) {
-  if (!Number.isFinite(plainSize)) return blob;
-  if (blob.size < plainSize) throw new Error('文件长度与清单不符（数据不完整）');
-  return blob.size > plainSize ? blob.slice(0, plainSize) : blob;
+/** 打包该怎么下：磁盘流式 / 内存 / 逐个文件 */
+export async function zipPlan(items, capBytes = MEM_MAX_BYTES) {
+  const sum = zipBytes(items);
+  const probe = await openOpfsPath([ZIP_DIR, 'probe'], true);
+  const opfs = canWriteHandle(probe);
+  if (probe) await removeOpfsPath([ZIP_DIR, 'probe']).catch(() => {});
+  const picked = pickTier({ kind: 'zip', opfs, bytes: sum, capBytes });
+  return { ...picked, sum, opfs, capBytes };
 }
 
 /**
- * 可暂停 / 继续的 zip 任务：zip 状态与已完成的条目留在闭包里，
- * 暂停只 abort 当前文件；继续时从下一个未完成条目接着做。
+ * 打包 runner。暂停后继续会**从头重新打包**（zip 是顺序写入的流，半截条目没法续），
+ * 但每个文件的密文 partial 还在 OPFS 里，所以不会重新下载，只是重新解密。
+ * @param {{items:Array, tier:string, filename:string, onProgress?:Function}} o
  */
-export function createZipJob(items, { onProgress = () => {} } = {}) {
-  const list = Array.isArray(items) ? items : [];
-  const total = list.reduce((n, it) => n + (it.dir ? 0 : (Number.isFinite(it.totalSize) ? it.totalSize
-    : Number.isFinite(it.cipherSize) ? it.cipherSize
-      : Number.isFinite(it.plainSize) ? it.plainSize : 0)), 0);
-  const chunks = [];
-  const used = new Set();
-  let zip = null;
-  let index = 0;
-  let received = 0;
-  let ended = false;
-  let finish = null;
+export function createZipRunner({ items, tier, filename, onProgress = () => {} }) {
+  const isDisk = tier === TIER.DISK;
+  const zipKey = `${String(filename).replace(/[^\w.-]+/g, '_').slice(0, 60) || 'archive'}-${Date.now().toString(36)}`;
+  let zipHandle = null;
+  let zipWriter = null;
+  let prepared = null;
 
-  function init() {
-    if (zip) return;
-    zip = new Zip((err, data, final) => {
-      if (err) {
-        if (finish) finish.reject(err);
-        return;
-      }
-      if (data && data.length) chunks.push(data);
-      if (final && finish) finish.resolve();
-    });
-    finish = {};
-    finish.promise = new Promise((resolve, reject) => {
-      finish.resolve = resolve;
-      finish.reject = reject;
-    });
-  }
-
-  function unique(path) {
-    const base = safePath(path) || 'file';
-    if (!used.has(base)) { used.add(base); return base; }
-    const slash = base.lastIndexOf('/');
-    const dir = slash >= 0 ? base.slice(0, slash + 1) : '';
-    const name = slash >= 0 ? base.slice(slash + 1) : base;
-    const dot = name.lastIndexOf('.');
-    const stem = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : '';
-    for (let i = 2; ; i++) {
-      const candidate = `${dir}${stem} (${i})${ext}`;
-      if (!used.has(candidate)) { used.add(candidate); return candidate; }
+  const prepare = () => {
+    if (!prepared) {
+      prepared = (async () => {
+        if (!isDisk) return;
+        zipHandle = await openOpfsPath([ZIP_DIR, zipKey], true);
+        if (!canWriteHandle(zipHandle)) throw new Error('这台设备拿不到可写的本地存储，无法边写盘打包');
+      })();
     }
-  }
+    return prepared;
+  };
 
-  async function run({ signal } = {}) {
-    init();
-    for (; index < list.length; index++) {
-      if (signal?.aborted) throw new DOMException('已暂停', 'AbortError');
-      const item = list[index];
-      if (item.dir) {
-        const path = unique(item.path);
-        const entry = new ZipPassThrough(`${path.replace(/\/$/, '')}/`);
-        zip.add(entry);
-        entry.push(new Uint8Array(0), true);
-        continue;
-      }
+  const getCipher = async (item, { signal, onProgress: op } = {}) => {
+    if (!isDisk) {
       const res = await fetch(api.downloadUrl(item.batch, item.enc), { signal });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `下载失败 (${res.status})`);
       }
-      const blob = await FBCrypto.decryptStream(res.body, (n) => {
-        const cap = Number.isFinite(item.plainSize) ? item.plainSize : n;
-        onProgress({ received: received + Math.min(n, cap), total });
-      });
-      if (signal?.aborted) throw new DOMException('已暂停', 'AbortError');
-      const out = trimTo(blob, item.plainSize);
-      const bytes = new Uint8Array(await out.arrayBuffer());
-      // 只有真正要写入 zip 才占用路径：暂停 / 失败的那一版不能把名字“用掉”
-      const path = unique(item.path);
-      const entry = new ZipPassThrough(path);
-      zip.add(entry);
-      entry.push(bytes, true);
-      received += Number.isFinite(item.plainSize)
-        ? item.plainSize
-        : (Number.isFinite(item.totalSize) ? item.totalSize
-          : (Number.isFinite(item.cipherSize) ? item.cipherSize : bytes.length));
-      onProgress({ received, total });
+      return res.body;
     }
-    if (!ended) {
-      zip.end();
-      ended = true;
-    }
-    await finish.promise;
-    return { blob: new Blob(chunks, { type: 'application/zip' }), bytes: received };
-  }
-
-  return {
-    total,
-    get index() { return index; },
-    run,
+    const handle = await openOpfsPath([item.batch, item.enc], true);
+    if (!handle) throw new Error('拿不到本地存储句柄，无法断点续传这个文件');
+    await transferToStore({
+      url: api.downloadUrl(item.batch, item.enc),
+      store: handleStore(handle),
+      total: Number.isFinite(item.cipherSize) ? item.cipherSize : 0,
+      signal,
+      onUpdate: (p) => op && op({ received: p.received }),
+    });
+    return handle.getFile();
   };
+
+  const cleanupCipher = async (item) => {
+    if (!isDisk) return;
+    await removeOpfsPath([item.batch, item.enc]).catch(() => {});
+  };
+
+  const job = createZipJob(items, {
+    getCipher,
+    cleanupCipher,
+    onProgress,
+    sink: isDisk
+      ? {
+        write: async (u8) => { await zipWriter.write(u8); },
+        close: async () => { if (zipWriter) { const w = zipWriter; zipWriter = null; await w.close(); } },
+      }
+      : null,
+  });
+
+  /** 每次（重新）开始都换一份新 sink：上一轮的半截压缩包不参与这一轮 */
+  const run = async ({ signal } = {}) => {
+    await prepare();
+    if (isDisk) {
+      if (zipWriter) { try { await zipWriter.close(); } catch { /* 上一轮已废 */ } }
+      zipWriter = await zipHandle.createWritable({ keepExistingData: false });
+    }
+    const result = await job.run({ signal });
+    if (isDisk) {
+      saveBlob(await zipHandle.getFile(), filename, () => removeOpfsPath([ZIP_DIR, zipKey]));
+      return { saved: 'disk', bytes: result.bytes };
+    }
+    saveBlob(result.blob, filename);
+    return { saved: 'memory', bytes: result.bytes };
+  };
+
+  /** 放弃这一轮（暂停 / 取消）：关掉写入器并删掉半截压缩包 */
+  const dispose = async () => {
+    if (zipWriter) { const w = zipWriter; zipWriter = null; try { await w.close(); } catch { /* 已废 */ } }
+    if (isDisk && zipHandle) await removeOpfsPath([ZIP_DIR, zipKey]).catch(() => {});
+  };
+
+  return { total: job.total, tier, prepare, run, dispose };
 }
 
-/** 一次性用法（测试 / 不需要暂停的场景） */
-export async function buildZip(items, { signal, onProgress } = {}) {
-  return createZipJob(items, { onProgress }).run({ signal });
-}
+export { TIER, tierLabel } from './capability.mjs';
+export { capMessage } from './capability.mjs';

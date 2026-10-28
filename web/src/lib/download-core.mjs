@@ -149,7 +149,10 @@ export async function decryptToStore(o) {
   await plainStore.clear();
   const writer = await plainStore.openWriter({ append: false });
   const q = queueOf(typeof src.stream === 'function' ? src.stream() : src);
+  // 上传时明文是**向上补到 64KiB 的**：清单里的 size 才是真实大小。
+  // 所以这里只能"多出来的裁掉、少了才报错"，判"严格相等"会把所有带填充的文件当成损坏。
   let plainTotal = 0;
+  let decryptedTotal = 0;
   try {
     for (;;) {
       let head;
@@ -165,14 +168,19 @@ export async function decryptToStore(o) {
       block.set(head, 0);
       block.set(ct, 16);
       const plain = await decryptBytes(block);
-      await writer.write(plain);
-      plainTotal += plain.length;
-      onProgress({ decrypted: plainTotal, total: Number.isFinite(plainSize) ? plainSize : plainTotal });
+      decryptedTotal += plain.length;
+      const need = Number.isFinite(plainSize) ? plainSize - plainTotal : plain.length;
+      if (need > 0) {
+        const out = need >= plain.length ? plain : plain.subarray(0, need);
+        await writer.write(out);
+        plainTotal += out.length;
+      }
+      onProgress({ decrypted: plainTotal, total: Number.isFinite(plainSize) ? plainSize : decryptedTotal });
     }
   } finally {
     try { await writer.close(); } catch { /* 关不上也不能把半截当成品 */ }
   }
-  if (Number.isFinite(plainSize) && plainTotal !== plainSize) {
+  if (Number.isFinite(plainSize) && plainTotal < plainSize) {
     throw new Error('文件长度与清单不符（数据不完整）');
   }
   return { size: plainTotal };
