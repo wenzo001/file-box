@@ -637,6 +637,14 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   pointer-events: none;
 }
 .column.drop-target .col-head { background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
+/* 拖拽移动：悬停到目标上只给高亮，松手才动（提交在 drop 捕获里，setValues 不做事） */
+.col-row.drop-here {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.col-row.drop-here .col-name { color: var(--accent); font-weight: 600; }
+.column.drop-here { outline: 2px dashed color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: -3px; }
+.col-size { color: var(--text); font-weight: 600; }
 .tag.hot { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
 .tag.share-tag { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
 .banner.share {

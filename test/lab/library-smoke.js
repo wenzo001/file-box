@@ -260,6 +260,10 @@ const tmp = (name) => path.join(os.tmpdir(), name);
       return row && /2 个文件/.test(row.textContent);
     }, { timeout: 15000 });
     const projectMeta = await page.locator('.column').first().locator('.folder-row', { hasText: '冒烟项目' }).locator('.col-meta').innerText();
+    // 目录行要标大小（目录汇总），文件行也要标（清单里的真实大小）
+    assert.match(projectMeta, /\d+(\.\d+)?\s?(B|KB|MB|GB)/, `目录行没标大小：${projectMeta}`);
+    const fileMeta = await page.locator('.file-row').first().locator('.col-meta').innerText();
+    assert.match(fileMeta, /\d+(\.\d+)?\s?(B|KB|MB|GB)/, `文件行没标大小：${fileMeta}`);
     assert.match(projectMeta, /2 个文件/, '整批移动后父目录文件数不对');
 
     // 拖拽上传到当前栏
@@ -288,11 +292,45 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     const src = before.batches.find((b) => b.count === 2);
     const toFolder = before.folders.find((f) => f.name === '拖拽去处');
     assert.ok(src && toFolder, '夹具里没有两文件的批次或目标目录，后面判据无从比对');
-    await rowOf('fb-library-甲.txt').dragTo(rowOf('拖拽去处'));
+    // 用户要的是「没松手什么都不执行」：这里真的**按住 1 秒**再松，而不是用原子化的 dragTo。
+    // 按住期间：① 不许有移动请求；② 目标行要亮出「接受」样式（.drop-here）。
+    await page.evaluate(() => {
+      window.__moveReqs = [];
+      const realFetch = window.fetch;
+      window.fetch = (input, opt = {}) => {
+        const url = String(input && input.url ? input.url : input);
+        if (/\/api\/(batches\/[^/]+\/file-move|folders\/)/.test(url)) window.__moveReqs.push(url);
+        return realFetch(input, opt);
+      };
+    });
+    const srcBox = await rowOf('fb-library-甲.txt').boundingBox();
+    const dstBox = await rowOf('拖拽去处').boundingBox();
+    await page.mouse.move(srcBox.x + srcBox.width * 0.4, srcBox.y + srcBox.height / 2);
+    await page.mouse.down();
+    for (let i = 1; i <= 15; i++) {
+      await page.mouse.move(
+        srcBox.x + srcBox.width * 0.4 + (dstBox.x + 40 - (srcBox.x + srcBox.width * 0.4)) * (i / 15),
+        srcBox.y + srcBox.height / 2 + (dstBox.y + dstBox.height / 2 - (srcBox.y + srcBox.height / 2)) * (i / 15),
+      );
+      await page.waitForTimeout(25);
+    }
+    await page.waitForTimeout(900); // 按住不放
+    const held = await page.evaluate(() => ({
+      reqs: window.__moveReqs.slice(),
+      rowHere: [...document.querySelectorAll('.col-row.drop-here')].map((n) => n.textContent.trim().slice(0, 14)),
+      colHere: document.querySelectorAll('.column.drop-here').length,
+    }));
+    assert.deepStrictEqual(held.reqs, [], `鼠标还没松手就发出去了：${JSON.stringify(held.reqs)}`);
+    assert.ok(held.rowHere.some((t) => t.includes('拖拽去处')),
+      `悬停在目标目录上时没有「接受」样式：${JSON.stringify(held)}`);
+    assert.ok(held.colHere >= 1, '悬停的那一栏没有落点提示（.drop-here）');
+    await page.mouse.up();
     await page.waitForFunction(async (id) => {
       const l = await (await fetch(`${location.origin}/api/library`)).json();
       return l.batches.some((b) => b.folderId === id && b.count === 1);
     }, toFolder.id, { timeout: 20000 });
+    const released = await page.evaluate(() => window.__moveReqs.slice());
+    assert.strictEqual(released.length, 1, `松手后应当恰好发出一次移动请求：${JSON.stringify(released)}`);
     lib = await (await fetch(`${srv.base}/api/library`)).json();
     const landed = lib.batches.filter((b) => b.folderId === toFolder.id);
     assert.strictEqual(landed.length, 1, `拖进来的这条没有单独成批: `

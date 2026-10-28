@@ -152,6 +152,14 @@ const columns = computed(() => columnIds.value.map((id) => {
 const pathIds = computed(() => new Set(columnIds.value.slice(1)));
 
 // ---- 拖拽移动：目录行拖进别的目录 = 换父级；文件行拖进别的目录 = 把这一条拆出批次搬走 ----
+// 拖拽移动的落点（只用于高亮）：row = 目标目录行，col = 悬停在哪一栏
+const dndOverId = ref(null);
+const dndOverCol = ref(null);
+function setDndOver(payload) {
+  dndOverId.value = payload && payload.folderId ? payload.folderId : null;
+  dndOverCol.value = payload ? payload.colKey : null;
+}
+
 let dndBusy = false;
 let dndDragging = false;
 let dndTimer = null;
@@ -172,10 +180,13 @@ function bindDnd() {
   const els = columnsEl.value ? [...columnsEl.value.querySelectorAll('.col-list')] : [];
   const lists = els.map((el, i) => ({
     el,
+    colKey: columns.value[i]?.key ?? String(i),
     folderId: columns.value[i]?.id ?? null,
     rows: () => dndRows(columns.value[i] || { folders: [], files: [] }),
   }));
-  if (lists.length) bindColumnDnd({ lists, onMove: onDndMove, onDragState: setDndDragging });
+  if (lists.length) bindColumnDnd({
+    lists, onMove: onDndMove, onDragState: setDndDragging, onDragOver: setDndOver,
+  });
 }
 
 function setDndDragging(value) {
@@ -341,7 +352,7 @@ function colMeta(col) {
 
 function folderRowMeta(folder) {
   const updated = Number.isFinite(folder.lastUpdatedAt) ? `最后更新 ${fmtAgo(folder.lastUpdatedAt, now.value)}` : '还没有文件';
-  return `${folder.count || 0} 个文件 · ${updated}`;
+  return `${folder.count || 0} 个文件 · ${fmtSize(folder.size || 0)} · ${updated}`;
 }
 
 function isSelected(key) { return selected.value.includes(key); }
@@ -1644,7 +1655,7 @@ onBeforeUnmount(() => {
               v-for="col in columns"
               :key="col.key"
               class="column"
-              :class="{ 'drop-target': dragTargetKey === col.key }"
+              :class="{ 'drop-target': dragTargetKey === col.key, 'drop-here': dndOverCol === col.key }"
             >
               <header class="col-head">
                 <div class="col-title">
@@ -1705,6 +1716,7 @@ onBeforeUnmount(() => {
                     selected: isSelected(`folder:${folder.id}`),
                     current: pathIds.has(folder.id),
                     shared: sharedFolderIds.has(folder.id),
+                    'drop-here': dndOverId === folder.id,
                   }"
                   @click="navigate(folder.id)"
                   @contextmenu.prevent.stop="openFolderMenu($event, folder)"
@@ -1762,7 +1774,7 @@ onBeforeUnmount(() => {
                     <span v-if="row.legacy" class="tag">旧数据</span>
                     <span v-if="row.missingMeta" class="tag warn">清单缺失</span>
                   </span>
-                  <span class="col-meta" :title="fmtFullTime(row.uploadedAt)">{{ fmtUploaded(row.uploadedAt) }} · {{ fmtAgo(row.uploadedAt, now) }} · {{ dlText(row.downloads) }}</span>
+                  <span class="col-meta" :title="fmtFullTime(row.uploadedAt)"><b class="col-size">{{ fmtSize(row.size || 0) }}</b> · {{ fmtUploaded(row.uploadedAt) }} · {{ fmtAgo(row.uploadedAt, now) }} · {{ dlText(row.downloads) }}</span>
                   <span :class="expiryClass(row.expiresAt, now)" class="col-expiry">{{ fmtExpiry(row.expiresAt, now) }}</span>
                   <button class="icon-btn col-more" title="更多操作" aria-label="更多操作" @click.stop="showMenuFor($event, fileMenuItems(row))">⋯</button>
                 </div>
