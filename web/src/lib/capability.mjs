@@ -19,7 +19,7 @@ export function pickTier({ kind, opfs, bytes = 0, capBytes = 0 }) {
     if (kind === 'zip') return { tier: TIER.PER_FILE, reason: '这台设备不支持大包断点续存，改为逐个文件下载' };
     return { tier: TIER.MEMORY, reason: '超过内存上限，无法下载' };
   }
-  return { tier: TIER.MEMORY, reason: '整文件进内存（这台设备没有可写 OPFS）' };
+  return { tier: TIER.MEMORY, reason: '整文件经内存（这个页面拿不到本地存储：纯 HTTP、无痕窗口或旧浏览器）' };
 }
 
 /** 打包总量：优先用清单里的明文大小，没有清单（旧文件）时退回密文大小 ——

@@ -890,7 +890,7 @@ function startZipTask(title, items, filename) {
 
   // 先按能力选档：磁盘流式 / 内存 / 逐个文件（降级）
   const ensure = async () => {
-    if (!plan) plan = await zipPlan(list, data.value.memDownloadMaxBytes || 0);
+    if (!plan) plan = await zipPlan(list, data.value.memZipMaxBytes || data.value.memDownloadMaxBytes || 0);
     if (plan.tier === 'per-file') return null;
     if (!runner) {
       runner = createZipRunner({
@@ -1645,7 +1645,7 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="httpsUrl" class="banner info">
           <Info :size="15" aria-hidden="true" />
-          当前是 HTTP 兼容模式，加解密会慢一个数量级。改用 <a :href="httpsUrl">HTTPS 地址</a> 可大幅提速（首次需信任自签证书）。
+          当前是 HTTP 兼容模式：加解密慢一个数量级，而且浏览器不给本地存储 —— 大文件下载只能整份经内存（超过上限就下不了），也不支持断点续传。改用 <a :href="httpsUrl">HTTPS 地址</a> 这些才有（首次需信任自签证书）。
         </div>
         <div v-if="currentId === null && legacyUnfiledCount && !legacyNoticeDismissed" class="banner info">
           <Info :size="15" aria-hidden="true" />

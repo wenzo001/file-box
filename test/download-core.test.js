@@ -143,13 +143,18 @@ test('取消：立刻停，不再发请求', async () => {
   assert.strictEqual(calls, 0);
 });
 
-test('能力上限：没有 OPFS 时超过 50MB 直接给话术，小于等于放行', () => {
+test('能力上限：没有 OPFS 时按上限给话术（默认 512MB），并指名真正的出路是 HTTPS', () => {
   assert.strictEqual(core.memoryCapProblem({ hasOpfs: true, size: 700 * MB }), null, '有 OPFS 就不该有上限');
   assert.strictEqual(core.memoryCapProblem({ hasOpfs: false, size: 10 * MB }), null);
-  const msg = core.memoryCapProblem({ hasOpfs: false, size: 300 * MB });
-  assert.ok(msg && /OPFS|断点/.test(msg), `没给出可读的理由：${msg}`);
-  assert.ok(/50MB/.test(msg), `话术里要写清上限：${msg}`);
+  const msg = core.memoryCapProblem({ hasOpfs: false, size: 600 * MB });
+  assert.ok(msg && /本地存储/.test(msg), `没给出可读的理由：${msg}`);
+  assert.ok(/512MB/.test(msg), `话术里要写清上限：${msg}`);
+  // 用户看到这句话时最需要的是"那我该怎么办"：地址不安全 + HTTPS 入口必须写在里面
+  assert.ok(/HTTPS/.test(msg), `话术没给出路（HTTPS 入口）：${msg}`);
+  assert.ok(/无痕|HTTP/.test(msg), `话术没点明是哪一类页面：${msg}`);
+  // 上限可以由部署下调，判据跟着传进来的值走
   assert.strictEqual(core.memoryCapProblem({ hasOpfs: false, size: 300 * MB, capBytes: 300 * MB }), null, '部署把上限放宽到 300MB 时，300MB 就该放行');
+  assert.ok(core.memoryCapProblem({ hasOpfs: false, size: 301 * MB, capBytes: 300 * MB }), '超一点点就该挡');
 });
 
 test('解密写盘：按块写进明文 store，内容一致、进度到总量、长度不符要报错', async () => {

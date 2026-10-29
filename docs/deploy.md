@@ -47,7 +47,8 @@
 | `TTL_SWEEP_MS` / `UPLOAD_TTL_HOURS` | 60000 / 48 | 过期扫描间隔 / 未完成批次保留 |
 | `MAX_FOLDERS` | 10000 | 目录数量护栏 |
 | `SCAN_CACHE_MS` | 1500 | `/api/library` 扫盘缓冲（走 API 的改动会立刻失效） |
-| `MEM_DOWNLOAD_MAX_MB` | 50 | **没有可写 OPFS** 的浏览器单文件下载内存上限（有 OPFS 不受限） |
+| `MEM_DOWNLOAD_MAX_MB` | 512 | **页面拿不到本地存储**（纯 HTTP 局域网地址 / 无痕 / 旧浏览器）时单文件下载上限；有 OPFS 不受限 |
+| `MEM_ZIP_MAX_MB` | 50 | 同一条路下打包的内存上限（要同时放输入与输出，所以更保守）；超了降级成逐个文件 |
 | `MAX_EGRESS` | 32 | 下载 + 归档共用的并发名额；满了 429 |
 | `INIT_PER_WINDOW` / `LIBRARY_PER_WINDOW` / `RATE_WINDOW_MS` | 60 / 240 / 60000 | 文件库侧按 IP 的限速（开始上传 / 刷新列表 / 窗口长度） |
 | `TRUST_PROXY` | 空 | 反代后必须设 `1`（或信任的代理串），否则所有客户端共用一个 IP 桶 |
@@ -205,9 +206,9 @@ pm2 restart file-box
 | 多实例/多进程 | NeDB 索引不是多进程安全；只跑一个 `file-box` 进程 |
 | 页面还是旧版 | 浏览器缓存；刷新一次。旧 `public/index.html` 已删除，旧 `/next` 会跳回根 |
 | 页面报「刷新列表太频繁」/ 接口 429 | 触发了文件库侧限速（默认 60 次开始上传 / 240 次刷新列表每分钟，按 IP）；等一个窗口，或调大 `INIT_PER_WINDOW` / `LIBRARY_PER_WINDOW`；反代下确认设了 `TRUST_PROXY` |
-| 下载慢又像"从头开始" | 先看任务行阶段：拉密文 / 解密中 / 保存中。弱网会自己重连（写「网络中断，N 秒后从 X 继续」）；若一开始就提示「不支持断点续存（OPFS）」，是那台浏览器没有可写 OPFS，超过 `MEM_DOWNLOAD_MAX_MB` 传不完 |
+| 下载慢又像"从头开始" | 先看任务行阶段：拉密文 / 解密中 / 保存中。弱网会自己重连（写「网络中断，N 秒后从 X 继续」）；若一开始就提示「这个页面拿不到浏览器的本地存储」，说明这个地址不是安全上下文（多数是用 `http://<局域网IP>` 打开）或处在无痕窗口：单文件超过 `MEM_DOWNLOAD_MAX_MB`、整包超过 `MEM_ZIP_MAX_MB` 就会挡下。**改用 HTTPS 入口**（同一台服务的 https 端口）后这两条上限都不存在，还带断点续传 |
 | 手机上切后台后上传停了 | 上传期间持了 Web Lock（Chrome 下不会被冻结），系统仍可能节流；任务行会写「页面在后台」，回前台会继续，48 小时内可续 |
-| 打包变成"逐个文件" | 这台设备没有可写 OPFS 且压缩包超过 `MEM_DOWNLOAD_MAX_MB`；降级是预期行为，要整包就换设备或调大上限 |
+| 打包变成"逐个文件" | 页面拿不到本地存储且压缩包超过 `MEM_ZIP_MAX_MB`；降级是预期行为，要整包就改用 HTTPS 入口或调大上限 |
 | 清空后目录还在、文件没了 | 预期：一键清空保留目录树、全局设置与历史累计下载，只删本服务按「日期_时间」建的批次 |
 | 点清空显示「连接中断…」 | 多半是**回执丢了**（服务正好被重启 / 网络掐断），不是没删：界面会自己去问一次服务器状态，已经清空就按「已确认清空」收掉，还有文件才报「服务器上还有 N 个文件：请重试」。再点一次是幂等的（最多回执里 0 个批次）|
 
@@ -237,6 +238,7 @@ node test/lab/mobile-smoke.js        # 真浏览器触摸档：390/360/320 的 4
 node test/lab/feature-sweep.js       # 真浏览器主路径扫查：文件重命名 / 文件删除 / 移动到… / 下载暂停继续
 node test/lab/folder-delete-nav.js   # 真浏览器：删掉当前目录后停在上一级
 node test/lab/download-resume.js     # 真浏览器：第一次只回 40% 就断，第二发带 Range 续传
+node test/lab/download-noopfs.js     # 真浏览器：没有本地存储（纯 HTTP 那种处境）也能下完超过旧上限的文件
 node test/lab/zip-fallback.js        # 真浏览器：无 OPFS + 超上限时打包降级成逐个文件
 node test/lab/upload-lock.js         # 真浏览器：上传期间持 Web Lock、结束释放
 node test/lab/upload-ghost.js        # 真浏览器：上传中的影子行（虚线 + 进度条）→ 换成真实文件

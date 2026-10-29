@@ -1,6 +1,7 @@
 // 下载任务：密文断点续传进 OPFS → 按块解密写进第二个 OPFS 文件 → 把**磁盘上的 File** 交给保存锚点。
 // 内存只留一块（JS 引擎 512KB / 原生 4MB）；断线或卡住都从已存字节续，直到用户取消。
-// 没有可写 OPFS 的设备（旧 Safari / 无痕模式）只能整文件进内存：实测 64MB 要 355MB 堆，所以按 50MB 封顶。
+// 拿不到可写 OPFS 的页面（纯 HTTP 局域网地址 / 无痕窗口 / 旧浏览器）只能经内存走一趟 Blob：
+// 上限由 MEM_DOWNLOAD_MAX_MB 下发，默认 512MB；真正的解法是改用 HTTPS 入口（那里有 OPFS，还能断点续传）。
 import { api } from './api.js';
 import { MEM_MAX_BYTES, decryptToStore, memoryCapProblem, transferToStore } from './download-core.mjs';
 
@@ -59,17 +60,25 @@ function opfsStore(handle) {
   };
 }
 
-/** 内存兜底：只有拿不到 OPFS 可写句柄时才走，容量由 memoryCapProblem 先卡住 */
-function memStore() {
-  let parts = [];
+/** 拿不到 OPFS 可写句柄时的兜底：把解密出来的块推进一个流，交给浏览器自己落盘。
+    以前是攒成 ArrayBuffer 数组再 new Blob(parts)：所有分片同时活着，还多一份拷贝。
+    改成流之后 JS 侧不再持有整份明文，剩下的那份缓冲归浏览器管（所以上限仍存在，只是可以放宽）。 */
+function streamStore() {
+  const ts = new TransformStream();
+  const writer = ts.writable.getWriter();
+  let bytes = 0;
   return {
-    parts: () => parts,
-    size: async () => parts.reduce((s, p) => s + p.length, 0),
-    clear: async () => { parts = []; },
+    stream: ts.readable,
+    size: async () => bytes,
+    clear: async () => { /* 流是一次性的，没有可清的中途状态 */ },
     openWriter: async ({ append }) => {
-      if (!append) parts = [];
-      return { write: async (u8) => { parts.push(u8); }, close: async () => {} };
+      if (append) throw new Error('流式落盘不支持续写');
+      return {
+        write: async (u8) => { bytes += u8.length; await writer.write(u8); },
+        close: async () => { await writer.close(); },
+      };
     },
+    abort: async (err) => { try { await writer.abort(err); } catch { /* 已经关了 */ } },
   };
 }
 
@@ -117,16 +126,26 @@ async function memoryDownload(file, { total, onUpdate, signal }) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || `下载失败 (${res.status})`);
   }
-  const store = memStore();
-  const r = await decryptToStore({
-    cipherSource: res.body,
-    plainStore: store,
-    decryptBytes: FBCrypto.decryptBytes,
-    plainSize: file.plainSize,
-    onProgress: (p) => onUpdate({ phase: 'decrypt', received: p.decrypted, total: p.total }),
-  });
+  const store = streamStore();
+  // 消费端要先挂上：TransformStream 的读端没人拉时，写端会在一个块之后阻塞，解密就停在那儿
+  const blobPromise = new Response(store.stream).blob();
+  let r;
+  try {
+    r = await decryptToStore({
+      cipherSource: res.body,
+      plainStore: store,
+      decryptBytes: FBCrypto.decryptBytes,
+      plainSize: file.plainSize,
+      onProgress: (p) => onUpdate({ phase: 'decrypt', received: p.decrypted, total: p.total }),
+    });
+  } catch (err) {
+    // 中途失败（取消 / 断流）要把流也掐掉，否则 Blob 那一侧会一直挂着等数据
+    await store.abort(err);
+    await blobPromise.catch(() => {});
+    throw err;
+  }
   onUpdate({ phase: 'save', received: r.size, total: r.size });
-  saveBlob(new Blob(store.parts(), { type: 'application/octet-stream' }), file.name);
+  saveBlob(await blobPromise, file.name);
   onUpdate({ received: total || r.size, total: total || r.size, done: true, phase: 'done' });
   return { name: file.name, size: r.size };
 }

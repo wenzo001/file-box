@@ -48,7 +48,12 @@ const TTL_SWEEP_MS = Number(process.env.TTL_SWEEP_MS) || 60 * 1000;
 const MAX_FOLDERS = Number(process.env.MAX_FOLDERS) || 10000;
 // 没有可写 OPFS 的浏览器只能把整个文件读进内存：实测 64MB 文件解密时 JS 堆峰值 +355MB，
 // 所以默认 50MB 封顶。部署里若全是内存充裕的平板，可以用这个环境变量放宽（风险自担）。
-const MEM_DOWNLOAD_MAX_MB = Number(process.env.MEM_DOWNLOAD_MAX_MB) || 50;
+// 只在页面拿不到可写 OPFS 时生效（纯 HTTP 的局域网地址 / 无痕窗口 / 旧浏览器）；
+// 这条路现在是流式落盘，管的是浏览器自己的 Blob 容量，不是我们的堆
+const MEM_DOWNLOAD_MAX_MB = Number(process.env.MEM_DOWNLOAD_MAX_MB) || 512;
+// 打包是另一件事：fflate 在内存里拼整包（store 不压缩），一份输入一份输出，
+// 所以它仍用保守的 50MB —— 单文件下载和整包打包不该共用一个数字
+const MEM_ZIP_MAX_MB = Number(process.env.MEM_ZIP_MAX_MB) || 50;
 const library = createLibrary({ libraryDir: LIBRARY_DIR, log: console, maxFolders: MAX_FOLDERS });
 let libraryReady = false;
 
@@ -610,6 +615,7 @@ async function buildLibraryPayload() {
     wipeConfirm: WIPE_CONFIRM,
     // 没有 OPFS 可写时单文件能进内存的上限（字节）；界面据此决定"直接拒"还是"照下"
     memDownloadMaxBytes: MEM_DOWNLOAD_MAX_MB * 1024 * 1024,
+    memZipMaxBytes: MEM_ZIP_MAX_MB * 1024 * 1024,
     folders,
     batches,
   };

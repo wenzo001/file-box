@@ -1,16 +1,18 @@
 // 下载核心（纯逻辑，可在 Node 里用假网络/假存储验）：
 //  - transferToStore：把密文拉进 store，断线 / 卡住都从已存字节续，直到用户取消
 //  - decryptToStore：按块解密并写进明文 store（内存只留一块，不再整文件进内存）
-//  - memoryCapProblem：没有可写 OPFS 的设备，超过上限直接给话术（实测 64MB 要 355MB 堆）
+//  - memoryCapProblem：没有可写 OPFS 的页面（纯 HTTP 局域网地址 / 无痕窗口 / 旧浏览器），超过上限直接给话术
 // 浏览器侧的真实依赖（fetch / OPFS / FBCrypto / Blob）由 download.js 注入。
 import { queueOf } from './byte-queue.mjs';
 
 export const IDLE_MS = 15000;
 export const RETRY_BASE_MS = 1000;
 export const RETRY_MAX_MS = 30000;
-// 实测：16MB 文件解密时 JS 堆峰值 +173MB，64MB +355MB（≈5×）。手机标签页预算只有几百 MB，
-// 所以"整文件进内存"这条路只给没有 OPFS 可写能力的设备兜底，50MB 封顶。
-export const MEM_MAX_BYTES = 50 * 1024 * 1024;
+// 这条上限现在只管"浏览器自己的 Blob 容量"，不再是"我们占多少堆"：没有 OPFS 时明文是
+// **流**进 `new Response(stream).blob()` 的（浏览器把大 Blob 落盘），渲染进程只留一块 4MB 缓冲。
+// 旧实现把整份明文攒进数组再 `new Blob(parts)`，64MB 就要 355MB 堆，那时才需要 50MB 这种小上限。
+// Chromium 单个 Blob 的实际上限约 2GB，这里取 1GB 留余量，仍可由 MEM_DOWNLOAD_MAX_MB 调。
+export const MEM_MAX_BYTES = 512 * 1024 * 1024;
 
 const abortError = () => Object.assign(new Error('已取消下载'), { name: 'AbortError' });
 const sleepDefault = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -19,7 +21,7 @@ export function memoryCapProblem({ hasOpfs, size, capBytes = MEM_MAX_BYTES }) {
   if (hasOpfs) return null;
   if (Number.isFinite(size) && size > capBytes) {
     const cap = Math.round(capBytes / 1024 / 1024);
-    return `这台设备的浏览器不支持断点续存（OPFS），大于 ${cap}MB 的文件传不完：请用电脑下载，或让发送方走「无痕传输」`;
+    return `这个页面拿不到浏览器的本地存储（纯 HTTP 打开、无痕窗口或旧版浏览器），超过 ${cap}MB 的文件只能整份经内存：改用 HTTPS 入口再下（还带断点续传），或把 MEM_DOWNLOAD_MAX_MB 调大`;
   }
   return null;
 }

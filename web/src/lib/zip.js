@@ -1,15 +1,18 @@
 // 打包下载的浏览器接线：先按能力选档，再决定"边写盘 / 内存 / 降级成逐个文件"。
 // 纯逻辑在 zip-core.mjs（流式）与 capability.mjs（选档），这里只负责 OPFS 与保存。
 import { api } from './api.js';
-import { MEM_MAX_BYTES, transferToStore } from './download-core.mjs';
+import { transferToStore } from './download-core.mjs';
 import { TIER, pickTier, zipBytes } from './capability.mjs';
 import { createZipJob } from './zip-core.mjs';
 import { canWriteHandle, handleStore, openOpfsPath, removeOpfsPath, saveBlob } from './download.js';
 
 const ZIP_DIR = '_zips';
 
+// 内存拼包是「一份输入 + 一份输出」，比单文件下载更吃内存，所以上限不跟下载那个共用
+const ZIP_MEM_LIMIT = 50 * 1024 * 1024;
+
 /** 打包该怎么下：磁盘流式 / 内存 / 逐个文件 */
-export async function zipPlan(items, capBytes = MEM_MAX_BYTES) {
+export async function zipPlan(items, capBytes = ZIP_MEM_LIMIT) {
   const sum = zipBytes(items);
   const probe = await openOpfsPath([ZIP_DIR, 'probe'], true);
   const opfs = canWriteHandle(probe);

@@ -13,7 +13,8 @@ const EXE = process.env.CHROME_PATH || 'C:/Users/lhcz-fu/AppData/Local/Chromium/
 const LOG = (m) => console.log(`[fallback-lab] ${m}`);
 
 (async () => {
-  const srv = await startServer({ MEM_DOWNLOAD_MAX_MB: '1' });
+  // 打包的上限已经从单文件下载那个变量里拆出来了（两者别共用一个数）：这里要压的是打包档
+  const srv = await startServer({ MEM_ZIP_MAX_MB: '1' });
   let browser = null;
   try {
     const plain = Buffer.alloc(600 * 1024, 7);
