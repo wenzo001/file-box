@@ -239,6 +239,9 @@ node test/lab/folder-delete-nav.js   # 真浏览器：删掉当前目录后停�
 node test/lab/download-resume.js     # 真浏览器：第一次只回 40% 就断，第二发带 Range 续传
 node test/lab/zip-fallback.js        # 真浏览器：无 OPFS + 超上限时打包降级成逐个文件
 node test/lab/upload-lock.js         # 真浏览器：上传期间持 Web Lock、结束释放
+node test/lab/upload-ghost.js        # 真浏览器：上传中的影子行（虚线 + 进度条）→ 换成真实文件
+node test/lab/paste-upload.js        # 真浏览器：Ctrl+V 粘贴即上传（当前目录 / 最外层），输入框与弹层里不触发
+node test/lab/ui-refactor-audit.js   # 真浏览器：两端 13 档视口的几何/可达/对比度总审计（115 条）
 SMOKE_MB=2 node test/lab/ui-smoke.js # 真浏览器：无痕传输
 ```
 
