@@ -25,18 +25,16 @@ const patchFolder = (id, body) => jget(`${srv.base}/api/folders/${id}`, {
 const library = () => jget(`${srv.base}/api/library`);
 const folderById = (data, id) => data.folders.find((f) => f.id === id);
 
-test('空库：/api/library 返回未分档、TTL 选项和用量；旧 /api/list 兼容', async () => {
+test('空库：/api/library 只有用户目录、没有「未分档」这个假目录；旧 /api/list 兼容', async () => {
   const r = await library();
   assert.strictEqual(r.status, 200);
   assert.strictEqual(r.body.libraryReady, true);
-  assert.ok(r.body.folders.some((f) => f.id === '__unfiled__' && f.system === true));
+  // 没有归属目录的批次就挂在最外层，不再合成一个系统目录
+  assert.deepStrictEqual(r.body.folders, []);
   assert.deepStrictEqual(r.body.batches, []);
   assert.deepStrictEqual(r.body.ttlOptions, [1, 4, 8, 48, 72, 120, 240, 2160]);
   assert.deepStrictEqual(r.body.settings, { defaultTtlHours: 1 });
-  assert.strictEqual(r.body.folders.find((f) => f.id === '__unfiled__').lastUpdatedAt, null);
   assert.strictEqual(r.body.usage.limitGB, 1);
-  const unfiledDel = await fetch(`${srv.base}/api/folders/__unfiled__`, { method: 'DELETE' });
-  assert.strictEqual(unfiledDel.status, 400, '未分档是系统目录，不能删除');
 
   const old = await jget(`${srv.base}/api/list`);
   assert.strictEqual(old.status, 200);

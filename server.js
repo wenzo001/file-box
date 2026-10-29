@@ -544,7 +544,9 @@ async function buildLibraryPayload() {
   const emptySummary = () => ({
     count: 0, size: 0, downloads: 0, earliestExpiresAt: null, lastUpdatedAt: null,
   });
-  const summary = new Map([['__unfiled__', emptySummary()]]);
+  // 没有目录的批次（历史数据、上传时没选目录、目录被删）不属于任何文件夹：
+  // 它们就在最外层「全部文件」里，和根上的目录并排显示。不再造一个「未分档」的假目录。
+  const summary = new Map();
   for (const f of folderDocs) summary.set(f._id, emptySummary());
 
   const batches = disk.map((b) => {
@@ -579,7 +581,7 @@ async function buildLibraryPayload() {
         s.earliestExpiresAt = b.expiresAt;
       }
     };
-    add(b.folderId || '__unfiled__');
+    add(b.folderId);
     let parent = b.folderId ? (folderMap.get(b.folderId)?.parentId || null) : null;
     const seen = new Set();
     while (parent && !seen.has(parent)) {
@@ -589,20 +591,11 @@ async function buildLibraryPayload() {
     }
   }
 
-  const folders = [
-    {
-      id: '__unfiled__', parentId: null, name: '未分档', system: true,
-      createdAt: null, updatedAt: null, ...summary.get('__unfiled__'),
-    },
-    ...folderDocs.map((f) => ({
-      id: f._id, parentId: f.parentId, name: f.name, system: false,
-      createdAt: f.createdAt, updatedAt: f.updatedAt, ...summary.get(f._id),
-    })),
-  ];
-  folders.sort((a, b) => {
-    if (a.system !== b.system) return a.system ? -1 : 1;
-    return FOLDER_COLLATOR.compare(a.name, b.name);
-  });
+  const folders = folderDocs.map((f) => ({
+    id: f._id, parentId: f.parentId, name: f.name,
+    createdAt: f.createdAt, updatedAt: f.updatedAt, ...summary.get(f._id),
+  }));
+  folders.sort((a, b) => FOLDER_COLLATOR.compare(a.name, b.name));
 
   return {
     now: Date.now(),
@@ -832,7 +825,7 @@ app.post('/api/upload/finish', express.json({ limit: '64kb' }), (req, res) => {
           targetFolderId = null;
         }
       } else if (meta.folderId) {
-        // 索引不可用时不能假装已经归档；文件仍在磁盘，按未分档展示
+        // 索引不可用时不能假装已经归档；文件仍在磁盘，就按最外层展示
         targetFolderId = null;
         folderMissing = true;
       }
@@ -971,7 +964,7 @@ app.patch('/api/folders/:id', requireLibrary, express.json({ limit: '64kb' }), a
 }));
 
 app.delete('/api/folders/:id', requireLibrary, asyncHandler(async (req, res) => {
-  if (req.params.id === '__unfiled__') return res.status(400).json({ error: '未分档不能删除' });
+
 
   if (req.query.mode === 'empty') {
     await library.deleteEmptyFolder(req.params.id);
@@ -1426,7 +1419,7 @@ app.use((err, req, res, next) => {
     libraryReady = true;
   } catch (err) {
     libraryReady = false;
-    console.error('[目录索引] 初始化失败，按未分档模式运行', err.code || err.message);
+    console.error('[目录索引] 初始化失败，按最外层模式运行', err.code || err.message);
   }
   if (libraryReady) {
     try { await reconcileLibrary(); } catch (err) { console.error('[目录索引] 启动对账失败', err.code || err.message); }
@@ -1442,7 +1435,7 @@ app.use((err, req, res, next) => {
     console.log(`  HTTP : http://localhost:${PORT}`);
     console.log(`  HTTPS: https://localhost:${HTTPS_PORT}（推荐，首次访问需信任自签证书一次）`);
     console.log(`上传目录: ${UPLOAD_DIR}（存储上限 ${STORAGE_LIMIT_GB}GB；新上传默认 ${library.defaultTtlHours} 小时后自动删除，可在页面顶部公共配置区修改；文件夹只手动删除）`);
-    console.log(`目录索引: ${LIBRARY_DIR}${libraryReady ? '' : '（不可用，按未分档运行）'}`);
+    console.log(`目录索引: ${LIBRARY_DIR}${libraryReady ? '' : '（不可用，按最外层运行）'}`);
     console.log('文件在浏览器内端到端加密后上传，服务器磁盘只保存密文');
   });
   http.createServer(app).listen(PORT);

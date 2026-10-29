@@ -1,5 +1,5 @@
 // 上传中的「影子文件」：把进行中的上传任务摊成目标目录里的行，完成 / 失败 / 取消即消失。
-// 目录归属口径与 filesForFolder 一致：null 表示「未分档」那一栏。
+// 目录归属口径与 filesForFolder 一致：null 表示最外层「全部文件」那一栏。
 const LIVE = new Set(['queued', 'running', 'finishing', 'paused']);
 
 export function pendingRows(tasks, folderId) {

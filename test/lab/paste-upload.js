@@ -89,7 +89,8 @@ const LOG = (m) => console.log(`[paste-upload] ${m}`);
     await page.keyboard.press('Escape');
 
     // 4) 弹层开着时粘贴：不做后台动作
-    await page.locator('[aria-label="新建文件夹"]').first().click();
+    // 按可访问名找，不写死整串：栏头那颗现在叫「在此新建文件夹」（说清是在哪一栏建）
+    await page.getByRole('button', { name: '新建文件夹' }).first().click();
     await page.waitForSelector('.dialog', { state: 'visible' });
     const n2 = await tasks();
     await pasteFile('弹层里.png', 1024);
@@ -98,24 +99,24 @@ const LOG = (m) => console.log(`[paste-upload] ${m}`);
     await page.locator('.dialog .btn').first().click();
     await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
 
-    // 5) 没有选中目录（根 / 未分档）时粘贴：落到未分档
+    // 5) 在最外层（没有选中目录）粘贴：落到根，也就是「全部文件」里
     await page.evaluate(() => { history.pushState(null, '', location.pathname); dispatchEvent(new PopStateEvent('popstate')); });
     await page.waitForTimeout(600);
     assert.match(await page.locator('.crumb').innerText(), /全部文件\s*$/, `没回到根：${(await page.locator('.crumb').innerText()).trim()}`);
     const beforeNames = (await lib()).batches.map((b) => b.name);
-    await pasteFile('未分档粘贴.png', 128 * 1024);
+    await pasteFile('根目录粘贴.png', 128 * 1024);
     // 等"这一发自己"完成：批次在收尾（正在合并）时就已出现在列表里，按"多了个批次"会读到归属没定的它
     await page.waitForFunction(() => [...document.querySelectorAll('.task')]
-      .some((t) => /未分档粘贴\.png/.test(t.textContent) && /已完成/.test(t.textContent)), null, { timeout: 30000, polling: 500 });
+      .some((t) => /根目录粘贴\.png/.test(t.textContent) && /已完成/.test(t.textContent)), null, { timeout: 30000, polling: 500 });
     const after2 = await lib();
     const fresh2 = after2.batches.find((b) => !beforeNames.includes(b.name));
     assert.ok(fresh2, '根目录粘贴后服务端没多出批次');
-    assert.strictEqual(fresh2.folderId, null, `没有选中目录时该落到未分档，实际 ${fresh2.folderId}`);
-    LOG('根目录粘贴：落到未分档');
+    assert.strictEqual(fresh2.folderId, null, `没有选中目录时该落在最外层，实际 ${fresh2.folderId}`);
+    LOG('最外层粘贴：落在「全部文件」里');
 
     const real = errs.filter((e) => !/Failed to load resource/.test(e));
     assert.deepStrictEqual(real, [], `浏览器报错：\n${real.join('\n')}`);
-    LOG('通过：粘贴文件即上传（当前目录 / 未分档），文本与输入框内的粘贴不触发');
+    LOG('通过：粘贴文件即上传（当前目录 / 最外层），文本与输入框内的粘贴不触发');
   } catch (err) {
     console.error('[paste-upload] 失败:', err.message);
     console.error('[paste-upload] 浏览器错误:', errs.length ? errs : 'none');

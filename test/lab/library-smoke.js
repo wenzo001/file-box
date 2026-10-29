@@ -132,7 +132,8 @@ const tmp = (name) => path.join(os.tmpdir(), name);
 
     // 工具行常驻：勾选前后分栏卡片的 y 必须一模一样（旧选中栏一出现就把界面顶下去）
     const cardY = async () => Math.round((await page.locator('.columns').boundingBox()).y);
-    const toolBtn = (text) => page.locator('.tool-actions .linkbtn', { hasText: text });
+    // 工具行的可见标签在窄处会压短（全选 / 打包 / 取消），可访问名才是不变的契约 ⇒ 按 aria-label 找
+    const toolBtn = (name) => page.locator(`.tool-actions .linkbtn[aria-label^="${name}"]`);
     const yIdle = await cardY();
     assert.strictEqual(await toolBtn('复制分享链接').isDisabled(), true, '一件没选时「复制分享链接」应不可点');
     assert.strictEqual(await toolBtn('删除').isDisabled(), true, '一件没选时「删除」应不可点');
@@ -169,14 +170,10 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.notStrictEqual(await bg(dangerItem), idleBg, '删除项 hover 没画底色');
     await page.keyboard.press('Escape');
 
-    // 禁用项不许被 hover 点亮（Chromium 对 disabled 按钮照样算 :hover）
-    await page.locator('.column').first().locator('.folder-row', { hasText: '未分档' }).locator('.col-more').click();
-    const offItem = page.locator('.context-menu .menu-item[disabled]');
-    assert.strictEqual(await offItem.count(), 1, '未分档菜单里该有那颗禁用的删除项');
-    const offIdle = await bg(offItem);
-    await offItem.hover();
-    assert.strictEqual(await bg(offItem), offIdle, `禁用项被 hover 点亮了：${offIdle} → ${await bg(offItem)}`);
-    await page.keyboard.press('Escape');
+    // 「禁用项不许被 hover 点亮」这条腿原先拿「未分档」那颗禁用的删除项当靶子；
+    // 系统目录取消之后菜单里再没有禁用项（重命名只在没有清单的旧数据上是禁用的），
+    // 这一格改由 test/format.test.js 的静态门守着（.menu-item:disabled 必须真声明 opacity），
+    // 行为层的同形状判据登记为欠账：造一条旧数据才能再验一次。
 
     // 分享链接改名后仍指向同一个目录 ID
     await parent.locator('.col-more').click();
@@ -238,7 +235,7 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     await page.locator('.file-row .col-check').nth(1).check();
     const [dl2] = await Promise.all([
       page.waitForEvent('download', { timeout: 30000 }),
-      page.locator('.tool-actions .linkbtn', { hasText: '打包下载' }).click(),
+      toolBtn('打包下载').click(),
     ]);
     const multi = Object.keys(unzipSync(new Uint8Array(fs.readFileSync(await dl2.path()))));
     assert.ok(multi.filter((n) => !n.endsWith('/')).length >= 2);
@@ -358,22 +355,16 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     page.off('request', spy);
     assert.ok(patched.length >= 1, '拖拽目录行没有发出改父级的 PATCH —— 父级变化不能归因于这次拖拽');
 
-    // 系统目录不许被拖走，且要给一句具名的拒绝
-    await rowOf('未分档').dragTo(rowOf('拖拽去处'));
-    await page.waitForFunction(
-      () => Boolean(document.querySelector('.banner.danger')?.textContent.includes('系统目录')),
-      null, { timeout: 10000 },
-    );
-    lib = await (await fetch(`${srv.base}/api/library`)).json();
-    assert.strictEqual(lib.folders.find((f) => f.name === '未分档').parentId, null, '未分档被拖拽改动了父级');
-
-    // 窄屏：当前栏必须自动滚到视野内
+    // 窄屏：当前目录的行必须真的在视野里，且倒计时那一行要画得出来
+    // （2026-10 重构后 ≤700px 换的是手机档那棵壳，`.column` 已经不存在了 ——
+    //   这里不能再按"最后一栏"找行，改按"这一屏看得见的文件行"找，判的是同一件事：别把内容挤到视野外）
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForTimeout(600);
-    const box = await page.locator('.column:last-child .file-row').first().boundingBox();
-    assert.ok(box && box.x >= 0 && box.x < 390, `窄屏下当前目录不在视野内: ${JSON.stringify(box)}`);
+    const box = await page.locator('.file-row').first().boundingBox();
+    assert.ok(box && box.x >= 0 && box.x < 390 && box.y >= 0 && box.y < 844,
+      `窄屏下当前目录的行不在视野内: ${JSON.stringify(box)}`);
     // 三行都要真渲染：旧表格的窄屏规则曾把倒计时那一行整行 display:none 掉
-    const expiryCell = page.locator('.column:last-child .file-row .col-expiry').first();
+    const expiryCell = page.locator('.file-row .col-expiry').first();
     const expiryBox = await expiryCell.boundingBox();
     assert.ok(
       expiryBox && expiryBox.height > 8 && expiryBox.width > 20,
@@ -433,9 +424,10 @@ const tmp = (name) => path.join(os.tmpdir(), name);
     assert.strictEqual(libAfter.folders.length, libBefore.folders.length, '目录树必须原样保留');
     assert.strictEqual(libAfter.downloadsTotal, libBefore.downloadsTotal, '历史累计下载不许被清空');
     assert.strictEqual(await page.locator('.file-row').count(), 0, '清空后界面上还看得见文件行');
+    // 顶栏那颗容量药丸是"历史累计下载"在桌面档唯一的落点（旧类名 .topbar-usage 已随旧壳删掉）
     assert.match(
-      await page.locator('.topbar-usage').first().evaluate((el) => el.textContent || ''),
-      /累计下载 \d+ 次/,
+      await page.locator('.usage-chip').first().evaluate((el) => el.textContent || ''),
+      /下载 \d+ 次/,
       '顶栏没显示历史累计下载',
     );
 

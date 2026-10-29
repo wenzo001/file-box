@@ -2,36 +2,35 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useNow } from '@vueuse/core';
 import {
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogOverlay,
-  DialogPortal,
-  DialogRoot,
-  DialogTitle,
-} from 'reka-ui';
-import {
-  ChevronRight, Clock, Download, File, Folder, FolderPlus, HardDrive, Inbox,
-  Link2, ListChecks, Package, Pause, Play, RotateCcw, Search, Settings, Trash2, Upload, X,
+  Clock, Download, File, Folder, FolderPlus, HardDrive, Inbox, Info, Link2, ListChecks,
+  Package, RotateCcw, Search, Trash2, Upload, X,
 } from '@lucide/vue';
 import { api } from './lib/api.js';
 import { encodeManifest, fetchManifest, invalidateManifest, manifestMap } from './lib/manifest.js';
 import { UploadTask, relPath, sortSelected } from './lib/upload.js';
-import { clearDownload, downloadFile, saveBlob } from './lib/download.js';
+import { clearDownload, downloadFile } from './lib/download.js';
 import { createZipRunner, zipPlan } from './lib/zip.js';
 import WipeDialog from './components/WipeDialog.vue';
 import SettingsSheet from './components/SettingsSheet.vue';
-import { tierLabel } from './lib/capability.mjs';
+import TopBar from './components/TopBar.vue';
+import ColumnBrowser from './components/ColumnBrowser.vue';
+import MobileBrowser from './components/MobileBrowser.vue';
+import SearchPanel from './components/SearchPanel.vue';
+import TaskCenter from './components/TaskCenter.vue';
+import ContextMenu from './components/ContextMenu.vue';
+import ActionSheet from './components/ActionSheet.vue';
+import AppDialog from './components/AppDialog.vue';
+import TaskDrawer from './components/TaskDrawer.vue';
 import { bindColumnDnd } from './lib/dnd.js';
 import { enterSubmits } from './lib/dialog-enter.js';
 import { pendingRows } from './lib/pending.mjs';
-import {
-  collator, dlText, expiryClass, fmtAgo, fmtExpiry, fmtFullTime, fmtSize, fmtUploaded, isHot, ttlLabel,
-} from './lib/format.js';
+import { collator, fmtExpiry, fmtSize, ttlLabel } from './lib/format.js';
+import { useIsMobile, useKeyboardInset } from './composables/useDevice.js';
 
 const FOLDER_NAME_MAX = 10;
 const TTL_FALLBACK = [1, 4, 8, 48, 72, 120, 240, 2160];
 const now = useNow({ interval: 15_000 });
+const isMobile = useIsMobile();
 
 const data = ref({
   folders: [], batches: [], usage: { used: 0, limit: 1, limitGB: 10 },
@@ -45,6 +44,7 @@ const error = ref('');
 const manifestError = ref('');
 const query = ref('');
 const selected = ref([]);
+const selectMode = ref(false);
 const allFileRows = ref([]);
 const manifestState = ref(new Map());
 const tasks = ref([]);
@@ -53,10 +53,12 @@ const resumePending = ref(null);
 const settingsTtl = ref(1);
 const settingsSaving = ref(false);
 const fileInput = ref(null);
-const columnsEl = ref(null);
+const desktopBrowser = ref(null);
 const dragTargetKey = ref('');
 const toastText = ref('');
 const menu = ref(null);
+const tasksOpen = ref(true);
+const taskDrawer = ref(false);
 const shareFileRefs = ref([]);
 const sharedFileKeys = ref(new Set());
 const sharedFolderIds = ref(new Set());
@@ -73,17 +75,16 @@ let loadToken = 0;
 const dialog = reactive({
   open: false, kind: '', mode: 'confirm', title: '', message: '',
   value: '', error: '', busy: false, destructive: false,
-  confirmText: '确定', target: null, items: [],
+  confirmText: '确定', target: null,
 });
 
+const sheet = reactive({ open: false, title: '', subtitle: '', items: [] });
+
+const columnsEl = computed(() => desktopBrowser.value?.columnsEl || null);
 const rootLabel = '全部文件';
 const folderMap = computed(() => new Map(data.value.folders.map((f) => [f.id, f])));
 const ttlOptions = computed(() => (data.value.ttlOptions?.length ? data.value.ttlOptions : TTL_FALLBACK));
-
-const currentFolder = computed(() => {
-  if (!currentId.value) return null;
-  return folderMap.value.get(currentId.value) || null;
-});
+const currentFolder = computed(() => (currentId.value ? folderMap.value.get(currentId.value) || null : null));
 
 function pathTo(id) {
   if (!id) return [];
@@ -98,40 +99,29 @@ function pathTo(id) {
   return out;
 }
 
-const breadcrumb = computed(() => {
-  const out = [{ id: null, name: rootLabel }];
-  if (!currentId.value) return out;
-  return out.concat(pathTo(currentId.value).map((f) => ({ id: f.id, name: f.name })));
-});
+const path = computed(() => (currentId.value ? pathTo(currentId.value) : []));
+const breadcrumb = computed(() => [{ id: null, name: rootLabel }, ...path.value.map((f) => ({ id: f.id, name: f.name }))]);
 
-const uploadTargetId = computed(() => (
-  currentId.value && currentId.value !== '__unfiled__' ? currentId.value : null
-));
+const uploadTargetId = computed(() => currentId.value || null);
 const uploadTargetLabel = computed(() => (
-  uploadTargetId.value ? (folderMap.value.get(uploadTargetId.value)?.name || '目录') : '未分档'
+  uploadTargetId.value ? (folderMap.value.get(uploadTargetId.value)?.name || '目录') : rootLabel
 ));
 const uploadTtlText = computed(() => (
   data.value.libraryReady === false ? '自动删除设置暂不可用' : `${ttlLabel(settingsTtl.value)}后自动删除`
 ));
 
 function sortFolders(list) {
-  return list.slice().sort((a, b) => {
-    if (a.system !== b.system) return a.system ? -1 : 1;
-    return collator.compare(a.name, b.name);
-  });
+  return list.slice().sort((a, b) => collator.compare(a.name, b.name));
 }
 
 function childrenOf(id) {
-  if (id === '__unfiled__') return [];
   return sortFolders(data.value.folders.filter((f) => (
     id === null ? f.parentId === null : f.parentId === id
   )));
 }
 
 function filesForFolder(id) {
-  const rows = allFileRows.value.filter((r) => (
-    id === '__unfiled__' ? !r.folderId : r.folderId === id
-  ));
+  const rows = allFileRows.value.filter((r) => r.folderId === id);
   return rows.slice().sort((a, b) => {
     const at = Number.isFinite(a.uploadedAt) ? a.uploadedAt : 0;
     const bt = Number.isFinite(b.uploadedAt) ? b.uploadedAt : 0;
@@ -140,7 +130,7 @@ function filesForFolder(id) {
   });
 }
 
-const columnIds = computed(() => [null, ...pathTo(currentId.value).map((f) => f.id)]);
+const columnIds = computed(() => [null, ...path.value.map((f) => f.id)]);
 const columns = computed(() => columnIds.value.map((id) => {
   const folder = id ? folderMap.value.get(id) || null : null;
   return {
@@ -148,16 +138,16 @@ const columns = computed(() => columnIds.value.map((id) => {
     id,
     folder,
     folders: childrenOf(id),
-    files: id ? filesForFolder(id) : [],
-    // 「未分档」栏与 null 批次是同一个桶（同 filesForFolder 的口径）；顶端那栏只列目录
-    pending: id ? pendingRows(tasks.value, id === '__unfiled__' ? null : id) : [],
+    // 没有目录的批次就挂在最外层：根那栏同样有文件和影子行
+    files: filesForFolder(id),
+    pending: pendingRows(tasks.value, id),
   };
 }));
 // 当前路径上的每一级（含当前这一级自己）：所在栏的那一行要亮成选中态
 const pathIds = computed(() => new Set(columnIds.value.slice(1)));
+const currentCol = computed(() => columns.value[columns.value.length - 1]);
 
 // ---- 拖拽移动：目录行拖进别的目录 = 换父级；文件行拖进别的目录 = 把这一条拆出批次搬走 ----
-// 拖拽移动的落点（只用于高亮）：row = 目标目录行，col = 悬停在哪一栏
 const dndOverId = ref(null);
 const dndOverCol = ref(null);
 function setDndOver(payload) {
@@ -169,10 +159,11 @@ let dndBusy = false;
 let dndDragging = false;
 let dndTimer = null;
 let dndObserver = null;
+let dndObservedEl = null;
 
 function dndRows(col) {
   const rows = [
-    ...col.folders.map((f) => ({ kind: 'folder', id: f.id, name: f.name, system: Boolean(f.system) })),
+    ...col.folders.map((f) => ({ kind: 'folder', id: f.id, name: f.name })),
     // 影子行也是这一栏的子元素：库按"值与子元素一一对应"配对，漏掉它们会让后面的行错位
     ...(col.pending || []).map((p) => ({ kind: 'pending', id: p.key })),
     ...col.files.map((r) => ({ kind: 'file', id: r.key, batch: r.batch, enc: r.enc, name: r.name })),
@@ -183,10 +174,12 @@ function dndRows(col) {
 
 function bindDnd() {
   if (dndBusy || dndDragging || pointerOnRow) return; // 按住或拖拽在飞时重建绑定，会把这次拖拽掐死在起点
+  const el = columnsEl.value;
+  if (!el) return;
   // 按 DOM 顺序取容器，与 columns 一一对齐；v-for 里的数组 ref 顺序没有保证，错位会让库把值和子元素配错
-  const els = columnsEl.value ? [...columnsEl.value.querySelectorAll('.col-list')] : [];
-  const lists = els.map((el, i) => ({
-    el,
+  const els = [...el.querySelectorAll('.col-list')];
+  const lists = els.map((listEl, i) => ({
+    el: listEl,
     colKey: columns.value[i]?.key ?? String(i),
     folderId: columns.value[i]?.id ?? null,
     rows: () => dndRows(columns.value[i] || { folders: [], files: [] }),
@@ -214,12 +207,19 @@ function scheduleBind() {
 }
 
 function watchColumnsDom() {
-  if (!columnsEl.value || dndObserver) return;
-  dndObserver = new MutationObserver(scheduleBind);
-  dndObserver.observe(columnsEl.value, { childList: true, subtree: true });
-  document.addEventListener('pointerdown', (e) => { pointerOnRow = Boolean(e.target?.closest?.('.col-row')); }, true);
-  document.addEventListener('pointerup', () => { pointerOnRow = false; scheduleBind(); }, true);
-  document.addEventListener('pointercancel', () => { pointerOnRow = false; }, true);
+  const el = columnsEl.value;
+  // 视口从桌面切到手机会销毁这块 DOM：观察器必须跟着换主人，否则一直盯着一棵游离的树
+  if (dndObserver && dndObservedEl !== el) {
+    dndObserver.disconnect();
+    dndObserver = null;
+    dndObservedEl = null;
+  }
+  if (!el) return;
+  if (!dndObserver) {
+    dndObserver = new MutationObserver(scheduleBind);
+    dndObserver.observe(el, { childList: true, subtree: true });
+    dndObservedEl = el;
+  }
   scheduleBind();
 }
 
@@ -245,31 +245,22 @@ async function moveFileRowTo(row, toFolderId) {
 
 async function onDndMove({ dragged, toFolderId }) {
   if (dndBusy) return; // 一次落点只执行一遍，重复触发不能把移动做两次
-  const unfiled = toFolderId === '__unfiled__';
-  const to = toFolderId && !unfiled ? toFolderId : null;
+  const to = toFolderId || null;
   // 落点只带 kind/id（从 DOM 的 data-dnd-* 读），其余字段回数据里取，不在拖拽层复制一份状态
   const rows = (dragged || [])
     .map((r) => (r.kind === 'folder'
-      ? { kind: 'folder', id: r.id, system: Boolean(folderMap.value.get(r.id)?.system) }
+      ? { kind: 'folder', id: r.id }
       : { kind: 'file', row: itemByKey.value.get(r.id)?.file }))
     .filter((r) => (r.kind === 'folder' ? Boolean(folderMap.value.get(r.id)) : Boolean(r.row)))
     .filter((r) => !(r.kind === 'folder' && r.id === to));
   if (!rows.length) return;
-  if (rows.some((r) => r.kind === 'folder' && r.system)) {
-    error.value = '「未分档」是系统目录，不能移动';
-    return;
-  }
-  if (unfiled && rows.some((r) => r.kind === 'folder')) {
-    error.value = '未分档只放没归档的文件；目录请拖到别的文件夹或「全部文件」那一栏';
-    return;
-  }
   dndBusy = true;
   try {
     for (const r of rows) {
       if (r.kind === 'folder') await api.patchFolder(r.id, { parentId: to });
-      else await moveFileRowTo(r.row, unfiled ? '__unfiled__' : to);
+      else await moveFileRowTo(r.row, to);
     }
-    const where = unfiled ? '未分档' : (to ? folderMap.value.get(to)?.name || '目标目录' : '顶级');
+    const where = to ? folderMap.value.get(to)?.name || '目标目录' : rootLabel;
     toast(`已移动 ${rows.length} 项到「${where}」`);
     // 锁要跨过这次刷新：刷新会重绘分栏，锁先放开就会在回弹里被再触发一次
     await refreshLibrary({ silent: true });
@@ -281,6 +272,7 @@ async function onDndMove({ dragged, toFolderId }) {
 }
 
 watch(columns, () => nextTick(watchColumnsDom), { flush: 'post' });
+watch(isMobile, () => nextTick(watchColumnsDom));
 
 const folderPathText = (id) => {
   if (!id) return '全部文件';
@@ -305,7 +297,7 @@ const searchFileResults = computed(() => {
   return allFileRows.value
     .filter((row) => row.name.toLowerCase().includes(q))
     .slice(0, 300)
-    .map((row) => ({ row, path: folderPathText(row.folderId || '__unfiled__') }));
+    .map((row) => ({ row, path: folderPathText(row.folderId) }));
 });
 const selectedFileCount = computed(() => selectedItems.value.filter((x) => x.type === 'file').length);
 
@@ -321,6 +313,8 @@ const itemByKey = computed(() => {
 });
 
 const selectedItems = computed(() => selected.value.map((key) => itemByKey.value.get(key)).filter(Boolean));
+const selectedSet = computed(() => new Set(selected.value));
+const isSelecting = computed(() => selectMode.value || selected.value.length > 0);
 
 const visibleKeys = computed(() => {
   if (searching.value) {
@@ -329,50 +323,36 @@ const visibleKeys = computed(() => {
       ...searchFileResults.value.map((x) => x.row.key),
     ];
   }
+  // 手机上只有当前这一层：全选的含义是"这一屏看得见的"，不是整棵树
+  if (isMobile.value) return columnKeys(currentCol.value);
   return columns.value.flatMap((col) => columnKeys(col));
 });
 
 const shareRows = computed(() => allFileRows.value.filter((r) => sharedFileKeys.value.has(r.key)));
 
 function columnKeys(col) {
+  if (!col) return [];
   return [
     ...col.folders.map((f) => `folder:${f.id}`),
     ...col.files.map((r) => r.key),
   ];
 }
+const allSelectedNow = computed(() => {
+  const keys = visibleKeys.value;
+  return keys.length > 0 && keys.every((k) => selectedSet.value.has(k));
+});
 
-function colLabel(col) {
-  if (!col.id) return rootLabel;
-  return col.folder?.name || '目录';
-}
-
-function colMeta(col) {
-  if (!col.id) {
-    const folderCount = data.value.folders.filter((f) => !f.system).length;
-    return `${folderCount} 个文件夹 · ${fmtSize(data.value.usage.used)}`;
-  }
-  const folder = col.folder;
-  if (!folder) return '';
-  const updated = Number.isFinite(folder.lastUpdatedAt) ? `最后更新 ${fmtAgo(folder.lastUpdatedAt, now.value)}` : '还没有文件';
-  // 影子行不计入"N 个文件"（还没提交），单独说一句，免得表头写着"还没有文件"下面却有一行
-  const uploading = (col.pending || []).length ? ` · ${col.pending.length} 个上传中` : '';
-  return `${folder.count || 0} 个文件 · ${updated}${uploading}`;
-}
-
-function folderRowMeta(folder) {
-  const updated = Number.isFinite(folder.lastUpdatedAt) ? `最后更新 ${fmtAgo(folder.lastUpdatedAt, now.value)}` : '还没有文件';
-  return `${folder.count || 0} 个文件 · ${fmtSize(folder.size || 0)} · ${updated}`;
-}
-
-function isSelected(key) { return selected.value.includes(key); }
+const expiringKeys = (row) => (
+  Number.isFinite(row.expiresAt) && row.expiresAt - now.value < 10 * 60_000
+);
 
 function toggleSelect(key) {
-  if (isSelected(key)) selected.value = selected.value.filter((k) => k !== key);
+  if (selected.value.includes(key)) selected.value = selected.value.filter((k) => k !== key);
   else selected.value = [...selected.value, key];
 }
 
 function allSelectedIn(keys) {
-  return keys.length > 0 && keys.every((k) => isSelected(k));
+  return keys.length > 0 && keys.every((k) => selectedSet.value.has(k));
 }
 
 function toggleColumn(col) {
@@ -385,8 +365,22 @@ function toggleColumn(col) {
 function toggleAll() {
   const keys = visibleKeys.value;
   if (!keys.length) return;
-  if (keys.every((k) => isSelected(k))) selected.value = selected.value.filter((k) => !keys.includes(k));
-  else selected.value = [...new Set([...selected.value, ...keys])];
+  if (keys.every((k) => selectedSet.value.has(k))) {
+    selected.value = selected.value.filter((k) => !keys.includes(k));
+    if (!selected.value.length) selectMode.value = false;
+  } else {
+    selected.value = [...new Set([...selected.value, ...keys])];
+  }
+}
+
+// 手机：长按进多选并把这一项选上；退出多选要清干净，不能留一串看不见的选中项
+function enterSelect(key) {
+  selectMode.value = true;
+  if (key && !selected.value.includes(key)) selected.value = [...selected.value, key];
+}
+function exitSelect() {
+  selectMode.value = false;
+  selected.value = [];
 }
 
 function toast(message) {
@@ -395,47 +389,19 @@ function toast(message) {
   toastTimer = setTimeout(() => { toastText.value = ''; }, 3200);
 }
 
-function stateText(task) {
-  // 下载分三段：拉密文（可续）、解密（写本地）、交给浏览器保存——三段都要说清在哪
-  if (task.kind === 'download' && task.state === 'running') {
-    if (task.phase === 'decrypt') return '解密中';
-    if (task.phase === 'save') return '保存中';
-    if (task.phase === 'waiting') return '重连中';
-  }
-  return {
-    queued: '排队', running: '进行中', finishing: '正在合并', paused: '已暂停',
-    failed: '失败', done: '已完成', canceled: '已取消',
-  }[task.state] || task.state;
-}
-
-function taskPct(task) {
-  if (task.state === 'done') return 100;
-  if (task.kind === 'upload') return task.total ? Math.round((task.done / task.total) * 100) : 0;
-  if (task.kind === 'folder-delete') return task.items?.length ? Math.round((task.index / task.items.length) * 100) : 0;
-  return task.total ? Math.round((task.received / task.total) * 100) : 0;
-}
-
-function taskMeta(task) {
-  if (task.kind === 'download' && task.note) return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.note}`;
-  if (task.kind === 'upload') return `${task.done || 0}/${task.total || 0} 块 · ${fmtSize(task.doneBytes || 0)}${task.note ? ` · ${task.note}` : ''}`;
-  if (task.kind === 'folder-delete') return `已完成 ${task.index || 0}/${task.items?.length || 0} 项`;
-  if (task.kind === 'zip') return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)} · ${task.files || 0} 个文件${task.tier ? ` · ${tierLabel(task.tier)}` : ''}`;
-  return `${fmtSize(task.received || 0)} / ${fmtSize(task.total || 0)}`;
-}
-
-function updateUrl() {
+// URL 只由这一处写：目录 + 分享进来的文件引用。分享横幅还在内存里的时候，
+// 刷新页面也得能把它还原出来 —— 两个状态写两份名单必然分叉。
+function writeUrl(push) {
   const url = new URL(location.href);
   url.search = '';
   if (currentId.value) url.searchParams.set('f', currentId.value);
-  history.pushState({ f: currentId.value }, '', url);
+  for (const ref of shareFileRefs.value) url.searchParams.append('file', ref);
+  const state = { f: currentId.value };
+  if (push) history.pushState(state, '', url);
+  else history.replaceState(state, '', url);
 }
-
-function replaceUrl() {
-  const url = new URL(location.href);
-  url.search = '';
-  if (currentId.value) url.searchParams.set('f', currentId.value);
-  history.replaceState({ f: currentId.value }, '', url);
-}
+function updateUrl() { writeUrl(true); }
+function replaceUrl() { writeUrl(false); }
 
 async function refreshPending() {
   try { pendingUploads.value = (await api.uploads()).uploads; }
@@ -531,7 +497,7 @@ async function refreshLibrary({ silent = false, force = false } = {}) {
     const prevFolders = data.value.folders;
     data.value = res;
     if (!settingsSaving.value) settingsTtl.value = res.settings?.defaultTtlHours ?? 1;
-    if (currentId.value && currentId.value !== '__unfiled__' && !res.folders.some((f) => f.id === currentId.value)) {
+    if (currentId.value && !res.folders.some((f) => f.id === currentId.value)) {
       const alive = new Set(res.folders.map((f) => f.id));
       const prevById = new Map(prevFolders.map((f) => [f.id, f]));
       const seen = new Set();
@@ -549,6 +515,7 @@ async function refreshLibrary({ silent = false, force = false } = {}) {
     if (!silent) error.value = '';
     applyShare();
     selected.value = selected.value.filter((key) => itemByKey.value.has(key));
+    if (!selected.value.length) selectMode.value = false;
     refreshPending();
   } catch (err) {
     if (!silent) error.value = err.message || '加载失败';
@@ -564,6 +531,8 @@ async function navigate(id) {
   const next = id || null;
   query.value = '';
   selected.value = [];
+  selectMode.value = false;
+  closeMenu();
   if (next === currentId.value) {
     await refreshLibrary({ silent: true });
     await nextTick();
@@ -578,8 +547,13 @@ async function navigate(id) {
   setTimeout(scrollColumnsToEnd, 120);
 }
 
+async function goBack() {
+  const parent = path.value.length >= 2 ? path.value[path.value.length - 2].id : null;
+  await navigate(parent);
+}
+
 async function navigateToFile(row) {
-  await navigate(row.folderId || '__unfiled__');
+  await navigate(row.folderId);
   pulse(row.key);
 }
 
@@ -598,7 +572,7 @@ function onPop() {
     applyShare();
     if (shareFileRefs.value.length) {
       const hit = allFileRows.value.find((r) => shareFileRefs.value.includes(`${r.batch}/${r.enc}`));
-      if (hit) currentId.value = hit.folderId || '__unfiled__';
+      if (hit) currentId.value = hit.folderId || null;
     }
     nextTick(scrollColumnsToEnd);
   });
@@ -614,7 +588,7 @@ function applyShare() {
   if (!shareFileRefs.value.length) return;
   const rows = allFileRows.value.filter((r) => shareFileRefs.value.includes(`${r.batch}/${r.enc}`));
   sharedFileKeys.value = new Set(rows.map((r) => r.key));
-  sharedFolderIds.value = new Set(rows.map((r) => r.folderId || '__unfiled__'));
+  sharedFolderIds.value = new Set(rows.map((r) => r.folderId).filter(Boolean));
   shareBanner.value = rows.length > 0;
   shareMissing.value = rows.length === 0;
 }
@@ -629,10 +603,6 @@ function dismissShare() {
 }
 
 function focusShared(row) { navigateToFile(row); }
-
-function isExpiring(row) {
-  return Number.isFinite(row.expiresAt) && row.expiresAt - now.value < 10 * 60_000;
-}
 
 function chooseUpload(folderId) {
   resumePending.value = null;
@@ -657,13 +627,13 @@ function onFilesPicked(event) {
 function addUpload(files, { folderId = null, ttlHours = null } = {}) {
   if (!window.FBCrypto) { toast('加密模块未加载，请刷新页面'); return; }
   sortSelected(files);
-  const target = folderId && folderId !== '__unfiled__' ? folderId : null;
+  const target = folderId || null;
   const task = reactive({
     id: `task-${++taskSeq}`,
     kind: 'upload',
     title: files.length === 1 ? relPath(files[0]) : `${relPath(files[0])} 等 ${files.length} 个文件`,
     state: 'queued', done: 0, total: 0, doneBytes: 0, error: '', result: null, note: '',
-    targetLabel: target ? (folderMap.value.get(target)?.name || '目录') : '未分档',
+    targetLabel: target ? (folderMap.value.get(target)?.name || '目录') : rootLabel,
     // 影子行：进行中的文件要立刻出现在目标目录那栏里
     folderId: target,
     names: files.map(relPath),
@@ -682,11 +652,11 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
         refreshLibrary({ silent: true });
         refreshPending();
         if (res.indexed === false) {
-          toast('上传完成，但目录索引不可用：文件在未分档，未设置自动删除');
-          navigate('__unfiled__');
+          toast('上传完成，但目录索引不可用：文件在最外层（全部文件），未设置自动删除');
+          navigate(null);
         } else if (res.folderMissing) {
-          toast('上传完成，但目标目录已不存在：文件在未分档');
-          navigate(resultFolder || '__unfiled__');
+          toast('上传完成，但目标目录已不存在：文件在最外层（全部文件）');
+          navigate(resultFolder || null);
         } else {
           const expiry = res.expiresAt ? fmtExpiry(res.expiresAt, Date.now()) : '未设置自动删除';
           toast(`已上传到「${task.targetLabel}」· ${expiry}`);
@@ -701,7 +671,7 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
   task.resume = () => up.resume();
   task.cancel = () => up.cancel();
   task.remove = () => { tasks.value = tasks.value.filter((t) => t !== task); };
-  task.openResult = () => navigate(task.result?.folderId || '__unfiled__');
+  task.openResult = () => navigate(task.result?.folderId || null);
   // 手机上切到后台时告诉用户一句：持了 Web Lock 但系统仍可能节流
   const onVis = () => {
     if (['running', 'finishing'].includes(task.state)) {
@@ -753,22 +723,13 @@ function onColumnDrop(event, col) {
   event.preventDefault();
   event.stopImmediatePropagation();
   dragTargetKey.value = '';
-  const folderId = !col.id || col.id === '__unfiled__' ? null : col.id;
+  const folderId = col.id || null;
   addUpload(files, { folderId });
-}
-
-function menuItemsHeight(items) {
-  return items.reduce((n, item) => n + (item.sep ? 9 : 32), 0);
 }
 
 function showMenu(x, y, items) {
   if (!items?.length) return;
-  const height = Math.min(menuItemsHeight(items), 380);
-  menu.value = {
-    x: Math.max(8, Math.min(x, window.innerWidth - 236)),
-    y: Math.max(8, Math.min(y, window.innerHeight - height - 8)),
-    items,
-  };
+  menu.value = { x, y, items };
 }
 
 function showMenuFor(event, items) {
@@ -803,56 +764,59 @@ function openColumnMenu(event, col) {
   showMenu(event.clientX, event.clientY, columnMenuItems(col));
 }
 
+// 手机：同一个业务清单换成底部操作表；条目与桌面右键菜单出自同一批构造函数。
+// 抽屉不需要触发点坐标，所以这两个入口只收"哪一项"。
+function openFolderSheet(folder) {
+  sheet.title = folder.name;
+  sheet.subtitle = '文件夹操作';
+  sheet.items = folderMenuItems(folder);
+  sheet.open = true;
+}
+
+function openFileSheet(row) {
+  sheet.title = row.name;
+  sheet.subtitle = '文件操作';
+  sheet.items = fileMenuItems(row);
+  sheet.open = true;
+}
+
 function folderMenuItems(folder) {
-  const items = [{ label: '打开', run: () => navigate(folder.id) }];
-  if (!folder.system) {
-    items.push(
-      { label: '重命名', run: () => openRenameFolder(folder) },
-      { label: '移动到…', run: () => openMoveFolder(folder) },
-      { label: '在此新建子文件夹', run: () => openNewFolder(folder.id) },
-    );
-  }
-  items.push(
-    { label: '复制文件夹链接', run: () => copyFolderLink(folder.id) },
-    { label: '打包下载', run: () => downloadFolderZip(folder) },
-  );
-  if (folder.system) {
-    items.push({ sep: true }, { label: '系统目录，不能删除', disabled: true });
-  } else {
-    items.push({ sep: true }, { label: '删除文件夹', danger: true, run: () => openDeleteFolder(folder) });
-  }
-  return items;
+  return [
+    { label: '打开', icon: Folder, run: () => navigate(folder.id) },
+    { label: '重命名', icon: File, run: () => openRenameFolder(folder) },
+    { label: '移动到…', icon: Folder, run: () => openMoveFolder(folder) },
+    { label: '在此新建子文件夹', icon: FolderPlus, run: () => openNewFolder(folder.id) },
+    { label: '复制文件夹链接', icon: Link2, run: () => copyFolderLink(folder.id) },
+    { label: '打包下载', icon: Package, run: () => downloadFolderZip(folder) },
+    { sep: true },
+    { label: '删除文件夹', icon: Trash2, danger: true, run: () => openDeleteFolder(folder) },
+  ];
 }
 
 function fileMenuItems(row) {
   return [
-    { label: '下载', run: () => addDownload(row) },
-    { label: '重命名', disabled: !row.hasManifest, run: () => openRenameFile(row) },
-    { label: '移动这批上传到…', run: () => openMoveBatch(row) },
-    { label: '复制文件分享链接', run: () => copyFileLink([row]) },
+    { label: '下载', icon: Download, run: () => addDownload(row) },
+    { label: '重命名', icon: File, disabled: !row.hasManifest, run: () => openRenameFile(row) },
+    { label: '移动这批上传到…', icon: Folder, run: () => openMoveBatch(row) },
+    { label: '复制文件分享链接', icon: Link2, run: () => copyFileLink([row]) },
     { sep: true },
-    { label: '删除文件', danger: true, run: () => openDeleteFile(row) },
+    { label: '删除文件', icon: Trash2, danger: true, run: () => openDeleteFile(row) },
   ];
 }
 
 function columnMenuItems(col) {
-  const items = [];
-  if (col.id !== '__unfiled__') {
-    items.push({ label: col.id ? '在此新建子文件夹' : '新建文件夹', run: () => openNewFolder(col.id) });
-  }
-  items.push({
-    label: '上传文件到此处',
-    run: () => chooseUpload(col.id && col.id !== '__unfiled__' ? col.id : null),
-  });
+  const items = [
+    { label: col.id ? '在此新建子文件夹' : '新建文件夹', icon: FolderPlus, run: () => openNewFolder(col.id) },
+    { label: '上传文件到此处', icon: Upload, run: () => chooseUpload(col.id || null) },
+  ];
   if (col.folder) {
     items.push(
-      { label: '复制文件夹链接', run: () => copyFolderLink(col.folder.id) },
-      { label: '打包下载', run: () => downloadFolderZip(col.folder) },
+      { label: '复制文件夹链接', icon: Link2, run: () => copyFolderLink(col.folder.id) },
+      { label: '打包下载', icon: Package, run: () => downloadFolderZip(col.folder) },
     );
   }
-  if (col.id === '__unfiled__') items.push({ sep: true }, { label: '系统目录，不能删除', disabled: true });
-  else if (col.folder && !col.folder.system) {
-    items.push({ sep: true }, { label: '删除文件夹', danger: true, run: () => openDeleteFolder(col.folder) });
+  if (col.folder) {
+    items.push({ sep: true }, { label: '删除文件夹', icon: Trash2, danger: true, run: () => openDeleteFolder(col.folder) });
   }
   return items;
 }
@@ -1013,8 +977,8 @@ function buildFolderZipItems(root) {
   const stack = [{ fid: root.id, prefix: root.name }];
   while (stack.length) {
     const { fid, prefix } = stack.pop();
-    const children = fid === '__unfiled__' ? [] : childrenOf(fid);
-    const files = allFileRows.value.filter((r) => (fid === '__unfiled__' ? !r.folderId : r.folderId === fid));
+    const children = childrenOf(fid);
+    const files = allFileRows.value.filter((r) => r.folderId === fid);
     if (!children.length && !files.length) items.push({ path: prefix, dir: true });
     for (const child of children) stack.push({ fid: child.id, prefix: `${prefix}/${child.name}` });
     for (const row of files) {
@@ -1060,41 +1024,35 @@ function clearDone() {
 function openPrompt(kind, title, value = '', target = null, message = '') {
   Object.assign(dialog, {
     open: true, kind, mode: 'prompt', title, message, value, error: '',
-    busy: false, destructive: false, confirmText: '确定', target, items: [],
+    busy: false, destructive: false, confirmText: '确定', target,
   });
 }
 
-function openConfirm(kind, title, message, target = null, items = []) {
+function openConfirm(kind, title, message, target = null) {
   Object.assign(dialog, {
     open: true, kind, mode: 'confirm', title, message, value: '', error: '',
-    busy: false, destructive: true, confirmText: '删除', target, items,
+    busy: false, destructive: true, confirmText: '删除', target,
   });
 }
 
 function openMoveFolder(folder) {
-  if (folder.system) return;
   Object.assign(dialog, {
     open: true, kind: 'move-folder', mode: 'move', title: '移动到…', message: '',
     value: folder.parentId || '', error: '', busy: false, destructive: false,
-    confirmText: '移动', target: { folder }, items: [],
+    confirmText: '移动', target: { folder },
   });
 }
 
 function openMoveBatch(row) {
   Object.assign(dialog, {
     open: true, kind: 'move-batch', mode: 'move', title: '移动这批上传到…', message: '',
-    value: row.folderId || '__unfiled__', error: '', busy: false, destructive: false,
-    confirmText: '移动', target: { row }, items: [],
+    value: row.folderId || '', error: '', busy: false, destructive: false,
+    confirmText: '移动', target: { row },
   });
 }
 
 function openNewFolder(parentId = undefined) {
-  let pid;
-  if (parentId === undefined) {
-    pid = currentId.value && currentId.value !== '__unfiled__' ? currentId.value
-      : currentId.value === '__unfiled__' ? '__unfiled__' : null;
-  } else pid = parentId;
-  if (pid === '__unfiled__') { toast('未分档是系统目录，不能新建子目录'); return; }
+  const pid = parentId === undefined ? (currentId.value || null) : (parentId || null);
   openPrompt('new-folder', '新建文件夹', '', { parentId: pid }, `最多 ${FOLDER_NAME_MAX} 个字；分享链接由目录 ID 固定，改名不会变。`);
 }
 
@@ -1135,7 +1093,6 @@ async function renameFileRow(row, newName) {
 }
 
 function openRenameFolder(folder) {
-  if (folder.system) return;
   openPrompt('rename-folder', '重命名文件夹', folder.name, { folder }, `最多 ${FOLDER_NAME_MAX} 个字；分享链接由目录 ID 固定，改名不会变。`);
 }
 
@@ -1224,7 +1181,6 @@ function startDeleteTask(title, items) {
 }
 
 function startFolderDelete(folder) {
-  if (folder.system) { toast('未分档是系统目录，不能删除'); return; }
   const { folders, batches } = collectFolderTree(folder.id);
   const items = [
     ...batches.map((batch) => ({ kind: 'batch', batch })),
@@ -1234,7 +1190,6 @@ function startFolderDelete(folder) {
 }
 
 function openDeleteFolder(folder) {
-  if (folder.system) { toast('未分档是系统目录，不能删除'); return; }
   openConfirm(
     'delete-folder',
     '删除文件夹？',
@@ -1249,11 +1204,7 @@ function openDeleteFile(row) {
 
 function openDeleteSelected() {
   if (!selectedItems.value.length) return;
-  if (!selectedItems.value.some((x) => x.type !== 'folder' || !x.folder.system)) {
-    toast('未分档是系统目录，不能删除');
-    return;
-  }
-  openConfirm('delete-selected', '删除选中的内容？', `将永久删除选中的 ${selectedItems.value.length} 项，不能撤销。`, null, selectedItems.value);
+  openConfirm('delete-selected', '删除选中的内容？', `将永久删除选中的 ${selectedItems.value.length} 项，不能撤销。`);
 }
 
 // 一键清空：确认词由服务端下发（/api/library 的 wipeConfirm），弹层在 components/WipeDialog.vue
@@ -1284,7 +1235,7 @@ function selectedDeleteItems() {
   const seenFolders = new Set();
   const folderIds = [];
   for (const item of selectedItems.value) {
-    if (item.type !== 'folder' || item.folder.system) continue;
+    if (item.type !== 'folder') continue;
     const tree = collectFolderTree(item.folder.id);
     for (const batch of tree.batches) {
       if (seenBatches.has(batch.name)) continue;
@@ -1355,6 +1306,7 @@ async function submitDialog() {
     }
     dialog.open = false;
     selected.value = [];
+    selectMode.value = false;
     await refreshLibrary();
   } catch (err) {
     dialog.error = err.message || '操作失败';
@@ -1421,7 +1373,7 @@ async function copyFileLink(rows) {
   const url = new URL(location.href);
   url.search = '';
   url.hash = '';
-  url.searchParams.set('f', rows[0].folderId || '__unfiled__');
+  if (rows[0].folderId) url.searchParams.set('f', rows[0].folderId);
   for (const row of rows) url.searchParams.append('file', `${row.batch}/${row.enc}`);
   const ok = await copyText(url.href);
   toast(ok
@@ -1451,8 +1403,7 @@ const httpsUrl = computed(() => {
 
 const moveOptions = computed(() => {
   const options = [];
-  if (dialog.kind === 'move-batch') options.push({ value: '__unfiled__', label: '未分档' });
-  options.push({ value: '', label: '全部文件（根）' });
+  options.push({ value: '', label: rootLabel });
   const excluded = new Set();
   if (dialog.kind === 'move-folder' && dialog.target?.folder) {
     excluded.add(dialog.target.folder.id);
@@ -1476,7 +1427,6 @@ const moveOptions = computed(() => {
 const treeRows = computed(() => {
   const children = new Map();
   for (const f of data.value.folders) {
-    if (f.id === '__unfiled__') continue;
     const pid = f.parentId || '__root__';
     if (!children.has(pid)) children.set(pid, []);
     children.get(pid).push(f);
@@ -1494,7 +1444,6 @@ const treeRows = computed(() => {
 });
 
 const dialogLimit = computed(() => (dialog.kind === 'rename-file' ? 120 : FOLDER_NAME_MAX));
-const dialogCharCount = computed(() => Array.from(String(dialog.value || '')).length);
 
 async function onTtlChange() {
   const next = Number(settingsTtl.value);
@@ -1512,6 +1461,26 @@ async function onTtlChange() {
   }
 }
 
+// 最外层「全部文件」那一栏的读数：它现在同时装根目录和没有目录的批次
+const rootSummary = computed(() => {
+  const folders = childrenOf(null);
+  const files = filesForFolder(null);
+  const stamps = [
+    ...folders.map((f) => (Number.isFinite(f.lastUpdatedAt) ? f.lastUpdatedAt : 0)),
+    ...files.map((r) => (Number.isFinite(r.uploadedAt) ? r.uploadedAt : 0)),
+  ];
+  const updated = Math.max(0, ...stamps);
+  return {
+    folders: folders.length,
+    files: files.length,
+    size: folders.reduce((n, f) => n + (f.size || 0), 0) + files.reduce((n, r) => n + (r.size || 0), 0),
+    lastUpdatedAt: updated || null,
+  };
+});
+const taskBadge = computed(() => tasks.value.filter((t) => !['done', 'canceled'].includes(t.state)).length
+  + pendingUploads.value.length);
+const showTaskPanel = computed(() => tasks.value.length > 0 || pendingUploads.value.length > 0);
+
 async function init() {
   loading.value = true;
   try {
@@ -1522,23 +1491,24 @@ async function init() {
     if (params.get('f')) currentId.value = params.get('f');
     else if (params.get('folder')) {
       const b = res.batches.find((x) => x.name === params.get('folder'));
-      currentId.value = b ? (b.folderId || '__unfiled__') : null;
+      currentId.value = b ? (b.folderId || null) : null;
     }
     shareFileRefs.value = params.getAll('file');
-    if (currentId.value && currentId.value !== '__unfiled__' && !res.folders.some((f) => f.id === currentId.value)) {
+    if (currentId.value && !res.folders.some((f) => f.id === currentId.value)) {
       currentId.value = null;
     }
     try { legacyNoticeDismissed.value = localStorage.getItem('fb-legacy-notice') === '1'; } catch { /* 隐私模式 */ }
     await loadFiles();
     if (shareFileRefs.value.length) {
       const hit = allFileRows.value.find((r) => shareFileRefs.value.includes(`${r.batch}/${r.enc}`));
-      if (hit) currentId.value = hit.folderId || '__unfiled__';
+      if (hit) currentId.value = hit.folderId || null;
     }
     applyShare();
     await refreshPending();
     await nextTick();
     scrollColumnsToEnd();
     setTimeout(scrollColumnsToEnd, 120);
+    watchColumnsDom();
   } catch (err) {
     error.value = err.message || '加载失败';
   } finally {
@@ -1547,8 +1517,38 @@ async function init() {
   pollTimer = setInterval(() => { if (!document.hidden) refreshLibrary({ silent: true }); }, 10_000);
 }
 
+// 键盘：Escape 分三层收（菜单 → 多选 → 搜索），Ctrl/Cmd+A 全选，Delete 删选中，/ 聚焦搜索。
+// 输入框里、中文输入法组合中、弹层开着时一律不抢，避免把编辑和浏览器快捷键做坏。
+function inTextField(el) {
+  return Boolean(el?.closest?.('input, textarea, select, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]'));
+}
+
 function onKeydown(event) {
-  if (event.key === 'Escape') closeMenu();
+  if (event.key === 'Escape') {
+    if (menu.value) { closeMenu(); return; }
+    if (sheet.open) return;              // 抽屉自己会关
+    if (dialog.open) return;             // 弹层自己会关
+    if (isSelecting.value) { exitSelect(); event.preventDefault(); return; }
+    if (searching.value) { query.value = ''; return; }
+    return;
+  }
+  if (event.isComposing || event.keyCode === 229) return;
+  if (inTextField(event.target)) return;
+  if (dialog.open || sheet.open) return;
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    toggleAll();
+    return;
+  }
+  if (event.key === '/' ) {
+    event.preventDefault();
+    document.querySelector('.search input')?.focus();
+    return;
+  }
+  if ((event.key === 'Delete' || ((event.ctrlKey || event.metaKey) && event.key === 'Backspace')) && selected.value.length) {
+    event.preventDefault();
+    openDeleteSelected();
+  }
 }
 
 function onResize() {
@@ -1561,7 +1561,14 @@ watch(searchTerm, (q) => {
   if (q && manifestState.value.size < data.value.batches.length) loadFiles();
 });
 
+// 手机上任务中心是抽屉：离开窄屏时把抽屉状态收掉，别留一个打不开的遮罩
+watch(isMobile, (mobile) => { if (!mobile) taskDrawer.value = false; });
+
+let stopKeyboardInset = null;
+let rowPointerDown = null;
+
 onMounted(() => {
+  stopKeyboardInset = useKeyboardInset();
   init();
   window.addEventListener('popstate', onPop);
   window.addEventListener('click', closeMenu);
@@ -1569,8 +1576,14 @@ onMounted(() => {
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('resize', onResize);
   document.addEventListener('paste', onPaste);
+  // 长按与"按住期间不许重绑 dnd"共用这一个捕获点：只在桌面分栏的行上生效
+  rowPointerDown = (e) => { pointerOnRow = Boolean(e.target?.closest?.('.col-row')); };
+  document.addEventListener('pointerdown', rowPointerDown, true);
+  document.addEventListener('pointerup', () => { pointerOnRow = false; scheduleBind(); }, true);
+  document.addEventListener('pointercancel', () => { pointerOnRow = false; }, true);
 });
 onBeforeUnmount(() => {
+  stopKeyboardInset?.();
   clearInterval(pollTimer);
   clearTimeout(toastTimer);
   clearTimeout(pulseTimer);
@@ -1582,64 +1595,71 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('resize', onResize);
   document.removeEventListener('paste', onPaste);
+  if (rowPointerDown) document.removeEventListener('pointerdown', rowPointerDown, true);
 });
 </script>
 
 <template>
   <div class="app">
-    <header class="topbar">
-      <div class="brand"><HardDrive :size="22" aria-hidden="true" /> 文件盒子</div>
-      <div class="crumb">
-        <template v-for="(c, i) in breadcrumb" :key="c.id || 'root'">
-          <ChevronRight v-if="i" :size="14" class="crumb-sep" aria-hidden="true" />
-          <button class="crumb-btn" :class="{ current: i === breadcrumb.length - 1 }" @click="navigate(c.id)">{{ c.name }}</button>
-        </template>
-      </div>
-      <label class="search">
-        <Search :size="16" aria-hidden="true" />
-        <input v-model="query" type="search" placeholder="搜索全部文件夹和文件" aria-label="全局搜索文件夹和文件">
-      </label>
-      <div class="toolbar-actions">
-        <span class="topbar-usage" :title="`已用 ${fmtSize(data.usage.used)} / 上限 ${data.usage.limitGB} GB；累计下载 ${data.downloadsTotal || 0} 次`">{{ fmtSize(data.usage.used) }} / {{ data.usage.limitGB }} GB · 累计下载 {{ data.downloadsTotal || 0 }} 次</span>
-        <button class="btn btn-primary" @click="triggerUpload"><Upload :size="18" /> <span class="lbl-full">上传到「{{ uploadTargetLabel }}」</span><span class="lbl-short">上传</span></button>
-        <a class="btn" href="../transfer.html"><span class="lbl-full">无痕传输</span><span class="lbl-short">传输</span></a>
-        <button class="btn only-mobile" aria-label="设置" title="容量 / 自动删除 / 清理" @click="settingsOpen = true"><Settings :size="18" /></button>
-      </div>
-    </header>
+    <TopBar
+      :breadcrumb="breadcrumb"
+      :query="query"
+      :usage="data.usage"
+      :downloads-total="data.downloadsTotal || 0"
+      :upload-label="uploadTargetLabel"
+      :task-badge="taskBadge"
+      :show-tasks="showTaskPanel"
+      :is-mobile="isMobile"
+      @navigate="navigate"
+      @update:query="query = $event"
+      @upload="triggerUpload"
+      @open-tasks="taskDrawer = true"
+      @open-settings="settingsOpen = true"
+    />
 
     <div class="config-strip">
-      <Clock :size="16" class="config-icon" aria-hidden="true" />
-      <span class="config-label">所有新上传：</span>
+      <Clock :size="15" class="config-icon" aria-hidden="true" />
+      <span class="config-label">所有新上传</span>
       <select
         id="ttl-select"
         v-model.number="settingsTtl"
-        class="ttl ttl-global"
+        class="input ttl-global"
         aria-label="所有新上传的自动删除时长"
         :disabled="settingsSaving || libraryNotReady"
         @change="onTtlChange"
       >
         <option v-for="h in ttlOptions" :key="h" :value="h">{{ ttlLabel(h) }}后自动删除</option>
       </select>
-      <span class="config-hint" v-if="!libraryNotReady" :title="ttlHint">{{ ttlHint }}</span>
+      <span class="config-hint" v-if="!libraryNotReady">{{ ttlHint }}</span>
       <span class="config-hint" v-else>目录索引暂不可用，自动删除设置暂时不能修改。</span>
-      <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="wipeOpen = true"><Trash2 :size="15" aria-hidden="true" /><span class="wipe-label">清空所有文件…</span></button>
+      <button class="linkbtn danger-text wipe-open" title="清空服务器上的所有文件（保留文件夹、全局设置与历史下载次数）" aria-label="清空所有文件" @click="wipeOpen = true">
+        <Trash2 :size="14" aria-hidden="true" /><span>清空所有文件</span>
+      </button>
     </div>
 
     <div class="layout">
       <main class="main">
-        <div v-if="libraryNotReady" class="banner">目录索引暂不可用，当前按未分档展示；上传与下载仍可用。</div>
-        <div v-if="httpsUrl" class="banner">
+        <div v-if="libraryNotReady" class="banner info">
+          <Info :size="15" aria-hidden="true" />
+          目录索引暂不可用，当前所有文件都在最外层展示；上传与下载仍可用。
+        </div>
+        <div v-if="httpsUrl" class="banner info">
+          <Info :size="15" aria-hidden="true" />
           当前是 HTTP 兼容模式，加解密会慢一个数量级。改用 <a :href="httpsUrl">HTTPS 地址</a> 可大幅提速（首次需信任自签证书）。
         </div>
-        <div v-if="currentId === null && legacyUnfiledCount && !legacyNoticeDismissed" class="banner">
-          旧上传已归到「未分档」，原链接和下载次数不变。
-          <button class="linkbtn" @click="navigate('__unfiled__')">去整理</button>
+        <div v-if="currentId === null && legacyUnfiledCount && !legacyNoticeDismissed" class="banner info">
+          <Info :size="15" aria-hidden="true" />
+          旧上传就排在「全部文件」里（没有归属目录），原链接和下载次数不变。
           <button class="linkbtn" @click="dismissLegacyNotice">知道了</button>
         </div>
-        <div v-if="error" class="banner danger">{{ error }} <button class="linkbtn" @click="refreshLibrary()">重试</button></div>
-        <div v-if="manifestError" class="banner danger">部分文件名读取失败：{{ manifestError }} <button class="linkbtn" @click="loadFiles()">重试</button></div>
+        <div v-if="error" class="banner danger" role="alert">
+          {{ error }} <button class="linkbtn" @click="refreshLibrary()">重试</button>
+        </div>
+        <div v-if="manifestError" class="banner danger" role="alert">
+          部分文件名读取失败：{{ manifestError }} <button class="linkbtn" @click="loadFiles()">重试</button>
+        </div>
         <div v-if="shareBanner || shareMissing" class="banner share">
-          <Link2 :size="16" aria-hidden="true" />
+          <Link2 :size="15" aria-hidden="true" />
           <template v-if="shareRows.length">
             分享链接里有 {{ shareRows.length }} 个文件，所在文件夹已高亮：
             <button v-for="row in shareRows.slice(0, 6)" :key="row.key" class="linkbtn share-file" @click="focusShared(row)">{{ row.name }}</button>
@@ -1649,337 +1669,165 @@ onBeforeUnmount(() => {
           <button class="linkbtn" @click="dismissShare">关闭</button>
         </div>
 
+        <!-- 读屏播报位：只报"文件名读到第几份"。整块列表每 10 秒轮询、相对时间每 15 秒重算，
+             把 aria-live 挂在列表上会让读屏周期性地把整栏重念一遍。 -->
+        <span class="sr-only" role="status">{{ filesLoading ? `正在读取文件名 ${manifestProgress.done}/${manifestProgress.total}` : '' }}</span>
+
         <div class="tool-row">
           <span class="tool-status">上传到 <b>{{ uploadTargetLabel }}</b> · {{ uploadTtlText }}<span v-if="filesLoading"> · 正在读取文件名 {{ manifestProgress.done }}/{{ manifestProgress.total }}</span></span>
           <span class="tool-count" :class="{ on: selected.length }">{{ selected.length ? `已选 ${selected.length} 项` : '未选择' }}</span>
           <div class="tool-actions">
-            <button class="linkbtn tool-btn" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll">
-              <ListChecks :size="17" aria-hidden="true" /><span class="tool-label">全选当前可见</span>
+            <button class="linkbtn tool-btn" :aria-pressed="String(allSelectedNow)" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll">
+              <ListChecks :size="16" aria-hidden="true" /><span class="tool-label">全选</span>
             </button>
             <button class="linkbtn tool-btn" :disabled="!selectedFileCount" title="复制分享链接" aria-label="复制分享链接" @click="copySelectedShare">
-              <Link2 :size="17" aria-hidden="true" /><span class="tool-label">复制分享链接</span>
+              <Link2 :size="16" aria-hidden="true" /><span class="tool-label">复制分享链接</span>
             </button>
             <button class="linkbtn tool-btn" :disabled="!selected.length" title="打包下载" aria-label="打包下载" @click="downloadSelectedZip">
-              <Package :size="17" aria-hidden="true" /><span class="tool-label">打包下载</span>
+              <Package :size="16" aria-hidden="true" /><span class="tool-label">打包下载</span>
             </button>
             <button class="linkbtn tool-btn danger-text" :disabled="!selected.length" title="删除" aria-label="删除" @click="openDeleteSelected">
-              <Trash2 :size="17" aria-hidden="true" /><span class="tool-label">删除</span>
+              <Trash2 :size="16" aria-hidden="true" /><span class="tool-label">删除</span>
             </button>
-            <button class="linkbtn tool-btn" :disabled="!selected.length" title="取消选择" aria-label="取消选择" @click="selected = []">
-              <X :size="17" aria-hidden="true" /><span class="tool-label">取消</span>
+            <button class="linkbtn tool-btn" :disabled="!selected.length" title="取消选择" aria-label="取消选择" @click="exitSelect">
+              <X :size="16" aria-hidden="true" /><span class="tool-label">取消</span>
             </button>
           </div>
         </div>
 
-        <section v-if="searching" class="search-panel">
-          <div class="search-head">
-            <Search :size="18" aria-hidden="true" />
-            <b>全局搜索「{{ searchTerm }}」</b>
-            <span class="muted">文件夹名与文件名都会匹配；结果带出所在目录。</span>
-          </div>
-          <div v-if="filesLoading" class="search-loading">正在读取文件名 {{ manifestProgress.done }}/{{ manifestProgress.total }}…</div>
-
-          <div v-if="searchFolders.length" class="result-group">
-            <h3>文件夹 · {{ searchFolders.length }}</h3>
-            <button v-for="item in searchFolders" :key="item.folder.id" class="result-row" @click="navigate(item.folder.id)">
-              <Folder :size="18" class="row-icon folder-icon" />
-              <span class="result-name">{{ item.folder.name }}</span>
-              <span class="result-path">{{ item.path }}</span>
-              <span class="result-meta">{{ folderRowMeta(item.folder) }}</span>
-            </button>
-          </div>
-
-          <div v-if="searchFileResults.length" class="result-group">
-            <h3>文件 · {{ searchFileResults.length }}<span v-if="searchFileResults.length >= 300" class="muted">（只显示前 300 条）</span></h3>
-            <button v-for="item in searchFileResults" :key="item.row.key" class="result-row" @click="navigateToFile(item.row)">
-              <File :size="18" class="row-icon file-icon" />
-              <span class="result-name">{{ item.row.name }}</span>
-              <span class="result-path">{{ item.path }}</span>
-              <span class="result-meta">
-                {{ fmtAgo(item.row.uploadedAt, now) }} ·
-                <span :class="expiryClass(item.row.expiresAt, now)">{{ fmtExpiry(item.row.expiresAt, now) }}</span>
-              </span>
-            </button>
-          </div>
-
-          <div v-if="!filesLoading && !searchFolders.length && !searchFileResults.length" class="empty">
-            <Search :size="32" />
-            <p>没有匹配的文件夹或文件</p>
-          </div>
-        </section>
+        <SearchPanel
+          v-if="searching"
+          :term="searchTerm"
+          :folders="searchFolders"
+          :files="searchFileResults"
+          :loading="filesLoading"
+          :progress="manifestProgress"
+          :now="now"
+          @open-folder="navigate"
+          @open-file="navigateToFile"
+        />
 
         <section v-else class="browser" :class="{ loading }">
-          <div v-if="loading" class="empty">加载中…</div>
-          <div v-else ref="columnsEl" class="columns">
-            <section
-              v-for="col in columns"
-              :key="col.key"
-              class="column"
-              :class="{ 'drop-target': dragTargetKey === col.key, 'drop-here': dndOverCol === col.key }"
-            >
-              <header class="col-head">
-                <div class="col-title">
-                  <Inbox v-if="col.id === '__unfiled__'" :size="18" class="folder-icon" />
-                  <Folder v-else :size="18" class="folder-icon" />
-                  <div class="col-title-text">
-                    <b class="ellipsis">{{ colLabel(col) }}</b>
-                    <span class="col-sub">{{ colMeta(col) }}</span>
-                  </div>
-                </div>
-                <div class="col-tools">
-                  <label v-if="col.folders.length || col.files.length" class="check-hit">
-                    <input
-                      type="checkbox"
-                      class="col-check"
-                      :checked="allSelectedIn(columnKeys(col))"
-                      :aria-label="`全选 ${colLabel(col)}`"
-                      @change="toggleColumn(col)"
-                    >
-                  </label>
-                  <button
-                    v-if="col.folder"
-                    class="icon-btn col-icon"
-                    title="打包下载这个文件夹"
-                    aria-label="打包下载这个文件夹"
-                    @click="downloadFolderZip(col.folder)"
-                  ><Package :size="16" /></button>
-                  <button
-                    v-if="col.id !== '__unfiled__'"
-                    class="icon-btn col-icon"
-                    title="新建文件夹"
-                    aria-label="新建文件夹"
-                    @click="openNewFolder(col.id)"
-                  ><FolderPlus :size="16" /></button>
-                  <button
-                    class="icon-btn col-icon"
-                    title="更多操作"
-                    aria-label="更多操作"
-                    @click.stop="showMenuFor($event, col.folder ? folderMenuItems(col.folder) : columnMenuItems(col))"
-                  >⋯</button>
-                </div>
-              </header>
-
-              <div
-                class="col-list"
-                @contextmenu.prevent="openColumnMenu($event, col)"
-                @dragover="onColumnDragOver($event, col)"
-                @dragleave="onColumnDragLeave($event, col)"
-                @drop="onColumnDrop($event, col)"
-              >
-                <div
-                  v-for="folder in col.folders"
-                  :key="folder.id"
-                  class="col-row folder-row"
-                  data-dnd-kind="folder"
-                  :data-dnd-id="folder.id"
-                  :class="{
-                    selected: isSelected(`folder:${folder.id}`),
-                    current: pathIds.has(folder.id),
-                    shared: sharedFolderIds.has(folder.id),
-                    'drop-here': dndOverId === folder.id,
-                  }"
-                  @click="navigate(folder.id)"
-                  @contextmenu.prevent.stop="openFolderMenu($event, folder)"
-                >
-                  <label class="check-hit" @click.stop>
-                    <input
-                      type="checkbox"
-                      class="col-check"
-                      :checked="isSelected(`folder:${folder.id}`)"
-                      :aria-label="`选择 ${folder.name}`"
-                      @change="toggleSelect(`folder:${folder.id}`)"
-                    >
-                  </label>
-                  <Folder :size="20" class="row-icon folder-icon" />
-                  <span class="col-name" :title="folder.name"><span class="name-text">{{ folder.name }}</span>
-                    <span v-if="folder.system" class="tag">系统</span>
-                  </span>
-                  <span class="col-meta">{{ folderRowMeta(folder) }}</span>
-                  <span v-if="folder.earliestExpiresAt" :class="expiryClass(folder.earliestExpiresAt, now)" class="col-expiry">
-                    {{ fmtExpiry(folder.earliestExpiresAt, now) }}
-                  </span>
-                  <button class="icon-btn col-more" title="更多操作" aria-label="更多操作" @click.stop="showMenuFor($event, folderMenuItems(folder))">⋯</button>
-                </div>
-
-                <div
-                  v-for="p in col.pending"
-                  :key="p.key"
-                  class="col-row pending-row"
-                  aria-busy="true"
-                  :aria-label="`${p.name} ${p.paused ? '已暂停' : '上传中'}，${Math.round(p.progress * 100)}%`"
-                >
-                  <span class="check-hit"></span>
-                  <File :size="20" class="row-icon file-icon" />
-                  <span class="col-name"><span class="name-text">{{ p.name }}</span>
-                    <span class="tag">{{ p.paused ? '已暂停' : '上传中' }}</span>
-                  </span>
-                  <span class="col-meta">{{ fmtSize(p.size) }} · {{ Math.round(p.progress * 100) }}%</span>
-                  <span
-                    class="pending-track"
-                    role="progressbar"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    :aria-valuenow="Math.round(p.progress * 100)"
-                  >
-                    <span class="pending-fill" :style="{ width: `${Math.round(p.progress * 100)}%` }"></span>
-                  </span>
-                </div>
-
-                <div
-                  v-for="row in col.files"
-                  :key="row.key"
-                  class="col-row file-row"
-                  data-dnd-kind="file"
-                  :data-dnd-id="row.key"
-                  :class="{
-                    selected: isSelected(row.key),
-                    shared: sharedFileKeys.has(row.key),
-                    pulse: pulseKeys.has(row.key),
-                    expiring: isExpiring(row),
-                  }"
-                  @click="toggleSelect(row.key)"
-                  @dblclick="addDownload(row)"
-                  @contextmenu.prevent.stop="openFileMenu($event, row)"
-                >
-                  <label class="check-hit" @click.stop>
-                    <input
-                      type="checkbox"
-                      class="col-check"
-                      :checked="isSelected(row.key)"
-                      :aria-label="`选择 ${row.name}`"
-                      @change="toggleSelect(row.key)"
-                    >
-                  </label>
-                  <File :size="20" class="row-icon file-icon" />
-                  <span class="col-name" :title="row.name"><span class="name-text">{{ row.name }}</span>
-                    <span v-if="isHot(row.uploadedAt, now)" class="tag hot">热乎</span>
-                    <span v-if="sharedFileKeys.has(row.key)" class="tag share-tag">分享</span>
-                    <span v-if="row.legacy" class="tag">旧数据</span>
-                    <span v-if="row.missingMeta" class="tag warn">清单缺失</span>
-                  </span>
-                  <span class="col-meta" :title="fmtFullTime(row.uploadedAt)"><b class="col-size">{{ fmtSize(row.size || 0) }}</b> · {{ fmtUploaded(row.uploadedAt) }} · {{ fmtAgo(row.uploadedAt, now) }} · {{ dlText(row.downloads) }}</span>
-                  <span :class="expiryClass(row.expiresAt, now)" class="col-expiry">{{ fmtExpiry(row.expiresAt, now) }}</span>
-                  <button class="icon-btn col-more" title="更多操作" aria-label="更多操作" @click.stop="showMenuFor($event, fileMenuItems(row))">⋯</button>
-                </div>
-
-                <div v-if="!col.folders.length && !col.pending.length && !col.files.length" class="col-empty">
-                  <Folder :size="28" />
-                  <p>{{ col.id === '__unfiled__' ? '未分档还没有文件' : '空文件夹' }}</p>
-                  <p class="muted">右键可新建文件夹，或把文件拖到这里上传</p>
-                </div>
-              </div>
-
-              <div v-if="dragTargetKey === col.key" class="col-drop">松手上传到「{{ colLabel(col) === '全部文件' ? '未分档' : colLabel(col) }}」</div>
-            </section>
+          <div v-if="loading" class="empty">
+            <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
           </div>
+          <ColumnBrowser
+            v-else-if="!isMobile"
+            ref="desktopBrowser"
+            :columns="columns"
+            :now="now"
+            :root-label="rootLabel"
+            :root-summary="rootSummary"
+            :path-ids="pathIds"
+            :selected-keys="selectedSet"
+            :column-keys="columnKeys"
+            :shared-folder-ids="sharedFolderIds"
+            :shared-file-keys="sharedFileKeys"
+            :pulse-keys="pulseKeys"
+            :expiring-keys="expiringKeys"
+            :dnd-over-id="dndOverId || ''"
+            :dnd-over-col="dndOverCol || ''"
+            :drag-target-key="dragTargetKey"
+            @navigate="navigate"
+            @select="toggleSelect"
+            @toggle-column="toggleColumn"
+            @more-folder="(e, f) => openFolderMenu(e, f)"
+            @more-file="(e, r) => openFileMenu(e, r)"
+            @more-column="(e, c) => openColumnMenu(e, c)"
+            @column-contextmenu="(e, c) => openColumnMenu(e, c)"
+            @folder-contextmenu="(e, f) => openFolderMenu(e, f)"
+            @file-contextmenu="(e, r) => openFileMenu(e, r)"
+            @download-file="addDownload"
+            @dragover="onColumnDragOver"
+            @dragleave="onColumnDragLeave"
+            @drop="onColumnDrop"
+            @new-folder="openNewFolder"
+            @zip-folder="downloadFolderZip"
+          />
+          <MobileBrowser
+            v-else
+            :col="currentCol"
+            :path="breadcrumb"
+            :now="now"
+            :root-label="rootLabel"
+            :selected-keys="selectedSet"
+            :shared-folder-ids="sharedFolderIds"
+            :shared-file-keys="sharedFileKeys"
+            :pulse-keys="pulseKeys"
+            :expiring-keys="expiringKeys"
+            :selecting="isSelecting"
+            :all-selected="allSelectedNow"
+            @back="goBack"
+            @navigate="navigate"
+            @select="toggleSelect"
+            @longpress="enterSelect"
+            @sheet-folder="openFolderSheet"
+            @sheet-file="openFileSheet"
+            @new-folder="openNewFolder"
+            @upload="triggerUpload"
+            @zip="downloadFolderZip"
+            @toggle-all="allSelectedNow ? exitSelect() : toggleAll()"
+          />
         </section>
 
-        <section v-if="tasks.length || pendingUploads.length" class="tasks">
-          <div class="tasks-head">
-            <h2><ListChecks :size="18" /> 任务</h2>
-            <button v-if="tasks.length" class="linkbtn" @click="clearDone">清理已完成</button>
-          </div>
-
-          <div v-for="p in pendingUploads" :key="p.uploadId" class="task pending">
-            <div class="task-main">
-              <div class="task-title">未完成上传 · {{ p.fileCount }} 个文件</div>
-              <div class="task-sub">已收 {{ p.receivedChunks }}/{{ p.totalChunks }} 块 · {{ fmtSize(p.bytes) }}</div>
-            </div>
-            <div class="task-actions">
-              <button class="linkbtn" @click="resumeUpload(p)">重新选择同一批文件继续</button>
-              <button class="linkbtn danger-text" @click="cancelPending(p)">删除</button>
-            </div>
-          </div>
-
-          <div v-for="task in tasks" :key="task.id" class="task" :class="task.state">
-            <div class="task-main">
-              <div class="task-title">
-                <component :is="task.kind === 'upload' ? Upload : task.kind === 'folder-delete' ? Trash2 : task.kind === 'zip' ? Package : Download" :size="16" />
-                <span class="ellipsis">{{ task.title }}</span>
-                <span class="task-state">{{ stateText(task) }}</span>
-              </div>
-              <div class="bar"><span :style="{ width: `${taskPct(task)}%` }"></span></div>
-              <div class="task-sub">{{ taskMeta(task) }}<span v-if="task.error" class="danger-text"> · {{ task.error }}</span></div>
-            </div>
-            <div class="task-actions">
-              <template v-if="task.kind === 'upload'">
-                <button v-if="task.state === 'running'" class="icon-btn" title="暂停" @click="task.pause()"><Pause :size="16" /></button>
-                <button v-else-if="['paused','failed'].includes(task.state)" class="icon-btn" title="继续" @click="task.resume()"><Play :size="16" /></button>
-                <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
-                <button v-if="task.state === 'done'" class="linkbtn" @click="task.openResult()">打开所在目录</button>
-              </template>
-              <template v-else-if="task.kind === 'download' || task.kind === 'zip'">
-                <button v-if="task.state === 'running'" class="icon-btn" title="暂停" @click="task.pause()"><Pause :size="16" /></button>
-                <button v-else-if="['paused','failed'].includes(task.state)" class="icon-btn" title="继续" @click="task.resume()"><Play :size="16" /></button>
-                <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
-              </template>
-              <template v-else>
-                <button v-if="task.state === 'running'" class="icon-btn" title="暂停" @click="task.pause()"><Pause :size="16" /></button>
-                <button v-else-if="['paused','failed'].includes(task.state)" class="icon-btn" title="继续" @click="task.resume()"><Play :size="16" /></button>
-                <button v-if="!['done','canceled'].includes(task.state)" class="linkbtn danger-text" @click="task.cancel()">取消</button>
-              </template>
-              <button v-if="['done','canceled'].includes(task.state)" class="linkbtn" @click="task.remove()">移除</button>
-            </div>
-          </div>
-        </section>
+        <TaskCenter
+          v-if="showTaskPanel && !isMobile"
+          :tasks="tasks"
+          :pending-uploads="pendingUploads"
+          :expanded="tasksOpen"
+          @toggle="tasksOpen = !tasksOpen"
+          @clear-done="clearDone"
+          @resume-pending="resumeUpload"
+          @cancel-pending="cancelPending"
+        />
       </main>
     </div>
 
     <input ref="fileInput" type="file" multiple hidden @change="onFilesPicked">
 
-    <div v-if="toastText" class="toast">{{ toastText }}</div>
+    <div v-if="toastText" class="toast" role="status">{{ toastText }}</div>
 
-    <div v-if="menu" class="context-menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @click.stop>
-      <template v-for="(item, i) in menu.items" :key="i">
-        <div v-if="item.sep" class="menu-sep"></div>
-        <button
-          v-else
-          class="menu-item"
-          :class="{ danger: item.danger }"
-          :disabled="item.disabled"
-          @click.stop="runMenu(item)"
-        >{{ item.label }}</button>
-      </template>
-    </div>
+    <ContextMenu v-if="menu" :pos="{ x: menu.x, y: menu.y }" :items="menu.items" @run="runMenu" />
 
-    <DialogRoot :open="dialog.open" @update:open="dialog.open = $event">
-      <DialogPortal>
-        <DialogOverlay class="dialog-overlay" />
-        <DialogContent class="dialog" @keydown.enter="onDialogEnter">
-          <DialogTitle as-child><h3>{{ dialog.title }}</h3></DialogTitle>
-          <DialogDescription as-child><p v-if="dialog.message">{{ dialog.message }}</p></DialogDescription>
-          <input
-            v-if="dialog.mode === 'prompt'"
-            v-model="dialog.value"
-            class="input"
-            :maxlength="dialogLimit"
-            :placeholder="dialog.kind === 'rename-file' ? '新文件名' : `名称（最多 ${FOLDER_NAME_MAX} 个字）`"
-          >
-          <div v-if="dialog.mode === 'prompt' && dialog.kind !== 'rename-file'" class="char-count" :class="{ over: dialogCharCount > FOLDER_NAME_MAX }">
-            {{ dialogCharCount }}/{{ FOLDER_NAME_MAX }}
-          </div>
-          <select v-if="dialog.mode === 'move'" v-model="dialog.value" class="input">
-            <option v-for="opt in moveOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-          </select>
-          <div v-if="dialog.error" class="dialog-error">{{ dialog.error }}</div>
-          <div class="dialog-actions">
-            <DialogClose as-child><button class="btn">取消</button></DialogClose>
-            <button class="btn dialog-primary" :class="dialog.destructive ? 'btn-danger' : 'btn-primary'" :disabled="dialog.busy" @click="submitDialog">
-              {{ dialog.busy ? '处理中…' : dialog.confirmText }}
-            </button>
-          </div>
-        </DialogContent>
-      </DialogPortal>
-    </DialogRoot>
+    <ActionSheet
+      v-model:open="sheet.open"
+      :title="sheet.title"
+      :subtitle="sheet.subtitle"
+      :items="sheet.items"
+      @run="runMenu"
+    />
 
-    <div class="action-bar">
-      <span class="action-count">{{ selected.length ? `${selected.length} 项` : '选择文件' }}</span>
+    <AppDialog
+      v-model:open="dialog.open"
+      :dialog="dialog"
+      :move-options="moveOptions"
+      :limit="dialogLimit"
+      :name-max="FOLDER_NAME_MAX"
+      @update:value="dialog.value = $event"
+      @submit="submitDialog"
+      @enter="onDialogEnter"
+    />
+
+    <div v-if="isMobile && isSelecting" class="action-bar">
+      <span class="action-count" :class="{ on: selected.length }">
+        {{ selected.length ? `已选 ${selected.length} 项` : '长按文件进入多选' }}
+      </span>
       <div class="action-items">
-        <button class="linkbtn tool-btn" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll"><ListChecks :size="18" aria-hidden="true" /></button>
-        <button class="linkbtn tool-btn" :disabled="!selectedFileCount" title="复制分享链接" aria-label="复制分享链接" @click="copySelectedShare"><Link2 :size="18" aria-hidden="true" /></button>
-        <button class="linkbtn tool-btn" :disabled="!selected.length" title="打包下载" aria-label="打包下载" @click="downloadSelectedZip"><Package :size="18" aria-hidden="true" /></button>
-        <button class="linkbtn tool-btn danger-text" :disabled="!selected.length" title="删除" aria-label="删除" @click="openDeleteSelected"><Trash2 :size="18" aria-hidden="true" /></button>
-        <button class="linkbtn tool-btn" :disabled="!selected.length" title="取消选择" aria-label="取消选择" @click="selected = []"><X :size="18" aria-hidden="true" /></button>
+        <button class="linkbtn tool-btn" :aria-pressed="String(allSelectedNow)" title="全选当前可见" aria-label="全选当前可见" @click="toggleAll">
+          <ListChecks :size="18" aria-hidden="true" />
+        </button>
+        <button class="linkbtn tool-btn" :disabled="!selectedFileCount" title="复制分享链接" aria-label="复制分享链接" @click="copySelectedShare">
+          <Link2 :size="18" aria-hidden="true" />
+        </button>
+        <button class="linkbtn tool-btn" :disabled="!selected.length" title="打包下载" aria-label="打包下载" @click="downloadSelectedZip">
+          <Package :size="18" aria-hidden="true" />
+        </button>
+        <button class="linkbtn tool-btn danger-text" :disabled="!selected.length" title="删除" aria-label="删除" @click="openDeleteSelected">
+          <Trash2 :size="18" aria-hidden="true" />
+        </button>
+        <button class="linkbtn tool-btn" title="取消选择" aria-label="取消选择" @click="exitSelect">
+          <X :size="18" aria-hidden="true" />
+        </button>
       </div>
     </div>
 
@@ -2004,5 +1852,17 @@ onBeforeUnmount(() => {
       :bytes="wipeStats.bytes"
       @done="onWiped"
     />
+
+    <TaskDrawer v-if="isMobile" v-model:open="taskDrawer">
+      <TaskCenter
+        :tasks="tasks"
+        :pending-uploads="pendingUploads"
+        :expanded="true"
+        :show-header="false"
+        @clear-done="clearDone"
+        @resume-pending="resumeUpload"
+        @cancel-pending="cancelPending"
+      />
+    </TaskDrawer>
   </div>
 </template>

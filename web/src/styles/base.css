@@ -1,0 +1,263 @@
+/* =============================================================================
+   base.css — 重置、排印、焦点、以及所有界面共用的控件原子。
+   这一层不认识"顶栏""列表"这些概念，只定义 .btn / .input / .tag / .bar 之类。
+   ============================================================================= */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #app { min-height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font: 400 var(--fs-lg)/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* 手机上横向溢出多半不是内容宽，而是某个 absolute/负 margin 越界；
+     这里不写 overflow-x:hidden —— 那会把 body 变成滚动容器，毁掉 position:sticky。
+     溢出留给各块自己用 min-width:0 收。 */
+  overscroll-behavior-y: none;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
+button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3, p, ul { margin: 0; }
+ul { padding: 0; list-style: none; }
+
+/* 焦点：只给键盘用户。2px 实环 + 1px 外圈，压浅底压深底都看得见。 */
+:where(button, a, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: inherit;
+}
+:focus:not(:focus-visible) { outline: none; }
+
+/* 滚动条：细、跟随主题，不占布局宽度 */
+* { scrollbar-width: thin; scrollbar-color: var(--sep-strong) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--sep-strong);
+  border: 3px solid transparent;
+  border-radius: var(--r-pill);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--ink-3); background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- 原子：按钮 ---- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background var(--d-1) var(--ease), border-color var(--d-1) var(--ease),
+              transform var(--d-1) var(--ease), filter var(--d-1) var(--ease);
+}
+.btn:hover:not(:disabled) { background: var(--fill); border-color: transparent; }
+.btn:active:not(:disabled) { transform: scale(0.98); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
+.btn-primary:active:not(:disabled) { background: var(--accent-active); }
+
+.btn-danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: var(--on-danger);
+  font-weight: 600;
+}
+/* .btn:hover 权重 (0,2,0) 高于 .btn-danger (0,1,0)：不给它自己的 hover，
+   悬停会把底色换成 --fill，字压在低对比的底上直接看不见 */
+.btn-danger:hover:not(:disabled) { background: var(--danger); border-color: transparent; filter: brightness(1.08); }
+.btn-danger:active:not(:disabled) { filter: brightness(0.92); }
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-2);
+  transition: background var(--d-1) var(--ease), color var(--d-1) var(--ease),
+              transform var(--d-1) var(--ease);
+}
+.icon-btn:hover:not(:disabled) { background: var(--fill); color: var(--ink); }
+.icon-btn:active:not(:disabled) { background: var(--fill-2); transform: scale(0.94); }
+.icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.icon-btn.is-active { background: var(--sel); color: var(--sel-ink); }
+
+/* 文字按钮：菜单项、行内动作、banner 里的"重试"都用它 */
+.linkbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  min-height: 30px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-md);
+  transition: background var(--d-1) var(--ease), color var(--d-1) var(--ease);
+}
+.linkbtn:hover:not(:disabled) { background: var(--fill); text-decoration: none; }
+.linkbtn:active:not(:disabled) { background: var(--fill-2); }
+.linkbtn:disabled { opacity: 0.45; cursor: not-allowed; }
+.linkbtn.danger-text { color: var(--danger); }
+.linkbtn.danger-text:hover:not(:disabled) { background: var(--danger-soft); }
+
+/* ---- 原子：输入 ---- */
+.input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--sep-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--ink);
+  font-size: 16px;                     /* iOS 聚焦 <16px 的框会整页强制放大且回不去 */
+  transition: border-color var(--d-1) var(--ease), background var(--d-1) var(--ease);
+}
+.input:hover { border-color: var(--ink-3); }
+.input:focus { border-color: var(--accent); background: var(--surface); outline: none; }
+.input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.input::placeholder { color: var(--ink-3); }
+
+select.input {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: var(--sp-7);
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-2) 50%),
+                    linear-gradient(135deg, var(--ink-2) 50%, transparent 50%);
+  background-position: calc(100% - 15px) calc(50% + 2px), calc(100% - 10px) calc(50% + 2px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+/* ---- 原子：标签 / 状态 ---- */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 1px var(--sp-2);
+  border-radius: var(--r-xs);
+  background: var(--fill-3);
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.hot { background: var(--sel); color: var(--sel-ink); }
+.tag.share-tag { background: var(--ok-soft); color: var(--ok); }
+.tag.accent { background: var(--sel); color: var(--sel-ink); }
+
+.expiry-warn { color: var(--warn); }
+.expiry-danger { color: var(--danger); font-weight: 600; }
+.danger-text { color: var(--danger); }
+.ok-text { color: var(--ok); }
+.muted { color: var(--ink-2); }
+.ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 只给读屏看的播报位。别把 aria-live 挂在会周期性变化的整块容器上。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 数字一律等宽，读数跳动时不会把旁边的字推走 */
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---- 原子：进度条 ---- */
+.bar {
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--fill-2);
+  overflow: hidden;
+}
+.bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+  transition: width var(--d-2) var(--ease-io);
+}
+.done > .bar > span, .task.done .bar > span { background: var(--ok); }
+.failed > .bar > span, .task.failed .bar > span { background: var(--danger); }
+.paused > .bar > span, .task.paused .bar > span { background: var(--warn); }
+
+/* ---- 原子：卡片 / 空态 ---- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-1);
+}
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-8) var(--sp-5);
+  color: var(--ink-2);
+  text-align: center;
+}
+.empty > svg { color: var(--ink-3); }
+.empty p { font-size: var(--fs-md); }
+.empty .muted { font-size: var(--fs-sm); }
+.empty-actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; justify-content: center; }
+
+/* 骨架屏：加载时占住行高，避免"内容回来整页跳一下" */
+.skeleton {
+  height: var(--row-h);
+  margin: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: linear-gradient(90deg, var(--fill) 25%, var(--fill-2) 50%, var(--fill) 75%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s var(--ease-io) infinite;
+}
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .skeleton { animation: none; background: var(--fill); }
+}

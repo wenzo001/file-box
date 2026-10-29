@@ -1,6 +1,9 @@
 import { createApp } from 'vue';
 import App from './App.vue';
-import './styles/app.css';
+import './styles/tokens.css';
+import './styles/base.css';
+import './styles/files.css';
+import './styles/shell.css';
 
 async function loadCrypto() {
   if (window.FBCrypto) return;

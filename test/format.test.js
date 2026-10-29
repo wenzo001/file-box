@@ -35,36 +35,75 @@ test('到期：10 分钟内标红、1 小时内黄、刚上传的 1 小时写成
   assert.strictEqual(fmtExpiry(now + 5 * 60_000, now), '5 分钟后删除');
 });
 
-test('删掉的那套重复导航不许长回来：App.vue 与 app.css 里不许再出现那批类名', () => {
+// 2026-10 重构：样式从单个 app.css 拆成 tokens/base/files/shell 四份，
+// 行的模板也从 App.vue 下沉到 components/RowItem.vue。
+// 下面四条静态判据因此改成"扫全部样式表 / 扫全部模板"，判据本身一条没删。
+const STYLES_DIR = path.join(__dirname, '..', 'web', 'src', 'styles');
+const CSS_FILES = ['tokens.css', 'base.css', 'files.css', 'shell.css'];
+const cssAll = () => CSS_FILES.map((f) => fs.readFileSync(path.join(STYLES_DIR, f), 'utf8')).join('\n');
+const TEMPLATES = () => [
+  path.join(__dirname, '..', 'web', 'src', 'App.vue'),
+  ...fs.readdirSync(path.join(__dirname, '..', 'web', 'src', 'components'))
+    .filter((f) => f.endsWith('.vue'))
+    .map((f) => path.join(__dirname, '..', 'web', 'src', 'components', f)),
+];
+const tplAll = () => TEMPLATES().map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+const tpl = (name) => fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'components', name), 'utf8');
+const mediaBlock = (src, query) => (
+  (src.match(new RegExp(`@media ${query.replace(/[()]/g, '\\$&')}\\s*\\{[\\s\\S]*?\\n\\}`, 'g')) || []).join('\n')
+);
+
+test('删掉的那套重复导航不许长回来：模板与样式里不许再出现那批类名', () => {
   const banned = [
     'sidebar', 'side-item', 'side-sep', 'usage-bar', 'usage-text',
     'table-head', 'check-cell', 'row-main', 'folder-main', 'file-main',
     'selection-bar', 'upload-line',
   ];
   assert.ok(banned.length >= 12, '名单被删空了，这条判据就成了恒真');
-  const files = [
-    ['App.vue', path.join(__dirname, '..', 'web', 'src', 'App.vue')],
-    ['app.css', path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css')],
-  ];
-  const css = fs.readFileSync(files[1][1], 'utf8');
+  const css = cssAll();
   for (const live of ['col-row', 'col-expiry']) {
     assert.ok(new RegExp(`\\b${live}\\b`).test(css), `扫描器连在用的 ${live} 都找不到，说明它瞎了`);
   }
-  for (const [name, file] of files) {
-    const src = fs.readFileSync(file, 'utf8');
+  const sources = [['全部模板', tplAll()], ...CSS_FILES.map((f) => [f, fs.readFileSync(path.join(STYLES_DIR, f), 'utf8')])];
+  for (const [name, src] of sources) {
     const hits = banned.filter((c) => new RegExp(`\\b${c}\\b`).test(src));
     assert.deepStrictEqual(hits, [], `${name} 里还留着已删除的导航类名: ${hits.join(', ')}`);
   }
 });
 
 test('右键菜单三态与触摸档 44pt 必须在 CSS 里真声明（静态守机制）', () => {
-  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css'), 'utf8');
-  const coarse = (css.match(/@media \(pointer: coarse\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
+  const css = cssAll();
+  const coarse = mediaBlock(css, '(pointer: coarse)');
   assert.ok(coarse.length > 0, '一条 pointer:coarse 规则都没扫到，说明扫描器瞎了');
-  assert.match(coarse, /\.context-menu \.menu-item \{[^}]*min-height:\s*44px/, '触摸档没给右键菜单项 44pt 目标');
-  assert.match(css, /\.context-menu \.menu-item:hover:not\(:disabled\)/, '右键菜单项没有 hover 规则');
-  assert.match(css, /\.context-menu \.menu-item:active:not\(:disabled\)/, '右键菜单项没有按下态');
-  assert.match(css, /\.context-menu \.menu-item:disabled/, '右键菜单项没有禁用态');
+  // 44 现在住在 --tap 这一个 token 里：改 token 或删掉这条规则都要能红
+  assert.match(css, /--tap:\s*44px/, 'tokens.css 里没有 --tap: 44px，44 这个数失去了唯一来源');
+  assert.match(coarse, /\.menu-item \{[^}]*min-height:\s*var\(--tap\)/, '触摸档没给菜单项 44pt 目标');
+  // 三态原来写在 `.context-menu .menu-item` 下；新 Shell 里 .menu-item 只属于右键菜单
+  // （移动端底表用的是 .sheet-item），所以前缀去掉了。判据跟着认生效的那一句，并要求它真改了底色，
+  // 再补一条模板腿：CSS 点名的类必须在 ContextMenu.vue 里真存在，否则三态规则是写给空气的。
+  const menuTpl = tpl('ContextMenu.vue');
+  assert.match(menuTpl, /class="context-menu"/, 'ContextMenu.vue 不再有 .context-menu 容器');
+  assert.match(menuTpl, /class="menu-item"/, 'ContextMenu.vue 的条目不再用 .menu-item，下面的三态规则会落空');
+  assert.match(css, /\.menu-item:hover:not\(:disabled\)[^{]*\{[^}]*background:/, '右键菜单项没有 hover 规则');
+  assert.match(css, /\.menu-item:active:not\(:disabled\)[^{]*\{[^}]*background:/, '右键菜单项没有按下态');
+  assert.match(css, /\.menu-item:disabled[^{]*\{[^}]*opacity:/, '右键菜单项没有禁用态');
+});
+
+test('只有一套暗色：不许再出现按系统主题切换的第二套色值', () => {
+  const tokens = fs.readFileSync(path.join(STYLES_DIR, 'tokens.css'), 'utf8');
+  assert.match(tokens, /color-scheme:\s*dark/, 'tokens.css 没声明 color-scheme: dark（原生控件/滚动条会退回浅色）');
+  assert.doesNotMatch(tokens, /prefers-color-scheme/, 'tokens.css 又长出 prefers-color-scheme 了：本产品只有一套暗色，不要第二套');
+  // 扫描器先自证看得见：随机挑一个在用的 token，扫不到就说明它瞎了
+  assert.match(tokens, /--ink-2:/, '扫描器连 --ink-2 都找不到');
+  // 坐字的蓝色/红色底必须用字色 token —— 写死 #fff 在亮蓝/亮红底上分别只有 3.47 / 2.75
+  const css = cssAll();
+  const hardWhite = css
+    .split('\n')
+    .map((line, i) => [i + 1, line])
+    .filter(([, line]) => /^\s*color:\s*#fff(fff)?\s*;/.test(line));
+  assert.deepStrictEqual(hardWhite.map(([n]) => n), [], `这些行还在把字色写死成 #fff：${JSON.stringify(hardWhite)}`);
+  assert.match(css, /\.btn-danger\s*\{[^}]*color:\s*var\(--on-danger\)/, '.btn-danger 没有用 --on-danger 坐字');
+  assert.match(tokens, /--on-danger:\s*#[0-9a-f]{6}/i, 'tokens.css 里没有 --on-danger');
 });
 
 test('file-move 端点一旦被界面调用，台面就必须有真浏览器拖拽判据（防"后端有、界面悄悄上"）', () => {
@@ -76,10 +115,23 @@ test('file-move 端点一旦被界面调用，台面就必须有真浏览器拖�
     `界面已在调用 file-move（uiCalls=${uiCalls}）但台面无拖拽判据（hasJudge=${hasJudge}）——要么补判据，要么别接`);
 });
 
+test('拖拽落点读目录 id、行身份读命名空间键：这两颗属性不许合回一个', () => {
+  // 实测事故：行身份 data-dnd-id 是 folder:<id>，落点当年读的就是这一颗，
+  // 于是发给 /api/batches/x/file-move 的 to 变成 "folder:f_xxx"，服务端只能回「目标目录不存在」——
+  // 而落点高亮照样亮，看上去一切正常，只有真拖一次才暴露。
+  const dndCode = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'lib', 'dnd.js'), 'utf8')
+    .replace(/^\s*\/\/.*$/gm, ''); // 注释里提到这颗属性名是为了记住教训，不该把门判红
+  assert.match(tpl('RowItem.vue'), /data-dnd-folder="[^"]*item\.id/,
+    'RowItem.vue 的目录行不再输出裸目录 id（data-dnd-folder）——落点没有能发给 API 的值了');
+  assert.match(dndCode, /dataset\.dndFolder/, 'dnd.js 的落点没有读 data-dnd-folder');
+  assert.doesNotMatch(dndCode, /toFolderId\s*=[^;]*dataset\.dndId/,
+    'dnd.js 又把行身份键（folder:<id>）当成落点目录发给了 API');
+});
+
 test('到期状态类不许复用元素名：CSS 里任何 display:none 的规则都不能点到它', async () => {
   // 事故口径：状态类曾返回裸 'expiry'，被旧表格的窄屏规则 .file-row > .expiry 命中，
   // 第三行（倒计时）在手机上去掉——文字判据抓不到，只有量渲染几何才看得见。
-  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css'), 'utf8');
+  const css = cssAll();
   const hiddenIn = (src) => [...src.matchAll(/([^{}]+)\{[^{}]*display:\s*none[^{}]*\}/g)].map((m) => m[1]);
   // 正对照：扫描器必须看得见「隐藏规则点名 expiry」这个形状 —— 否则 0 命中只是它瞎了
   const probe = hiddenIn('.a > .expiry { display: none; }');
@@ -90,22 +142,32 @@ test('到期状态类不许复用元素名：CSS 里任何 display:none 的规�
 });
 
 test('手机档守机制：界面层不许钉顶、卡片要有高度地板、44 是命中区不是画出来的框', () => {
-  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'styles', 'app.css'), 'utf8');
-  const mobile = (css.match(/@media \(max-width: 560px\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
-  assert.ok(mobile.length > 0, '一条 max-width:560 规则都没扫到，说明扫描器瞎了');
+  const css = cssAll();
+  // 断点从 560 抬到 700（手机换成单层列表），判据跟着认这条新的
+  const mobile = mediaBlock(css, '(max-width: 700px)');
+  assert.ok(mobile.length > 0, '一条 max-width:700 规则都没扫到，说明扫描器瞎了');
   assert.ok(mobile.includes('position: static'),
     '手机档没让顶栏随页面滚走：sticky 会把 3～4 行界面层永久压在浏览区头上');
-  assert.match(mobile, /\.columns\s*\{[^}]*min-height:\s*280px/,
-    '手机档分栏卡片没有 280px 高度地板：让卡片和任务面板抢同一屏，实测会被挤到 62px、栏内行永久裁掉');
-  const coarse = (css.match(/@media \(pointer: coarse\)\s*\{[\s\S]*?\n\}/g) || []).join('\n');
+  // 高度地板现在由 clamp(地板, 目标, 天花板) 表达：认第一个参数，别认写死的 280。
+  // 桌面与平板各写了一条 .columns，两条都是"别让卡片和别的东西抢同一屏"的承诺，
+  // 所以取 min —— 之前取 max，把平板那条砍到 100px 也不会红。
+  const floors = [...css.matchAll(/\.columns\s*\{[^}]*height:\s*clamp\(\s*(\d+)px/g)].map((m) => Number(m[1]));
+  assert.ok(floors.length >= 2, `只扫到 ${floors.length} 条 .columns 高度地板，桌面和平板应各一条`);
+  assert.ok(Math.min(...floors) >= 280,
+    `分栏卡片的高度地板最低只有 ${Math.min(...floors)}px：让卡片和任务面板抢同一屏，实测会被挤到 62px、栏内行永久裁掉`);
+  const coarse = mediaBlock(css, '(pointer: coarse)');
   // 两条命中区规则要各自点名：只写 /\.check-hit/ 的话，栏头那条会替行那条背锅（下刀试过，摘掉行那条仍绿）
-  assert.match(coarse, /\.col-row \.check-hit\s*\{[^}]*width:\s*44px/, '触摸档目录行/文件行的勾选入口没有 44 命中区');
-  assert.match(coarse, /\.col-tools \.check-hit\s*\{[^}]*width:\s*44px/, '触摸档栏头「全选本栏」没有 44 命中区');
-  assert.match(coarse, /\.col-row \.col-check\s*\{[^}]*width:\s*22px/,
+  assert.match(coarse, /\.col-row \.check-hit\s*\{[^}]*width:\s*var\(--tap\)/, '触摸档目录行/文件行的勾选入口没有 44 命中区');
+  assert.match(coarse, /\.col-tools \.check-hit\s*\{[^}]*width:\s*var\(--tap\)/, '触摸档栏头「全选本栏」没有 44 命中区');
+  assert.match(coarse, /\.col-row \.col-check\s*\{[^}]*width:\s*20px/,
     '触摸档原生方框的尺寸变了：44 应该是命中区（外面那层 label），不是把复选框本身画成 44');
-  const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'src', 'App.vue'), 'utf8');
-  const wraps = (app.match(/class="check-hit"/g) || []).length;
-  assert.ok(wraps >= 3, `勾选入口的命中区包装层只有 ${wraps} 处，应为 3（栏头全选 / 目录行 / 文件行）`);
+  // 原来数的是 3 处字面量（栏头全选 / 目录行 / 文件行）；目录行与文件行合成了同一个 RowItem，
+  // 计数会凭空少 1。改成按"哪一格该有"各自点名：两颗分属两个文件，摘掉任一颗都必须红，
+  // 谁也不能替谁背锅（原来那条靠计数，RowItem 里留一颗就能蒙过栏头那颗）。
+  for (const [file, where] of [['RowItem.vue', '目录行/文件行'], ['ColumnBrowser.vue', '栏头「全选本栏」']]) {
+    assert.match(tpl(file), /class="check-hit"[\s\S]{0,400}type="checkbox"/,
+      `${file} 里 ${where} 的勾选入口没有 44 命中区包装层`);
+  }
 });
 
 // ---- 吐文件的路由：必须有一句能生效的安全声明 ----

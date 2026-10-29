@@ -1,6 +1,7 @@
 <script setup>
-// 手机档的「设置」底表：把原来压在列表上方的公共配置条收进来（容量、累计下载、全局自动删除、
-// 清空），让一屏尽量留给文件列表。桌面端仍然用顶部那条配置条 —— 这个组件的入口只在窄屏出现。
+// 「设置」底表：把公共配置（容量、累计下载、全局自动删除、清空）收在同一个入口里。
+// 这个入口在两端都在（桌面是居中弹层、窄屏是底部抽屉）；桌面顶部那条配置条同时保留，
+// 它是上传前最常改的那一项的快捷入口，不是这个弹层的替代。
 import {
   DialogClose, DialogContent, DialogDescription, DialogOverlay, DialogPortal, DialogRoot, DialogTitle,
 } from 'reka-ui';

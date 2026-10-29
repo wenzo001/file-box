@@ -33,7 +33,7 @@ export const api = {
 
   moveBatch: (batch, folderId) => json(`batches/${q(batch)}`, 'PATCH', { folderId }),
   deleteBatch: (batch, expectFolder) => {
-    const expect = expectFolder === undefined ? '' : `?expectFolder=${q(expectFolder ?? '__unfiled__')}`;
+    const expect = expectFolder === undefined ? '' : `?expectFolder=${q(expectFolder ?? '')}`;
     return request(`folder/${q(batch)}${expect}`, { method: 'DELETE' });
   },
 

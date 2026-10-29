@@ -134,7 +134,7 @@ npm start            # 默认 3000/3443；不需要 npm install
 | 目录 | 内容 | 丢了会怎样 |
 |---|---|---|
 | `uploads/` | 批次密文 | 文件丢失（不可恢复） |
-| `.library/` | NeDB 目录树 / 批次归属 / TTL / 清单哈希 / 公共设置（`defaultTtlHours`） | 文件还在，目录树、TTL 和全局设置丢失，全部回到「未分档」，新上传回到默认 1 小时 |
+| `.library/` | NeDB 目录树 / 批次归属 / TTL / 清单哈希 / 公共设置（`defaultTtlHours`） | 文件还在，目录树、TTL 和全局设置丢失，全部回到最外层「全部文件」，新上传回到默认 1 小时 |
 | `.stats/` | 下载次数账本（逐文件计数 + 只增不减的 `__total__`；第一次下载后才出现） | 文件还在，下载次数归零（含历史累计） |
 | `.uploading/` | 未完成上传的暂存（可不要） | 未传完的批次要重传；已完成的批次不受影响 |
 | `.transfer/` | 无痕传输中转的密文（可不要） | 进行中的无痕会话作废 |
@@ -145,7 +145,7 @@ cd /opt/file-box
 tar -czf /tmp/file-box-data-$(date +%F).tar.gz uploads $(ls -d .stats .library 2>/dev/null)
 ```
 
-恢复：先停服务，再解压覆盖数据目录；`.library` 缺失时文件仍会出现在未分档，不会丢文件。
+恢复：先停服务，再解压覆盖数据目录；`.library` 缺失时文件仍会出现在最外层「全部文件」里，不会丢文件。
 
 - **一键清空**（页面上「清空所有文件…」）会删掉 `uploads/` 里本服务建的批次、`.uploading/` 与 `.transfer/`，
   但**保留** `.library/folders.db`（目录树）、`.library/settings.db`（全局 TTL）与账本里的 `__total__`（历史累计下载）。`.certs/` 不动。
@@ -200,7 +200,7 @@ pm2 restart file-box
 | `npm ci` 失败 | 锁文件与 `package.json` 不一致；在构建机重新 `npm install` 生成锁并提交 |
 | 端口被占 | `pm2` 配置默认 4444/3443；`npm start` 默认 3000/3443；改 `PORT`/`HTTPS_PORT` |
 | 上传 413 | 反代 `client_max_body_size` 太小，或单块超过 32MB |
-| 目录树突然全变未分档 | `.library` 丢失/损坏；文件仍在。用 `.bak` 恢复，或接受重新建目录（全局自动删除设置会回到默认 1 小时） |
+| 目录树突然全变成最外层的一组文件 | `.library` 丢失/损坏；文件仍在。用 `.bak` 恢复，或接受重新建目录（全局自动删除设置会回到默认 1 小时） |
 | 目录索引启动报损坏 | 会优先读 `.bak`；两个都坏会改名 `*.corrupt-*` 并从空库启动，不会删文件 |
 | 多实例/多进程 | NeDB 索引不是多进程安全；只跑一个 `file-box` 进程 |
 | 页面还是旧版 | 浏览器缓存；刷新一次。旧 `public/index.html` 已删除，旧 `/next` 会跳回根 |

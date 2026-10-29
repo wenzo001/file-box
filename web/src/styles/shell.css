@@ -1,0 +1,548 @@
+/* =============================================================================
+   shell.css — 应用外壳：顶栏、配置条、提示条、工具行、任务中心、
+               弹层 / 菜单 / toast / 底表 / 底部动作栏，以及两端的断点差异。
+   ============================================================================= */
+
+.app { min-height: 100vh; min-height: 100dvh; }
+
+/* ---- 顶栏 ---- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: var(--header-h);
+  /* viewport-fit=cover 之后刘海会把内容压到屏幕上缘；home 指示条不属于顶栏，交给 .main 让开 */
+  padding: var(--sp-2) var(--sp-5);
+  padding-top: calc(var(--sp-2) + env(safe-area-inset-top));
+  background: var(--chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--sep);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  font-size: var(--fs-xl);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.brand > svg { color: var(--brand); }
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  background: var(--brand);
+  color: var(--on-accent);
+}
+
+/* 面包屑：桌面主力路径导航 */
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+.crumb-btn {
+  max-width: 168px;
+  min-height: 32px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--ink-2);
+  font-size: var(--fs-md);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background var(--d-1) var(--ease), color var(--d-1) var(--ease);
+}
+.crumb-btn:hover { background: var(--fill); color: var(--ink); }
+.crumb-btn.current { color: var(--ink); font-weight: 600; }
+.crumb-sep { flex: none; color: var(--ink-3); }
+.crumb-tail {                       /* 折叠起来的中间层级 */
+  min-width: 28px;
+  color: var(--ink-3);
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  width: 232px;
+  height: 36px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
+  color: var(--ink-3);
+  transition: border-color var(--d-1) var(--ease), background var(--d-1) var(--ease), width var(--d-2) var(--ease);
+}
+.search:focus-within { border-color: var(--accent); background: var(--surface); width: 300px; }
+.search > svg { flex: none; }
+.search input {
+  /* 输入框自己吃满外壳：外壳 44、里面 25 的话，点字上方那 10px 只是"运气好命中了 label"，
+     不是控件的命中区。让盒子本身就是 44，量出来才作数。 */
+  height: 100%;
+  min-height: 44px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  /* iOS 聚焦 font-size<16px 的输入框会强制放大整页且回不去 */
+  font-size: 16px;
+}
+.search input::placeholder { color: var(--ink-3); }
+.search input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+
+.toolbar-actions { display: flex; align-items: center; gap: var(--sp-2); flex: none; }
+.lbl-short { display: none; }
+.usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 30px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.usage-meter { width: 46px; height: 4px; border-radius: var(--r-pill); background: var(--fill-2); overflow: hidden; }
+.usage-meter > span { display: block; height: 100%; border-radius: inherit; background: var(--brand); }
+.usage-meter.is-high > span { background: var(--warn); }
+.usage-meter.is-full > span { background: var(--danger); }
+
+/* ---- 配置条（桌面）---- */
+.config-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-5);
+  background: var(--surface);
+  border-bottom: 1px solid var(--sep);
+  font-size: var(--fs-md);
+}
+.config-icon { flex: none; color: var(--brand); }
+.config-label { font-weight: 600; color: var(--ink); white-space: nowrap; }
+/* 配置说明是小字次要信息，必须坐得住 4.5:1 —— 用 --ink-2（canvas 上 5.65）而不是更浅的档 */
+.config-hint { min-width: 0; color: var(--ink-2); font-size: var(--fs-sm); }
+.config-strip .ttl-global { height: 32px; min-height: 32px; font-size: var(--fs-md); font-weight: 600; }
+.wipe-open { margin-left: auto; flex: none; }
+
+/* ---- 主体 ---- */
+.layout { min-height: calc(100dvh - var(--header-h) - 46px); }
+.main {
+  position: relative;
+  min-width: 0;
+  padding: var(--sp-4) var(--sp-5) calc(var(--sp-8) + env(safe-area-inset-bottom));
+}
+.col-row, .col-head, .task, .result-row { scroll-margin-top: calc(var(--header-h) + env(safe-area-inset-top)); }
+
+.banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  padding: 10px var(--sp-3);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: var(--fs-md);
+}
+.banner > svg { flex: none; }
+.banner.danger { background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 28%, transparent); color: var(--danger); }
+.banner.share { background: var(--sel); border-color: color-mix(in srgb, var(--brand) 28%, transparent); color: var(--ink); }
+.banner.info { background: var(--sel); border-color: color-mix(in srgb, var(--brand) 28%, transparent); color: var(--ink); }
+.share-file { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 工具行常驻一条，高度不随"有没有选中"变化：
+   原来那条选中栏是 v-if 插进来的，一勾选就把下面的分栏顶下去 */
+.tool-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  min-height: 32px;
+  margin-bottom: var(--sp-3);
+  color: var(--ink-2);
+  font-size: var(--fs-md);
+}
+.tool-row b { color: var(--ink); font-weight: 600; }
+.tool-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-count {
+  padding: 2px var(--sp-3);
+  border-radius: var(--r-pill);
+  background: var(--fill-2);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  transition: background var(--d-1) var(--ease), color var(--d-1) var(--ease);
+}
+.tool-count.on { background: var(--sel); color: var(--sel-ink); font-weight: 600; }
+.tool-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+
+/* ---- 任务中心 ---- */
+.tasks {
+  margin-top: var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-1);
+  overflow: hidden;
+}
+.tasks-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 44px;
+  padding: 0 var(--sp-4);
+}
+.tasks-head h2 { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-base); font-weight: 600; }
+.tasks-head h2 > svg { color: var(--brand); }
+.tasks-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  line-height: 20px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+/* 顶栏那颗任务按钮上的角标：贴在图标右上角，不吃布局宽度 */
+.badge-pin {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  min-width: 16px;
+  height: 16px;
+  line-height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+.icon-btn { position: relative; }
+.tasks-head .linkbtn { margin-left: auto; }
+.tasks-body { padding: 0 var(--sp-4) var(--sp-3); border-top: 1px solid var(--sep); }
+.tasks-body[hidden] { display: none; }
+
+.task {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--sep);
+}
+.tasks-body .task:first-child { border-top: 0; }
+.task-main { flex: 1 1 auto; min-width: 0; }
+.task-title { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; font-size: var(--fs-md); }
+.task-title > svg { flex: none; color: var(--ink-2); }
+.task-title > span:not(.task-state) { min-width: 0; }
+.task-state { flex: none; padding: 1px var(--sp-2); border-radius: var(--r-xs); background: var(--fill-2); color: var(--ink-2); font-size: var(--fs-xs); }
+.task.running .task-state { background: var(--sel); color: var(--sel-ink); }
+.task.done .task-state { background: var(--ok-soft); color: var(--ok); }
+.task.failed .task-state, .task.canceled .task-state { background: var(--danger-soft); color: var(--danger); }
+.task.paused .task-state { background: var(--warn-soft); color: var(--warn); }
+.task .bar { margin-top: 6px; }
+.task-sub { margin-top: 3px; color: var(--ink-2); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.task-actions { display: flex; align-items: center; gap: 2px; flex: none; flex-wrap: wrap; justify-content: flex-end; }
+.task.pending { align-items: flex-start; }
+.task.pending .task-main { padding-top: 2px; }
+
+/* ---- 右键菜单（桌面自绘）---- */
+.context-menu {
+  position: fixed;
+  z-index: var(--z-menu);
+  min-width: 216px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  border: 1px solid var(--sep);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--sh-3);
+  animation: menuIn var(--d-1) var(--ease);
+}
+@keyframes menuIn { from { opacity: 0; transform: translateY(-3px) scale(0.985); } }
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 34px;
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: var(--fs-md);
+  cursor: pointer;
+}
+.menu-item:hover:not(:disabled), .menu-item:focus-visible { background: var(--fill); }
+.menu-item:active:not(:disabled) { background: var(--fill-2); }
+.menu-item:disabled { opacity: 0.45; cursor: not-allowed; }
+.menu-item.danger { color: var(--danger); }
+.menu-item.danger:hover:not(:disabled) { background: var(--danger-soft); }
+.menu-item > svg { flex: none; color: var(--ink-2); }
+.menu-item.danger > svg { color: var(--danger); }
+.menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--sep); }
+
+/* ---- 弹层 / 对话框 ---- */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: var(--scrim);
+  animation: fadeIn var(--d-1) var(--ease);
+}
+@keyframes fadeIn { from { opacity: 0; } }
+
+.dialog {
+  position: fixed;
+  z-index: var(--z-dialog);
+  left: 50%;
+  top: 50%;
+  width: min(460px, calc(100vw - 28px));
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  transform: translate(-50%, -50%);
+  padding: var(--sp-5);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--sh-3);
+  animation: dialogIn var(--d-2) var(--ease);
+}
+@keyframes dialogIn { from { opacity: 0; transform: translate(-50%, -46%) scale(0.97); } }
+.dialog h3 { margin-bottom: var(--sp-2); font-size: var(--fs-xl); font-weight: 700; letter-spacing: -0.01em; }
+.dialog p { margin-bottom: var(--sp-4); color: var(--ink-2); font-size: var(--fs-md); }
+.dialog-error { margin-top: var(--sp-2); color: var(--danger); font-size: var(--fs-sm); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); margin-top: var(--sp-4); }
+.dialog-primary { min-width: 88px; }
+.char-count { margin-top: var(--sp-1); color: var(--ink-2); font-size: var(--fs-xs); text-align: right; font-variant-numeric: tabular-nums; }
+.char-count.over { color: var(--danger); }
+.wipe-keep { margin: var(--sp-2) 0 0; padding-left: var(--sp-4); color: var(--ink-2); font-size: var(--fs-md); line-height: 1.7; }
+.wipe-keep li { list-style: disc; }
+
+/* ---- toast：只是播报，不许吃掉底下那一行的点击 ---- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--sp-6) + env(safe-area-inset-bottom) + var(--kb-inset, 0px));
+  z-index: var(--z-toast);
+  transform: translateX(-50%);
+  max-width: calc(100vw - 32px);
+  padding: 10px var(--sp-5);
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--ink) 92%, transparent);
+  color: var(--canvas);
+  font-size: var(--fs-md);
+  box-shadow: var(--sh-3);
+  pointer-events: none;
+  animation: toastIn var(--d-2) var(--ease);
+}
+@keyframes toastIn { from { opacity: 0; transform: translate(-50%, 8px); } }
+
+/* ---- 底部动作栏 / 操作表（手机）---- */
+.action-bar {
+  position: fixed;
+  left: 0; right: 0;
+  z-index: var(--z-actionbar);
+  display: none;
+  align-items: center;
+  gap: var(--sp-2);
+  /* 软键盘起来时整条要跟着抬，否则"删除"埋在键盘后面 */
+  bottom: calc(env(safe-area-inset-bottom) + var(--kb-inset, 0px));
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-top: 1px solid var(--sep);
+}
+.action-count { flex: 1 1 auto; min-width: 0; color: var(--ink-2); font-size: var(--fs-md); }
+.action-count.on { color: var(--ink); font-weight: 600; }
+.action-items { display: flex; align-items: center; gap: 2px; flex: none; }
+.action-bar .tool-btn { width: var(--tap); height: var(--tap); padding: 0; justify-content: center; }
+
+/* 单行操作表：手机点文件行的 ⋯ 或长按后弹出 */
+.sheet-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0 var(--sp-4);
+  border: 0;
+  border-bottom: 1px solid var(--sep);
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+  font-size: var(--fs-lg);
+}
+.sheet-item:active { background: var(--fill); }
+.sheet-item > svg { flex: none; color: var(--ink-2); }
+.sheet-item.danger { color: var(--danger); }
+.sheet-item.danger > svg { color: var(--danger); }
+.sheet-item:disabled { opacity: 0.45; }
+.sheet-item:last-of-type { border-bottom: 0; }
+.sheet-sub { margin: 0 0 var(--sp-3); color: var(--ink-2); font-size: var(--fs-sm); }
+.sheet-row { display: flex; align-items: center; gap: var(--sp-3); margin: var(--sp-1) 0 var(--sp-2); }
+.sheet-row .ttl-global { flex: 1 1 auto; min-width: 0; }
+.sheet-hint { margin: 0 0 var(--sp-3); white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.6; }
+.sheet-stats { justify-content: space-between; color: var(--ink-2); font-size: var(--fs-sm); padding-top: var(--sp-2); border-top: 1px solid var(--sep); }
+.sheet-actions { justify-content: space-between; }
+.sheet-head { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-2); }
+.sheet-head .grab { position: absolute; left: 50%; top: 6px; width: 36px; height: 4px; margin-left: -18px; border-radius: var(--r-pill); background: var(--sep-strong); }
+.sheet-legend { margin: 0 0 var(--sp-3); color: var(--ink-2); font-size: var(--fs-sm); }
+
+/* ---- 断点 ---- */
+@media (max-width: 1180px) {
+  .usage-chip { display: none; }
+  .search { width: 190px; }
+  .search:focus-within { width: 232px; }
+}
+@media (max-width: 1023px) {
+  .topbar { padding: var(--sp-2) var(--sp-4); }
+  .main { padding: var(--sp-3) var(--sp-4) calc(var(--sp-8) + env(safe-area-inset-bottom)); }
+  .config-strip { padding: var(--sp-2) var(--sp-4); }
+  .brand-name { display: none; }
+  .crumb-btn { max-width: 120px; }
+}
+
+/* 手机档：顶栏两行、配置条收进设置底表、动作挪到底部动作栏、任务开成底表 */
+@media (max-width: 700px) {
+  .topbar {
+    position: static;                    /* 顶栏在手机上本来要 3～4 行；继续 sticky 就永久吃掉三分之一屏 */
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    min-height: 0;
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--sep);
+  }
+  .brand { order: 1; font-size: var(--fs-lg); }
+  .brand-name { display: inline; }
+  .toolbar-actions { order: 2; flex: 0 1 auto; margin-left: auto; }
+  .search { order: 3; flex: 1 1 100%; width: auto; height: 44px; }
+  .search:focus-within { width: auto; }
+  .crumb { display: none; }             /* 路径导航交给 .mb-back + 标题 */
+  .usage-chip { display: none; }
+  .lbl-full { display: none; }
+  .lbl-short { display: inline; }
+  .toolbar-actions .btn { padding: 0 var(--sp-3); }
+
+  .config-strip { display: none; }      /* 整块搬进设置底表 */
+  .layout { min-height: 0; }
+  .main { padding: var(--sp-3) var(--sp-3) calc(88px + env(safe-area-inset-bottom)); }
+
+  .tool-row { display: none; }          /* 状态交给列表头，动作交给底部动作栏 */
+  .settings-entry { display: inline-flex; }
+  .action-bar { display: flex; }
+  .toast { bottom: calc(84px + env(safe-area-inset-bottom) + var(--kb-inset, 0px)); }
+
+  /* 手机对话框 = 底部抽屉，键盘起来时整块抬到键盘上面 */
+  .dialog {
+    top: auto;
+    left: 0;
+    bottom: 0;
+    width: 100%;
+    max-height: calc(100dvh - 60px);
+    transform: none;
+    padding: calc(var(--sp-6) + 6px) var(--sp-4) calc(var(--sp-4) + env(safe-area-inset-bottom) + var(--kb-inset, 0px));
+    border-radius: var(--r-xl) var(--r-xl) 0 0;
+    box-shadow: var(--sh-3);
+    animation: sheetUp var(--d-3) var(--ease);
+  }
+  @keyframes sheetUp { from { transform: translateY(14%); opacity: 0.6; } }
+  .dialog-actions { gap: var(--sp-3); }
+  .dialog-actions .btn { flex: 1 1 0; min-height: var(--tap); }
+  .menu { min-width: 180px; }
+}
+
+/* 320 这种窄屏再收一格：品牌 + 动作按钮必须挤在一行，否则顶栏多出一行 */
+@media (max-width: 360px) {
+  .brand { font-size: var(--fs-base); }
+  .toolbar-actions { gap: var(--sp-1); }
+  .toolbar-actions .btn { padding: 0 var(--sp-2); }
+  .toolbar-actions .btn.settings-entry { min-width: var(--tap); padding: 0; }
+}
+
+/* 触摸档：命中区一律抬到 44，且不靠 hover 表达任何状态 */
+@media (pointer: coarse) {
+  .icon-btn { width: var(--tap); height: var(--tap); }
+  /* 按下态的 scale(0.94) 会把刚够 44pt 的命中区压成 41pt：触屏的按下反馈有底色变化就够，
+     不许连拇指要落的那块地方一起缩（桌面档保留这个缩放，鼠标不占命中区预算） */
+  .icon-btn:active:not(:disabled) { transform: none; }
+  .linkbtn { min-height: var(--tap); padding: 0 var(--sp-2); }
+  .btn { min-height: var(--tap); }
+  .input, .ttl-global { min-height: var(--tap); }
+  .crumb-btn { min-height: var(--tap); }
+  .menu-item { min-height: var(--tap); }
+  .col-more { opacity: 1; width: var(--tap); height: var(--tap); }
+  .col-icon { width: var(--tap); height: var(--tap); }
+  /* 窄屏会把按钮标签压成两个字（上传/传输）：短标签再窄也得留满一颗拇指 —— 44 是命中区下限，不是好看 */
+  .toolbar-actions .btn { min-width: var(--tap); }
+  .col-tools { gap: 0; }
+  .col-row { grid-template-columns: 20px 24px minmax(0, 1fr) var(--tap); }
+  .col-row .check-hit { width: var(--tap); height: var(--tap); }
+  .col-row .col-check { width: 20px; height: 20px; }
+  .col-tools .check-hit { width: var(--tap); height: var(--tap); }
+  .col-tools .col-check { width: 20px; height: 20px; }
+  /* 触摸没有 hover：行内动作按钮常驻，靠 --ink-2 的低对比压住视觉噪音 */
+  .col-more, .col-row:hover .col-more { opacity: 1; }
+}
+
+/* ---- 自动删除时长选择器：配置条与设置底表共用 ---- */
+.ttl-global {
+  min-height: 34px;
+  padding: 0 var(--sp-5) 0 var(--sp-3);
+  border: 1px solid var(--sep-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 600;
+}
+.ttl-global:disabled { opacity: 0.55; }
+
+/* ---- 任务中心：收起时只留标题条，高度不抢列表 ---- */
+.tasks-toggle { gap: var(--sp-2); font-size: var(--fs-base); }
+.tasks-toggle b { color: var(--ink); }
+.tasks.collapsed .tasks-body { display: none; }
+.tasks-empty { padding: var(--sp-3) 0 0; font-size: var(--fs-sm); }
+
+/* ---- 操作表 / 抽屉 ---- */
+.sheet-list { margin: 0 calc(var(--sp-4) * -1); }
+.dialog.sheet .drawer-body { max-height: 52vh; overflow-y: auto; }
+.dialog.sheet .task { padding: var(--sp-3) 0; }
+.dialog.sheet .task:first-child { border-top: 0; }
+
+/* 桌面：确认删除这类弹层不需要占满，收紧到内容宽 */
+@media (min-width: 701px) {
+  .sheet-list { margin: 0; border: 1px solid var(--sep); border-radius: var(--r-md); overflow: hidden; }
+  .sheet-item { border-bottom: 1px solid var(--sep); }
+}
+
+/* 配置条里的时长选择器：.input 带了 width:100%，不收就会拉满整条 1440 宽的带 */
+.config-strip .ttl-global { width: auto; min-width: 168px; max-width: 300px; }

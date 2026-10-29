@@ -69,8 +69,8 @@ const LOG = (m) => console.log(`[resume-lab] ${m}`);
     });
 
     await page.goto(`${srv.base}/`, { waitUntil: 'domcontentloaded' });
+    // 这批文件没有归属目录：它就在最外层「全部文件」里，不用先点进某个目录
     await page.waitForSelector('.columns');
-    await page.locator('.folder-row', { hasText: '未分档' }).first().click();
     await page.waitForSelector('.file-row');
     LOG('双击文件行开始下载（第一次会被断开）');
     const downloadPromise = page.waitForEvent('download', { timeout: 120000 }).catch((e) => { LOG('等下载事件失败：' + e.message); throw e; });

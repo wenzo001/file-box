@@ -74,8 +74,14 @@ function rememberOver(target, item) {
   if (!dragging.length) return;
   const row = target && target.closest ? target.closest('[data-dnd-kind]') : null;
   overEl = item.el;
-  overFolderId = row && row.dataset.dndKind === 'folder' ? row.dataset.dndId : null;
+  overFolderId = folderIdOf(row);
   overRef({ colKey: item.colKey, folderId: overFolderId });
+}
+
+// 落点要的是能直接发给 /api 的目录 id（data-dnd-folder），不是行身份 data-dnd-id（folder:<id>）：
+// 拿后者去移动，服务端只会回「目标目录不存在」。
+function folderIdOf(row) {
+  return row && row.dataset.dndKind === 'folder' ? row.dataset.dndFolder : null;
 }
 
 function onDropCapture(event) {
@@ -84,7 +90,7 @@ function onDropCapture(event) {
   const item = el && (bindings.get(el) || {}).item;
   if (!item) return; // 丢在栏外：什么都不做
   const row = event.target.closest('[data-dnd-kind]');
-  const toFolderId = row && row.dataset.dndKind === 'folder' ? row.dataset.dndId : item.folderId;
+  const toFolderId = folderIdOf(row) || item.folderId;
   const moved = dragging.slice();
   dragging = [];
   overEl = null;

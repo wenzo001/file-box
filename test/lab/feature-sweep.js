@@ -55,8 +55,8 @@ async function uploadWithManifest(srv, files) {
     page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
 
     await page.goto(`${srv.base}/`, { waitUntil: 'domcontentloaded' });
+    // 没有归属目录的批次就排在最外层「全部文件」里（系统目录「未分档」已经取消）
     await page.waitForSelector('.columns');
-    await page.locator('.folder-row', { hasText: '未分档' }).first().click();
     await page.waitForSelector('.file-row');
 
     // 热乎只标文件：目录行不该有
@@ -83,7 +83,7 @@ async function uploadWithManifest(srv, files) {
 
     // 目录名上限 10 个字：输入框本身卡住第 11 个字，文案里写清上限
     // （服务端拒绝超长的判据在 test/library.test.js —— 界面上走不到"提交 11 个字"那条路）
-    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.locator('.col-icon[aria-label="在此新建文件夹"]').first().click();
     await page.waitForSelector('.dialog', { state: 'visible' });
     const nameInput = page.locator('.dialog .input');
     assert.strictEqual(await nameInput.getAttribute('maxlength'), '10', '目录名输入框没有卡在 10 个字');
@@ -95,7 +95,7 @@ async function uploadWithManifest(srv, files) {
     await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
 
     // 回车提交，但"焦点在别的键上"时不许抢那颗键
-    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.locator('.col-icon[aria-label="在此新建文件夹"]').first().click();
     await page.waitForSelector('.dialog', { state: 'visible' });
     await page.locator('.dialog .input').fill('回车新建');
     await page.locator('.dialog .input').press('Tab'); // 走到「取消」那颗键
@@ -107,7 +107,7 @@ async function uploadWithManifest(srv, files) {
       '焦点在「取消」上时回车抢了那颗键：目录被建出来了');
     LOG('回车不抢键：焦点在「取消」上时那一下就是取消');
 
-    await page.locator('[aria-label="新建文件夹"]').first().click();
+    await page.locator('.col-icon[aria-label="在此新建文件夹"]').first().click();
     await page.waitForSelector('.dialog', { state: 'visible' });
     await page.locator('.dialog .input').fill('回车新建');
     await page.keyboard.press('Enter');
@@ -135,6 +135,12 @@ async function uploadWithManifest(srv, files) {
       true,
       '确认框打开后焦点没落在主键上：回车会成了"取消"',
     );
+    // 那句话只许出现一次：description 与 dialog-warning 曾各渲染一遍，界面上读起来像卡带
+    const said = await page.locator('.dialog').innerText();
+    assert.strictEqual(
+      (said.match(/将被永久删除/g) || []).length, 1,
+      `确认框把这句话印了 ${(said.match(/将被永久删除/g) || []).length} 遍：${JSON.stringify(said)}`,
+    );
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => ![...document.querySelectorAll('.file-row .col-name')].some((n) => n.textContent.includes('乙.txt')), null, { timeout: 15000 });
     lib = await (await fetch(`${srv.base}/api/library`)).json();
@@ -146,7 +152,7 @@ async function uploadWithManifest(srv, files) {
 
     // 3) 文件「⋯ → 移动这批上传到…」：选目标目录后归属真的改了
     const batchName = lib.batches[0].name;
-    assert.strictEqual(lib.batches[0].folderId, null, '前置：这份批次在未分档');
+    assert.strictEqual(lib.batches[0].folderId, null, '前置：这份批次没有归属目录（在最外层）');
     await page.locator('.file-row', { hasText: '大文件.bin' }).locator('.col-more').click();
     await page.locator('.context-menu .menu-item', { hasText: '移动这批上传到…' }).click();
     await page.locator('.dialog select').selectOption({ label: '目标目录' });

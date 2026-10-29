@@ -38,8 +38,11 @@ test('目录：同名去重（大小写不敏感）、不同父级可同名、�
   const c = await lib.createFolder({ name: '项目组 A', parentId: b._id });
   assert.strictEqual(c.parentId, b._id);
 
+  // 「未分档」不再特殊：系统目录取消之后它就是个普通名字
+  const named = await lib.createFolder({ name: '未分档', parentId: null });
+  assert.strictEqual(named.name, '未分档');
   await assert.rejects(
-    () => lib.createFolder({ name: '未分档', parentId: null }),
+    () => lib.createFolder({ name: '全部文件', parentId: null }),
     expectCode('INVALID_NAME'),
   );
   await assert.rejects(

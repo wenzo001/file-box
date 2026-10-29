@@ -1,5 +1,6 @@
 // 移动端真触摸冒烟（不属于 npm test）：先 npm run build，再 node test/lab/mobile-smoke.js
-// 判据全部打在渲染结果上：命中区 44pt、iOS 输入缩放、真实遮挡、够不着的裁切、卡片可用高度、对比度、触摸能不能用。
+// 判据全部打在渲染结果上：命中区 44pt、iOS 输入缩放、真实遮挡、够不着的裁切、列表在不在首屏、对比度、触摸能不能用。
+// 2026-10 重构后手机档是单层列表（.mobile-browser + .mb-list），⋯ 走底部操作表，动作栏只在多选态出现。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -90,7 +91,7 @@ const MEASURE = () => {
   }
   // 反过来的那种挤压：滚动容器自己的盒子被祖先切掉，里面的行再怎么滚也露不出来（320 档实测卡片只剩 61px）
   const cutScrollers = [];
-  for (const n of document.querySelectorAll('.columns, .col-list, .search-panel, .tasks, .main, .tool-row')) {
+  for (const n of document.querySelectorAll('.columns, .mobile-browser, .mb-list, .col-list, .search-panel, .tasks, .main, .tool-row')) {
     const r = n.getBoundingClientRect();
     if (!r.height || !shown(n)) continue;
     const v = visibleRect(n);
@@ -145,9 +146,15 @@ const MEASURE = () => {
     if (el && shown(el)) contrast[role] = ratio(el); // 收进底表的元素在页面上是隐藏的，别量它
 
   }
-  const cols = document.querySelector('.columns').getBoundingClientRect();
-  const list = document.querySelector('.column:last-child .col-list');
-  // 固定界面层：顶栏 + 配置条在手机上原本要 3～4 行；一旦还 sticky，分栏永久少一层
+  // 手机档不再渲染分栏卡片：量"当前这一屏的浏览区"，两种壳（.columns / .mobile-browser）共用同一组读数
+  const card = document.querySelector('.columns') || document.querySelector('.mobile-browser');
+  const cols = card.getBoundingClientRect();
+  const scope = document.querySelector('.mb-list') || document.querySelector('.column:last-child');
+  const list = document.querySelector('.mb-list') || document.querySelector('.column:last-child .col-list');
+  const rows = [...scope.querySelectorAll('.col-row')];
+  // 「多选」这颗的标签必须和"当前这一层是不是全选了"说的是同一件事
+  const head = document.querySelector('.mb-actions [aria-label="多选"], .mb-actions [aria-label="退出多选"]');
+  // 固定界面层：顶栏 + 配置条（手机档配置条整块进底表，量到 0 才对）
   const bar = document.querySelector('.topbar').getBoundingClientRect();
   const strip = document.querySelector('.config-strip').getBoundingClientRect();
   const stickyTop = [...document.querySelectorAll('*')].filter((n) => {
@@ -160,18 +167,22 @@ const MEASURE = () => {
   return {
     small, zoom, covered, unreachable, cutScrollers, contrast,
     hOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    // 卡片只要还有一屏的三分之一可用就赢；把它压成一条缝，行就被 overflow-y:hidden 永久裁掉
+    // 手机档的列表跟着内容长（不再是固定高度的卡片），"卡片可用高度"那条承诺在这里不再是可量的东西；
+    // 改量列表的顶边：被推到首屏外 = 这一屏打开时没有任何可浏览的行
+    listTop: Math.round(list ? list.getBoundingClientRect().top : cols.top),
     colsH: Math.round(cols.height),
-    // 不滚就能看到的那一段分栏：这才是手机上真正的浏览区
+    // 不滚就能看到的那一段浏览区
     colsInView: Math.round(Math.max(0, Math.min(cols.bottom, innerHeight) - Math.max(cols.top, 0))),
     listH: list ? Math.round(list.getBoundingClientRect().height) : null,
     chromeH: Math.round(bar.height + strip.height),
     barH: barEl && getComputedStyle(barEl).display !== 'none' ? Math.round(barEl.getBoundingClientRect().height) : 0,
     mainPadBottom: Math.round(parseFloat(getComputedStyle(document.querySelector('.main')).paddingBottom) || 0),
     stickyTop,
-    rowsVisible: [...document.querySelectorAll('.column:last-child .col-row')]
-      .filter((r) => { const v = visibleRect(r); return v.h >= 24 && v.w >= 24; }).length,
-    rowCount: document.querySelectorAll('.column:last-child .col-row').length,
+    headLabel: head ? head.getAttribute('aria-label') : null,
+    rowsSel: rows.filter((r) => r.classList.contains('selected')).length,
+    rowsPickable: rows.filter((r) => !r.classList.contains('pending-row')).length,
+    rowsVisible: rows.filter((r) => { const v = visibleRect(r); return v.h >= 24 && v.w >= 24; }).length,
+    rowCount: rows.length,
   };
 };
 
@@ -189,31 +200,73 @@ const MEASURE = () => {
     page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
     const tag = `${vp.w}x${vp.h}`;
     let step = '打开首页';
-    let stepSel = '.columns';
-    const tap = async (sel, name) => { step = name; stepSel = sel; await page.locator(sel).first().tap(); };
+    let stepSel = '.mobile-browser';
+    // 按下态是 transform: scale(0.94) 且带 transition：不等补间收掉就量几何，
+    // 读到的是"正在回弹"的那一帧（实测把 44pt 的键量成 43，报了一条假缺陷）。
+    // 上限 800ms：页面里有无限循环的进度动画时不许把台面挂住。
+    const settle = () => page.evaluate(async () => {
+      await Promise.race([
+        Promise.all(document.getAnimations().map((a) => a.finished.catch(() => {}))),
+        new Promise((r) => setTimeout(r, 800)),
+      ]);
+    });
+    const tap = async (sel, name) => {
+      step = name; stepSel = sel;
+      await page.locator(sel).first().tap();
+      await settle();
+    };
+    // 「多选」这颗的标签必须说的是"这一层是不是已经全选"，而不是"有没有选中过任何东西"：
+    // 期望从现场读数推（这一层几行、选中几行），不写死顺序 —— 写死就会把产品说什么听成什么
+    const headState = async () => {
+      const s = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('.mb-list .col-row')].filter((r) => !r.classList.contains('pending-row'));
+        const head = document.querySelector('.mb-actions [aria-label="多选"], .mb-actions [aria-label="退出多选"]');
+        return {
+          label: head ? head.getAttribute('aria-label') : null,
+          sel: rows.filter((r) => r.classList.contains('selected')).length,
+          total: rows.length,
+        };
+      });
+      const want = s.total > 0 && s.sel === s.total ? '退出多选' : '多选';
+      assert.strictEqual(s.label, want,
+        `${tag}: 头部写着「${s.label}」，但这一层是 ${s.sel}/${s.total} 选中（该写「${want}」）`);
+      return s;
+    };
+    // 按当前标签按下这颗（标签自己就该说清它这一次做什么），点完再核对标签
+    const tapHead = async (name) => {
+      const s = await headState();
+      await tap(`.mb-actions [aria-label="${s.label}"]`, name);
+      return s;
+    };
     try {
       await page.goto(`${srv.base}/`, { waitUntil: 'domcontentloaded' });
-      await page.waitForSelector('.columns');
-      await tap('[aria-label="新建文件夹"]', '点新建文件夹');
+      await page.waitForSelector('.mobile-browser');
+      // 手机档是单层列表：当前这一格里要同时有目录行和文件行，勾选与导航才各验得动 ⇒ 建两层再上传
+      await tap('.mb-actions [aria-label="在此新建文件夹"]', '点新建文件夹');
       await page.waitForSelector('.dialog', { state: 'visible' });
       await page.locator('.dialog .input').fill(`手机目录-${vp.w}`);
       await tap('.dialog .btn-primary', '点确定建目录');
       await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
       await tap(`.folder-row:has-text("手机目录-${vp.w}")`, '进入新目录');
-      await page.waitForTimeout(400);
+      await page.waitForFunction((n) => document.querySelector('.mb-title b')?.textContent === n, `手机目录-${vp.w}`);
+      await tap('.mb-actions [aria-label="在此新建文件夹"]', '在新目录里再建一层');
+      await page.waitForSelector('.dialog', { state: 'visible' });
+      await page.locator('.dialog .input').fill(`子目录-${vp.w}`);
+      await tap('.dialog .btn-primary', '点确定建子目录');
+      await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
       await page.locator('input[type=file]').setInputFiles([f]);
-      await page.waitForFunction(() => document.querySelectorAll('.column:last-child .file-row').length >= 1, { timeout: 30000 });
+      await page.waitForFunction(() => document.querySelectorAll('.mb-list .file-row').length >= 1, { timeout: 30000 });
       await page.waitForTimeout(500);
 
       const m = await page.evaluate(MEASURE);
       console.log(`[${tag}]`, JSON.stringify(m));
       if (m.hOverflow > 0) problems.push(`${tag}: 页面横向溢出 ${m.hOverflow}px`);
-      if (m.colsH < 260) problems.push(`${tag}: 分栏卡片只有 ${m.colsH}px 高，不足 260 —— 栏会被挤成一条缝`);
-      if (m.listH !== null && m.listH < 120) problems.push(`${tag}: 当前栏的行区只有 ${m.listH}px 高`);
+      // 手机档的列表高度跟着内容长，不再量"卡片有没有被压扁"；量它从哪开始：
+      // 顶边出了首屏 = 这一屏打开时一行都看不见
+      if (m.listTop > vp.h) problems.push(`${tag}: 列表顶边在 ${m.listTop}px，首屏（${vp.h}px）里没有任何可浏览的行；固定界面层=${m.chromeH}px`);
       if (m.cutScrollers.length) problems.push(`${tag}: 滚动容器自己被祖先切掉，里面的行再怎么滚也露不出来 → ${JSON.stringify(m.cutScrollers)}`);
-      if (m.colsInView < vp.h * 0.4) problems.push(`${tag}: 不滚动时浏览区只有 ${m.colsInView}px（屏高 ${vp.h} 的 ${Math.round((m.colsInView / vp.h) * 100)}%），不足 40%；固定界面层=${m.chromeH}px`);
-      if (m.stickyTop.length) problems.push(`${tag}: 手机上还有钉在顶上的界面层，分栏永久少一层 → ${JSON.stringify(m.stickyTop)}`);
-      if (m.rowsVisible < 1) problems.push(`${tag}: 当前栏 ${m.rowCount} 行里没有一行看得见`);
+      if (m.stickyTop.length) problems.push(`${tag}: 手机上还有钉在顶上的界面层，浏览区永久少一层 → ${JSON.stringify(m.stickyTop)}`);
+      if (m.rowsVisible < 1) problems.push(`${tag}: 当前目录 ${m.rowCount} 行里没有一行看得见`);
       if (m.unreachable.length) problems.push(`${tag}: ${m.unreachable.length} 个控件被滚不动的祖先裁掉、永远够不着 → ${JSON.stringify(m.unreachable)}`);
       if (m.small.length) problems.push(`${tag}: ${m.small.length} 个控件命中区不足 44pt → ${JSON.stringify(m.small)}`);
       if (m.zoom.length) problems.push(`${tag}: ${m.zoom.length} 个文本输入 <16px，iOS 聚焦会放大整页 → ${JSON.stringify(m.zoom)}`);
@@ -225,27 +278,43 @@ const MEASURE = () => {
         if (v < 4.5) problems.push(`${tag}: 「${role}」对比度 ${v}:1 < 4.5:1`);
       }
 
-      // 触摸真的能用：点复选框要能勾上，点 ⋯ 要能出菜单
-      const checkSel = '.column:last-child .file-row .col-check';
-      await tap(checkSel, '点文件行复选框');
-      assert.strictEqual(await page.locator(checkSel).first().isChecked(), true, `${tag}: 触摸点复选框没勾上`);
-      // 命中区是外面那层 label：点它边缘（22px 方框之外）也要勾上，且只能勾一次
-      // （label 会把点击转发给 input，行本身的 @click 也会被这一层 .stop 挡掉——少一层就会翻两次）
-      await page.locator('.column:last-child .file-row .check-hit').first().tap({ position: { x: 2, y: 22 } });
-      assert.strictEqual(await page.locator(checkSel).first().isChecked(), false,
-        `${tag}: 点命中区边缘没勾消（勾了两次说明 label 的转发和行本身的 @click 抢同一位）`);
+      // 触摸真的能用：先进多选（非多选态勾选区是 visibility:hidden，量不到也算不得命中区）。
+      // 「多选」这颗是"全选可见"：进去之后每项都已勾上，所以边缘那一下的期望是先勾消、再勾上。
+      await tapHead('进多选（全选这一层）');
+      const sel = await page.evaluate(MEASURE);
+      if (sel.small.length) problems.push(`${tag}: 多选态下 ${sel.small.length} 个控件命中区不足 44pt → ${JSON.stringify(sel.small)}`);
+      const checkSel = '.mb-list .file-row .col-check';
+      // 命中区是外面那层 label：点它边缘（方框之外）也要算数，且只能翻一次
+      // （label 把点击转发给 input，行本身的 @click 被这一层 .stop 挡掉——少一层就会翻两次）
+      await page.locator('.mb-list .file-row .check-hit').first().tap({ position: { x: 2, y: 22 } });
+      assert.strictEqual(await page.locator(checkSel).first().isChecked(), false, `${tag}: 点命中区边缘没勾消`);
+      await page.locator('.mb-list .file-row .check-hit').first().tap({ position: { x: 2, y: 22 } });
+      assert.strictEqual(await page.locator(checkSel).first().isChecked(), true,
+        `${tag}: 再点一次没勾上（一次边缘点只该翻一次）`);
       // 目录行的勾选区不许顺手把目录打开：点边缘只该改勾选
-      const crumbBefore = (await page.locator('.crumb-btn.current').last().innerText()).trim();
+      const titleBefore = (await page.locator('.mb-title b').innerText()).trim();
       await page.locator('.folder-row .check-hit').first().tap({ position: { x: 2, y: 22 } });
-      assert.strictEqual((await page.locator('.crumb-btn.current').last().innerText()).trim(), crumbBefore,
+      assert.strictEqual((await page.locator('.mb-title b').innerText()).trim(), titleBefore,
         `${tag}: 点目录行的勾选区把目录打开了（label 没挡住冒泡到行的 @click）`);
-      assert.strictEqual(await page.locator('.folder-row .col-check').first().isChecked(), true,
-        `${tag}: 点目录行的勾选区没勾上`);
-      await tap('.column:last-child .file-row .col-more', '点文件行的 ⋯');
-      await page.waitForSelector('.context-menu .menu-item');
-      const itemH = await page.locator('.context-menu .menu-item').first().evaluate((el) => Math.round(el.getBoundingClientRect().height));
-      assert.ok(itemH >= 44, `${tag}: 菜单项只有 ${itemH}px，触摸档要 ≥44`);
-      await page.keyboard.press('Escape');
+      assert.strictEqual(await page.locator('.folder-row .col-check').first().isChecked(), false,
+        `${tag}: 点目录行的勾选区没改勾选`);
+      // 手机档的 ⋯ 走底部操作表，不是桌面的右键菜单：条目要 ≥44 且能关得掉
+      await tap('.mb-list .file-row .col-more', '点文件行的 ⋯');
+      await page.waitForSelector('.sheet-item');
+      const itemH = await page.locator('.sheet-item').first().evaluate((el) => Math.round(el.getBoundingClientRect().height));
+      assert.ok(itemH >= 44, `${tag}: 操作表条目只有 ${itemH}px，触摸档要 ≥44`);
+      await page.locator('.dialog .btn').first().tap(); // 取消
+      await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
+      // 关掉操作表不许把选中项或当前目录弄丢
+      assert.strictEqual((await page.locator('.mb-title b').innerText()).trim(), titleBefore,
+        `${tag}: 关闭操作表后目录被重置了`);
+      let s = await headState();
+      await tap(`.mb-actions [aria-label="${s.label}"]`, '点头部多选键（补齐这一层的全选）');
+      s = await headState();
+      assert.strictEqual(s.label, '退出多选', `${tag}: 这一层 ${s.sel}/${s.total} 全选后头部还写着「${s.label}」`);
+      await tap('.mb-actions [aria-label="退出多选"]', '退出多选');
+      assert.strictEqual(await page.locator('.action-bar').count(), 0, `${tag}: 退出多选后底部动作栏没收`);
+      await headState();
 
       // 确认词没填就点，报错但不许删（红底被 hover 换掉那条腿在触摸档复现不了，见 library-smoke）
       const beforeWipe = await (await fetch(`${srv.base}/api/library`)).json();
@@ -284,23 +353,27 @@ const MEASURE = () => {
       await page.locator('.dialog .btn').first().tap(); // 取消
       await page.waitForSelector('.dialog', { state: 'detached', timeout: 8000 });
 
-      // 底部动作栏：拇指够得着的位置；未选中时后四颗按不动，勾上后可用
+      // 底部动作栏：手机档设计决定是"只在多选时出现"（常驻会长期吃掉一屏的底），
+      // 所以两头都要验：进多选它得在且每颗 ≥44，退出多选它得真的收起
+      await tapHead('进多选（全选这一层）');
       const bar = page.locator('.action-bar');
-      assert.strictEqual(await bar.isVisible(), true, '底部动作栏没有常驻');
+      await bar.waitFor({ state: 'visible', timeout: 8000 });
       const barBoxes = await bar.locator('.linkbtn').evaluateAll((els) => els.map((el) => {
         const r = el.getBoundingClientRect();
         return Math.round(Math.min(r.width, r.height));
       }));
+      assert.ok(barBoxes.length >= 5, `动作栏只有 ${barBoxes.length} 颗按钮，全选/链接/打包/删除/取消该都在`);
       assert.ok(barBoxes.every((n) => n >= 44), `动作栏里有按钮小于 44：${JSON.stringify(barBoxes)}`);
-      // 前面几条腿留下了选中（目录行的勾选框），先按「取消」清掉，再断言未选中时的禁用态
-      await bar.locator('.linkbtn').last().tap();
-      await page.waitForFunction(() => document.querySelector('.action-bar .action-count')?.textContent.trim() === '选择文件');
-      const barDisabled = await bar.locator('.linkbtn').evaluateAll((els) => els.map((el) => el.disabled));
-      assert.deepStrictEqual(barDisabled, [false, true, true, true, true], `未选中时只该「全选」可点：${JSON.stringify(barDisabled)}`);
-      // 勾一条文件：后四颗要能用
-      await page.locator('.column:last-child .file-row .col-check').first().tap();
-      await page.waitForFunction(() => !document.querySelectorAll('.action-bar .linkbtn')[3].disabled);
-      assert.match(await bar.locator('.action-count').innerText(), /1 项/, '动作栏没显示选中数量');
+      // 「多选」那颗是全选可见 ⇒ 动作栏该报出这么多项，且没有一颗因为"没选中"而按不动
+      assert.strictEqual(await bar.locator('.action-count').innerText(), `已选 ${sel.rowsPickable} 项`,
+        '动作栏的选中数量和「全选这一层」对不上');
+      assert.deepStrictEqual(await bar.locator('.linkbtn').evaluateAll((els) => els.map((el) => el.disabled)),
+        barBoxes.map(() => false), '全选后仍有动作按不动');
+      await bar.locator('[aria-label="取消选择"]').tap();
+      await page.waitForSelector('.action-bar', { state: 'detached', timeout: 8000 });
+      // 退出多选后回到"点行=进目录/开操作表"：勾选区要重新藏起来
+      assert.strictEqual(await page.locator('.mb-list .check-hit').first().evaluate((el) => getComputedStyle(el).visibility), 'hidden',
+        '退出多选后勾选框还露在外面');
 
       assert.deepStrictEqual(errs, [], `${tag}: 浏览器报错\n${errs.join('\n')}`);
       await page.screenshot({ path: SHOT(`fb-mob-${tag}.png`) });
@@ -310,7 +383,7 @@ const MEASURE = () => {
         const box = (n) => `${n.tagName.toLowerCase()}.${(n.className || '').toString().split(' ').filter(Boolean).join('.')} ${JSON.stringify(n.getBoundingClientRect().toJSON())}`;
         let el = null;
         try { el = document.querySelector(sel); } catch { return { sel, note: 'selector not DOM-parseable (Playwright pseudo)' }; }
-        if (!el) return { sel, found: 0, rows: document.querySelectorAll('.file-row').length, cols: document.querySelectorAll('.column').length };
+        if (!el) return { sel, found: 0, rows: document.querySelectorAll('.file-row').length, lists: document.querySelectorAll('.mb-list, .column').length };
         const r = el.getBoundingClientRect();
         const at = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
         return { sel, rect: r.toJSON(), centerHit: at ? box(at) : 'null', innerH: innerHeight, scroller: box(document.querySelector('.main')) };
@@ -332,5 +405,5 @@ const MEASURE = () => {
     console.error('[mobile-smoke] 失败:\n' + problems.join('\n'));
     process.exit(1);
   }
-  console.log(`[mobile-smoke] 通过：${VPS.map((v) => v.w).join(' / ')} 各档卡片可用高度、无够不着的裁切、44pt、无 iOS 缩放、无遮挡、对比度达标`);
+  console.log(`[mobile-smoke] 通过：${VPS.map((v) => v.w).join(' / ')} 各档列表在首屏内、无够不着的裁切、44pt（含多选态）、无 iOS 缩放、无遮挡、对比度达标、多选↔动作栏可进可退`);
 })().catch((err) => { console.error(err); process.exit(1); });

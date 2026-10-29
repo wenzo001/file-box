@@ -35,9 +35,10 @@ const LOG = (m) => console.log(`[fallback-lab] ${m}`);
     page.on('console', (m) => { if (m.type() === 'error') errs.push(`console.error: ${m.text()}`); });
 
     await page.goto(`${srv.base}/`, { waitUntil: 'domcontentloaded' });
+    // 两批文件都没有归属目录，就排在最外层；这里用「全选 + 打包下载」走同一个 zipPlan
     await page.waitForSelector('.columns');
-    await page.locator('.folder-row', { hasText: '未分档' }).first().click();
     await page.waitForSelector('.file-row');
+    await page.locator('.tool-actions [aria-label="全选当前可见"]').click();
 
     // 两个 waitForEvent 会拿到同一个下载事件；这里自己攒到两个
     const files = [];
@@ -45,7 +46,7 @@ const LOG = (m) => console.log(`[fallback-lab] ${m}`);
       page.on('download', (d) => { files.push(d); if (files.length >= 2) resolve(files); });
       setTimeout(() => resolve(files), 60000);
     });
-    await page.locator('[aria-label="打包下载这个文件夹"]').first().click();
+    await page.locator('.tool-actions [aria-label="打包下载"]').click();
     await twoDone;
     const sizes = [];
     for (const f of files) {
