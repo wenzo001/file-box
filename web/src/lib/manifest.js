@@ -22,7 +22,7 @@ export async function fetchManifest(batch, { force = false } = {}) {
     remember(batch, null);
     return null;
   }
-  if (!res.ok) throw new Error(`清单拉取失败 (${res.status})`);
+  if (!res.ok) throw new Error(`清单拉取失败 (${res.status})：点「重试」或刷新页面`);
   const cipher = new Uint8Array(await res.arrayBuffer());
   const plain = await FBCrypto.decryptBytes(cipher);
   const data = JSON.parse(td.decode(plain));

@@ -636,7 +636,7 @@ app.post('/api/upload/init', gateRate(initLimiter, '开始上传'), express.json
     const parsed = folderIdOrUnfiled.safeParse(req.body.folderId);
     if (!parsed.success) return res.status(400).json({ error: '目录标识不合法' });
     if (parsed.data && parsed.data !== '__unfiled__' && libraryReady) {
-      if (!(await library.getFolder(parsed.data))) return res.status(404).json({ error: '目录不存在' });
+      if (!(await library.getFolder(parsed.data))) return res.status(404).json({ error: '目录不存在（可能已被删除）：刷新列表后重试' });
       folderId = parsed.data;
     }
   }
@@ -909,12 +909,12 @@ app.delete('/api/uploads/:id', (req, res) => {
     return res.status(202).json({ ok: true, canceling: true });
   }
   const dir = uploadDirOf(id);
-  if (!fs.existsSync(dir)) return res.status(404).json({ error: '上传不存在' });
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: '上传不存在（可能已过期）：重新选择文件再上传' });
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
     console.error('[上传] 清理暂存失败', err.code, id.slice(0, 8));
-    return res.status(500).json({ error: '清理失败' });
+    return res.status(500).json({ error: '清理失败：请刷新后重试' });
   }
   cancelRequested.delete(id);
   forgetUsage();
@@ -1015,7 +1015,7 @@ app.patch('/api/batches', requireLibrary, express.json({ limit: '256kb' }), asyn
 app.patch('/api/batches/:batch', requireLibrary, express.json({ limit: '64kb' }), asyncHandler(async (req, res) => {
   const name = req.params.batch;
   if (!isFolderName(name)) return res.status(400).json({ error: '批次名不合法' });
-  if (!resolveFolder(name)) return res.status(404).json({ error: '批次不存在' });
+  if (!resolveFolder(name)) return res.status(404).json({ error: '批次不存在（可能已被清理）：刷新后重试' });
   const data = parseBody(res, schemas.batchMove, req.body);
   if (!data) return;
   const out = await library.moveBatches([name], data.folderId);
@@ -1072,7 +1072,7 @@ app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyn
   const batch = req.params.batch;
   if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
   const dir = resolveFolder(batch);
-  if (!dir) return res.status(404).json({ error: '批次不存在' });
+  if (!dir) return res.status(404).json({ error: '批次不存在（可能已被清理）：刷新后重试' });
   const data = parseBody(res, schemas.fileDelete, req.body);
   if (!data) return;
   const file = data.file;
@@ -1118,7 +1118,7 @@ app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyn
       fs.rmSync(fp, { force: true });
     } catch (err) {
       console.error('[文件删除] 删除失败', err.code, file);
-      return res.status(500).json({ error: '删除失败' });
+      return res.status(500).json({ error: '删除失败：请刷新后重试' });
     }
   }
   forgetDownload(batch, file);
@@ -1127,14 +1127,14 @@ app.post('/api/batches/:batch/file-delete', express.json({ limit: '2mb' }), asyn
   try {
     remaining = fs.readdirSync(dir).filter((name) => name !== MANIFEST && name !== 'manifest.enc.tmp');
   } catch {
-    return res.status(500).json({ error: '读取目录失败' });
+    return res.status(500).json({ error: '读取目录失败：刷新页面后重试' });
   }
   if (!remaining.length) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
     } catch (err) {
       console.error('[文件删除] 清理空批次失败', err.code || err.message);
-      return res.status(500).json({ error: '清理空批次失败' });
+      return res.status(500).json({ error: '清理空批次失败：请刷新后重试' });
     }
     forgetDownloads(batch);
     forgetUsage();
@@ -1152,14 +1152,14 @@ app.post('/api/batches/:batch/file-rename', express.json({ limit: '2mb' }), asyn
   const batch = req.params.batch;
   if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
   const dir = resolveFolder(batch);
-  if (!dir) return res.status(404).json({ error: '批次不存在' });
+  if (!dir) return res.status(404).json({ error: '批次不存在（可能已被清理）：刷新后重试' });
   const data = parseBody(res, schemas.fileRename, req.body);
   if (!data) return;
   const file = data.file;
   if (file === MANIFEST || safeName(file) !== file) {
     return res.status(400).json({ error: '文件名不合法' });
   }
-  if (!resolveFile(dir, file)) return res.status(404).json({ error: '文件不存在' });
+  if (!resolveFile(dir, file)) return res.status(404).json({ error: '文件不存在（可能已被删除）：刷新后重试' });
 
   const current = readManifestBytes(dir);
   if (!current) return res.status(400).json({ error: '旧数据没有加密清单，不能重命名' });
@@ -1192,13 +1192,13 @@ app.post('/api/batches/:batch/file-move', express.json({ limit: '2mb' }), asyncH
   const batch = req.params.batch;
   if (!isFolderName(batch)) return res.status(400).json({ error: '批次名不合法' });
   const fromDir = resolveFolder(batch);
-  if (!fromDir) return res.status(404).json({ error: '批次不存在' });
+  if (!fromDir) return res.status(404).json({ error: '批次不存在（可能已被清理）：刷新后重试' });
   const data = parseBody(res, schemas.fileMove, req.body);
   if (!data) return;
   const file = data.file;
   if (file === MANIFEST || safeName(file) !== file) return res.status(400).json({ error: '文件名不合法' });
   const srcPath = resolveFile(fromDir, file);
-  if (!srcPath) return res.status(404).json({ error: '文件不存在' });
+  if (!srcPath) return res.status(404).json({ error: '文件不存在（可能已被删除）：刷新后重试' });
 
   const current = readManifestBytes(fromDir);
   if (!current || hashBytes(current) !== data.expectedManifestHash) {
@@ -1214,7 +1214,7 @@ app.post('/api/batches/:batch/file-move', express.json({ limit: '2mb' }), asyncH
   if (data.to && data.to !== '__unfiled__') {
     if (!libraryReady) return res.status(503).json({ error: '目录索引暂不可用' });
     const doc = await library.getFolder(data.to);
-    if (!doc) return res.status(404).json({ error: '目标目录不存在' });
+    if (!doc) return res.status(404).json({ error: '目标目录不存在（可能已被删除或移动）：刷新列表后重试' });
     toFolderId = doc._id;
   }
 
@@ -1298,13 +1298,13 @@ app.delete('/api/folder/:folder', asyncHandler(async (req, res) => {
     }
     forgetDownloads(name);
     forgetUsage();
-    return res.status(404).json({ error: '目录不存在' });
+    return res.status(404).json({ error: '目录不存在（可能已被删除）：刷新列表后重试' });
   }
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
     console.error('[删除] 失败', err.code, name);
-    return res.status(500).json({ error: '删除失败' });
+    return res.status(500).json({ error: '删除失败：请刷新后重试' });
   }
   forgetUsage(); // 腾出的空间要立刻反映到上限判断上
   forgetDownloads(name);

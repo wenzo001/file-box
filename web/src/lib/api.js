@@ -2,10 +2,16 @@
 const API_ROOT = new URL('../api/', document.baseURI).href;
 
 async function request(path, options = {}) {
-  const res = await fetch(new URL(path, API_ROOT), options);
+  let res;
+  try {
+    res = await fetch(new URL(path, API_ROOT), options);
+  } catch (err) {
+    if (err.name === 'AbortError') throw err; // 取消不是故障，原样抛给调用方分诊
+    throw new Error('连不上服务器（网络断了或服务没在跑）：检查网络 / 服务后重试');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.error || `请求失败 (${res.status})`);
+    const err = new Error(data.error || `请求失败 (${res.status})：刷新页面后重试`);
     err.status = res.status;
     err.code = data.code;
     throw err;

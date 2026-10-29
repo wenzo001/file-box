@@ -183,7 +183,7 @@ export async function decryptToStore(o) {
     try { await writer.close(); } catch { /* 关不上也不能把半截当成品 */ }
   }
   if (Number.isFinite(plainSize) && plainTotal < plainSize) {
-    throw new Error('文件长度与清单不符（数据不完整）');
+    throw new Error('文件长度与清单不符：文件可能被改动过，请让发送方重新上传');
   }
   return { size: plainTotal };
 }

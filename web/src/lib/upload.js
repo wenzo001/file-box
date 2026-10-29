@@ -218,7 +218,7 @@ export class UploadTask {
         if (this.paused || this.cancelled || err.name === 'AbortError') throw err;
       }
       const status = res ? res.status : 0;
-      lastErr = new Error(data.error || `第 ${fi + 1} 个文件第 ${ci + 1} 块上传失败`);
+      lastErr = new Error(data.error || `第 ${fi + 1} 个文件第 ${ci + 1} 块上传失败：检查网络后点任务里的「重试」（已完成的块不会重传）`);
       const retry = status === 0 || status >= 500 || status === 408 || status === 429 || /校验不通过/.test(data.error || '');
       if (!retry) throw lastErr;
       if (attempt < CHUNK_ATTEMPTS) await sleep(300 * attempt);

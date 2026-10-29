@@ -227,7 +227,7 @@ async function moveFileRowTo(row, toFolderId) {
   const rec = manifestState.value.get(row.batch);
   if (!rec) throw new Error(`「${row.name}」是旧数据，没有加密清单，请用「⋯」里的「移动这批上传到…」`);
   const entry = (rec.data.files || []).find((f) => f.enc === row.enc);
-  if (!entry) throw new Error(`清单里找不到「${row.name}」`);
+  if (!entry) throw new Error(`清单里找不到「${row.name}」：清单可能已被改动，刷新页面后重试`);
   const keep = (rec.data.files || []).filter((f) => f.enc !== row.enc);
   const [source, target] = await Promise.all([
     encodeManifest({ ...rec.data, files: keep }),
@@ -470,7 +470,7 @@ async function loadFiles({ force = false } = {}) {
       let rec = null;
       try { rec = await fetchManifest(b.name, { force }); }
       catch (err) {
-        manifestError.value = err.message || '清单加载失败';
+        manifestError.value = err.message || '清单加载失败：点「重试」或刷新页面';
         // 不缓存失败结果：否则重试按钮永远命中这个 null，再也不去拉清单
         records.delete(b.name);
         manifestProgress.value = { done: manifestProgress.value.done + 1, total: missing.length };
@@ -652,7 +652,7 @@ function addUpload(files, { folderId = null, ttlHours = null } = {}) {
         refreshLibrary({ silent: true });
         refreshPending();
         if (res.indexed === false) {
-          toast('上传完成，但目录索引不可用：文件在最外层（全部文件），未设置自动删除');
+          toast('上传完成，但目录索引不可用：文件在最外层（全部文件），未设置自动删除（稍后刷新；一直这样就看服务日志）');
           navigate(null);
         } else if (res.folderMissing) {
           toast('上传完成，但目标目录已不存在：文件在最外层（全部文件）');
@@ -995,7 +995,7 @@ async function downloadFolderZip(folder) {
   if (!folder) return;
   await loadFiles();
   const items = buildFolderZipItems(folder);
-  if (!items.some((it) => !it.dir)) { toast('这个目录还没有文件'); return; }
+  if (!items.some((it) => !it.dir)) { toast('这个目录还没有文件：先上传，或换一个有内容的目录'); return; }
   startZipTask(`打包下载「${folder.name}」`, items, `${folder.name}.zip`);
 }
 
@@ -1012,7 +1012,7 @@ async function downloadSelectedZip() {
       });
     }
   }
-  if (!items.some((it) => !it.dir)) { toast('选中的内容里还没有文件'); return; }
+  if (!items.some((it) => !it.dir)) { toast('选中的内容里没有文件（只有空目录）：换一批再试'); return; }
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
   startZipTask('打包选中内容', items, `文件盒子-${stamp}.zip`);
 }
@@ -1081,7 +1081,7 @@ async function removeFileRow(row) {
 
 async function renameFileRow(row, newName) {
   const rec = manifestState.value.get(row.batch);
-  if (!rec) throw new Error('旧数据没有加密清单，不能重命名');
+  if (!rec) throw new Error('旧数据没有加密清单，不能重命名：需要改名的话重新上传一份');
   const files = (rec.data.files || []).map((f) => (f.enc === row.enc ? { ...f, name: newName } : f));
   const next = await encodeManifest({ ...rec.data, files });
   await api.renameFile(row.batch, {
@@ -1455,7 +1455,7 @@ async function onTtlChange() {
     toast(`之后的每批上传都会在「${ttlLabel(res.settings.defaultTtlHours)}」后自动删除`);
   } catch (err) {
     settingsTtl.value = data.value.settings?.defaultTtlHours ?? 1;
-    toast(err.message || '自动删除设置保存失败');
+    toast(err.message || '自动删除设置保存失败：稍后再试一次');
   } finally {
     settingsSaving.value = false;
   }
@@ -1641,7 +1641,7 @@ onBeforeUnmount(() => {
       <main class="main">
         <div v-if="libraryNotReady" class="banner info">
           <Info :size="15" aria-hidden="true" />
-          目录索引暂不可用，当前所有文件都在最外层展示；上传与下载仍可用。
+          目录索引暂不可用，当前所有文件都在最外层展示；上传与下载仍可用。要恢复目录树请让管理员看服务日志里的「目录索引」那条。
         </div>
         <div v-if="httpsUrl" class="banner info">
           <Info :size="15" aria-hidden="true" />

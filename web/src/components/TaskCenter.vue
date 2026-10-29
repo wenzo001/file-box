@@ -35,7 +35,7 @@ const activeCount = () => props.tasks.filter((t) => !isSettled(t)).length;
             <RotateCcw :size="15" aria-hidden="true" />
             <span class="ellipsis">未完成上传 · {{ p.fileCount }} 个文件</span>
           </div>
-          <div class="task-sub">已收 {{ p.receivedChunks }}/{{ p.totalChunks }} 块 · {{ fmtSize(p.bytes) }}</div>
+          <div class="task-sub">已收 {{ p.receivedChunks }}/{{ p.totalChunks }} 块 · {{ fmtSize(p.bytes) }} · 点「继续」要重新选同一批文件</div>
         </div>
         <div class="task-actions">
           <button class="linkbtn" @click="emit('resume-pending', p)">继续</button>

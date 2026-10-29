@@ -38,7 +38,7 @@ export function createZipRunner({ items, tier, filename, onProgress = () => {} }
       prepared = (async () => {
         if (!isDisk) return;
         zipHandle = await openOpfsPath([ZIP_DIR, zipKey], true);
-        if (!canWriteHandle(zipHandle)) throw new Error('这台设备拿不到可写的本地存储，无法边写盘打包');
+        if (!canWriteHandle(zipHandle)) throw new Error('这个页面拿不到可写的本地存储（纯 HTTP / 无痕窗口），没法边写盘打包：改用 HTTPS 入口，或让它降级成逐个文件下载');
       })();
     }
     return prepared;
@@ -54,7 +54,7 @@ export function createZipRunner({ items, tier, filename, onProgress = () => {} }
       return res.body;
     }
     const handle = await openOpfsPath([item.batch, item.enc], true);
-    if (!handle) throw new Error('拿不到本地存储句柄，无法断点续传这个文件');
+    if (!handle) throw new Error('拿不到本地存储句柄（纯 HTTP / 无痕窗口），这个文件没法续传：改用 HTTPS 入口或普通窗口');
     await transferToStore({
       url: api.downloadUrl(item.batch, item.enc),
       store: handleStore(handle),

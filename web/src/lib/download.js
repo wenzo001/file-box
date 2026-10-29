@@ -121,7 +121,13 @@ export async function clearDownload(batch, enc) {
 }
 
 async function memoryDownload(file, { total, onUpdate, signal }) {
-  const res = await fetch(api.downloadUrl(file.batch, file.enc), { signal });
+  let res;
+  try {
+    res = await fetch(api.downloadUrl(file.batch, file.enc), { signal });
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    throw new Error('连不上服务器（网络断了或服务没在跑）：检查网络 / 服务后重试');
+  }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || `下载失败 (${res.status})`);

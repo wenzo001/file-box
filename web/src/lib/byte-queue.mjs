@@ -20,7 +20,7 @@ export class ChunkQueue {
   /** 取恰好 n 字节；流提前结束就抛（调用方按"数据不完整"处理） */
   async take(n) {
     await this.fill(n);
-    if (this.buffered < n) throw new Error('数据不完整');
+    if (this.buffered < n) throw new Error('数据不完整：网络断了或服务器提前结束，请重试');
     const out = new Uint8Array(n);
     let off = 0;
     while (off < n) {
